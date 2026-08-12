@@ -24,16 +24,16 @@ The project starts as a tiny HTTP/1.1 reverse proxy and grows toward automatic A
 
 Goal: establish the executable, error handling, testing conventions, and tiny internal architecture without prematurely building a framework.
 
-* [ ] Replace the Cargo-generated hello-world executable.
-* [ ] Add a BareProxy startup banner.
-* [ ] Define the first top-level application error type using only `std`.
+* [x] Replace the Cargo-generated hello-world executable.
+* [x] Add a BareProxy startup banner.
+* [x] Define the first top-level application error type using only `std`.
 * [ ] Return meaningful process exit codes for startup failures.
-* [ ] Add basic command-line argument handling without a CLI crate.
-* [ ] Support `--help`.
-* [ ] Support `--version`.
-* [ ] Reject unknown command-line options.
-* [ ] Decide the default configuration file location.
-* [ ] Add a test module and first unit test.
+* [x] Add basic command-line argument handling without a CLI crate.
+* [x] Support `--help`.
+* [x] Support `--version`.
+* [x] Reject unknown command-line options.
+* [x] Decide the default configuration file location.
+* [x] Add a test module and first unit test.
 * [ ] Establish strict formatting/test/Clippy gates.
 * [ ] Document the WSL-first development environment.
 
