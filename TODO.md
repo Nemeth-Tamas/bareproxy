@@ -34,7 +34,7 @@ Goal: establish the executable, error handling, testing conventions, and tiny in
 * [x] Reject unknown command-line options.
 * [x] Decide the default configuration file location.
 * [x] Add a test module and first unit test.
-* [ ] Establish strict formatting/test/Clippy gates.
+* [x] Establish strict formatting/test/Clippy gates.
 * [ ] Document the WSL-first development environment.
 
 **Milestone complete when:** BareProxy starts cleanly, reports useful errors, passes strict gates, and still has zero dependencies.
@@ -142,8 +142,8 @@ Initial configuration should stay intentionally boring.
 * [ ] Load configuration at startup.
 * [ ] Reject startup when configuration is invalid.
 * [ ] Add configuration parser tests.
-* [ ] Add `--config <path>`.
-* [ ] Define a sensible default config filename.
+* [x] Add `--config <path>`.
+* [x] Define a sensible default config filename.
 
 Possible early syntax:
 

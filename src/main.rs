@@ -6,7 +6,7 @@ const CLI_ERROR_EXIT_CODE: u8 = 2;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
-    Run,
+    Run { config_path: String },
     Help,
     Version,
 }
@@ -14,6 +14,7 @@ enum Command {
 #[derive(Debug, PartialEq, Eq)]
 enum AppError {
     UnknownArgument(String),
+    MissingConfigPath,
     TooManyArguments,
 }
 
@@ -21,6 +22,7 @@ impl fmt::Display for AppError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownArgument(argument) => write!(formatter, "unknown argument: {argument}"),
+            Self::MissingConfigPath => write!(formatter, "--config requires a path"),
             Self::TooManyArguments => write!(formatter, "too many arguments"),
         }
     }
@@ -40,7 +42,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), AppError> {
     match parse_args(env::args().skip(1))? {
-        Command::Run => print_startup_banner(),
+        Command::Run { config_path } => print_startup_banner(&config_path),
         Command::Help => print_help(),
         Command::Version => println!("{APP_NAME} {}", env!("CARGO_PKG_VERSION")),
     }
@@ -55,9 +57,15 @@ where
     let mut args = args.into_iter();
 
     let command = match args.next().as_deref() {
-        None => Command::Run,
+        None => Command::Run {
+            config_path: DEFAULT_CONFIG_PATH.to_owned(),
+        },
         Some("--help" | "-h") => Command::Help,
         Some("--version" | "-V") => Command::Version,
+        Some("--config" | "-c") => {
+            let config_path = args.next().ok_or(AppError::MissingConfigPath)?;
+            Command::Run { config_path }
+        }
         Some(argument) => return Err(AppError::UnknownArgument(argument.to_owned())),
     };
 
@@ -68,21 +76,22 @@ where
     Ok(command)
 }
 
-fn print_startup_banner() {
+fn print_startup_banner(config_path: &str) {
     println!("{APP_NAME} {}", env!("CARGO_PKG_VERSION"));
     println!("Dependency-free Rust reverse proxy");
-    println!("Default config: {DEFAULT_CONFIG_PATH}");
+    println!("Config: {config_path}");
 }
 
 fn print_help() {
     println!("{APP_NAME} {}", env!("CARGO_PKG_VERSION"));
     println!();
     println!("USAGE:");
-    println!("    bareproxy [OPTION]");
+    println!("    bareproxy [OPTIONS]");
     println!();
     println!("OPTIONS:");
-    println!("    -h, --help       Print help");
-    println!("    -V, --version    Print version");
+    println!("    -c, --config <PATH>    Use a custom configuration file");
+    println!("    -h, --help             Print help");
+    println!("    -V, --version          Print version");
     println!();
     println!("Default config: {DEFAULT_CONFIG_PATH}");
 }
@@ -92,8 +101,41 @@ mod tests {
     use super::{AppError, Command, parse_args};
 
     #[test]
-    fn no_arguments_runs_proxy() {
-        assert_eq!(parse_args(Vec::new()), Ok(Command::Run));
+    fn no_arguments_runs_proxy_with_default_config() {
+        assert_eq!(
+            parse_args(Vec::new()),
+            Ok(Command::Run {
+                config_path: "bareproxy.conf".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn config_flag_selects_custom_path() {
+        assert_eq!(
+            parse_args(vec!["--config".to_owned(), "custom.conf".to_owned()]),
+            Ok(Command::Run {
+                config_path: "custom.conf".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn short_config_flag_selects_custom_path() {
+        assert_eq!(
+            parse_args(vec!["-c".to_owned(), "custom.conf".to_owned()]),
+            Ok(Command::Run {
+                config_path: "custom.conf".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn missing_config_path_is_rejected() {
+        assert_eq!(
+            parse_args(vec!["--config".to_owned()]),
+            Err(AppError::MissingConfigPath)
+        );
     }
 
     #[test]
@@ -121,6 +163,19 @@ mod tests {
     fn extra_argument_is_rejected() {
         assert_eq!(
             parse_args(vec!["--help".to_owned(), "extra".to_owned()]),
+            Err(AppError::TooManyArguments)
+        );
+    }
+
+    #[test]
+    fn duplicate_config_argument_is_rejected() {
+        assert_eq!(
+            parse_args(vec![
+                "--config".to_owned(),
+                "one.conf".to_owned(),
+                "--config".to_owned(),
+                "two.conf".to_owned(),
+            ]),
             Err(AppError::TooManyArguments)
         );
     }
