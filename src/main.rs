@@ -1,7 +1,9 @@
-use std::{env, error::Error, fmt, process::ExitCode};
+use std::{env, error::Error, fmt, net::TcpListener, process::ExitCode};
 
 const APP_NAME: &str = "BareProxy";
 const DEFAULT_CONFIG_PATH: &str = "bareproxy.conf";
+const DEV_LISTEN_ADDR: &str = "127.0.0.1:8080";
+const STARTUP_ERROR_EXIT_CODE: u8 = 1;
 const CLI_ERROR_EXIT_CODE: u8 = 2;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -16,6 +18,10 @@ enum AppError {
     UnknownArgument(String),
     MissingConfigPath,
     TooManyArguments,
+    ListenerBind {
+        address: &'static str,
+        message: String,
+    },
 }
 
 impl fmt::Display for AppError {
@@ -24,28 +30,56 @@ impl fmt::Display for AppError {
             Self::UnknownArgument(argument) => write!(formatter, "unknown argument: {argument}"),
             Self::MissingConfigPath => write!(formatter, "--config requires a path"),
             Self::TooManyArguments => write!(formatter, "too many arguments"),
+            Self::ListenerBind { address, message } => {
+                write!(formatter, "failed to listen on {address}: {message}")
+            }
         }
     }
 }
 
 impl Error for AppError {}
 
+impl AppError {
+    fn exit_code(&self) -> u8 {
+        match self {
+            Self::ListenerBind { .. } => STARTUP_ERROR_EXIT_CODE,
+            Self::UnknownArgument(_) | Self::MissingConfigPath | Self::TooManyArguments => {
+                CLI_ERROR_EXIT_CODE
+            }
+        }
+    }
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{APP_NAME}: {error}");
-            ExitCode::from(CLI_ERROR_EXIT_CODE)
+            ExitCode::from(error.exit_code())
         }
     }
 }
 
 fn run() -> Result<(), AppError> {
     match parse_args(env::args().skip(1))? {
-        Command::Run { config_path } => print_startup_banner(&config_path),
+        Command::Run { config_path } => start_proxy(&config_path)?,
         Command::Help => print_help(),
         Command::Version => println!("{APP_NAME} {}", env!("CARGO_PKG_VERSION")),
     }
+
+    Ok(())
+}
+
+fn start_proxy(config_path: &str) -> Result<(), AppError> {
+    print_startup_banner(config_path);
+
+    let _listener =
+        TcpListener::bind(DEV_LISTEN_ADDR).map_err(|source| AppError::ListenerBind {
+            address: DEV_LISTEN_ADDR,
+            message: source.to_string(),
+        })?;
+
+    println!("Listening on http://{DEV_LISTEN_ADDR}");
 
     Ok(())
 }
@@ -177,6 +211,23 @@ mod tests {
                 "two.conf".to_owned(),
             ]),
             Err(AppError::TooManyArguments)
+        );
+    }
+
+    #[test]
+    fn cli_error_uses_exit_code_two() {
+        assert_eq!(AppError::MissingConfigPath.exit_code(), 2);
+    }
+
+    #[test]
+    fn startup_error_uses_exit_code_one() {
+        assert_eq!(
+            AppError::ListenerBind {
+                address: "127.0.0.1:8080",
+                message: "address already in use".to_owned(),
+            }
+            .exit_code(),
+            1
         );
     }
 }

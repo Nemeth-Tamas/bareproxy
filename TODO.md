@@ -27,7 +27,7 @@ Goal: establish the executable, error handling, testing conventions, and tiny in
 * [x] Replace the Cargo-generated hello-world executable.
 * [x] Add a BareProxy startup banner.
 * [x] Define the first top-level application error type using only `std`.
-* [ ] Return meaningful process exit codes for startup failures.
+* [x] Return meaningful process exit codes for startup failures.
 * [x] Add basic command-line argument handling without a CLI crate.
 * [x] Support `--help`.
 * [x] Support `--version`.
@@ -35,7 +35,7 @@ Goal: establish the executable, error handling, testing conventions, and tiny in
 * [x] Decide the default configuration file location.
 * [x] Add a test module and first unit test.
 * [x] Establish strict formatting/test/Clippy gates.
-* [ ] Document the WSL-first development environment.
+* [x] Document the WSL-first development environment.
 
 **Milestone complete when:** BareProxy starts cleanly, reports useful errors, passes strict gates, and still has zero dependencies.
 
@@ -45,9 +45,9 @@ Goal: establish the executable, error handling, testing conventions, and tiny in
 
 Goal: prove BareProxy can accept real connections using only `std::net`.
 
-* [ ] Bind a `TcpListener`.
-* [ ] Default development listener to `127.0.0.1:8080`.
-* [ ] Print the bound address during startup.
+* [x] Bind a `TcpListener`.
+* [x] Default development listener to `127.0.0.1:8080`.
+* [x] Print the bound address during startup.
 * [ ] Accept one incoming TCP connection.
 * [ ] Read bytes from the client.
 * [ ] Return a hard-coded valid HTTP/1.1 response.
@@ -55,7 +55,7 @@ Goal: prove BareProxy can accept real connections using only `std::net`.
 * [ ] Return a useful `Server` header.
 * [ ] Close the connection cleanly.
 * [ ] Handle client disconnects without crashing the process.
-* [ ] Handle listener errors explicitly.
+* [x] Handle listener errors explicitly.
 * [ ] Add a minimal localhost smoke-test procedure.
 
 **Milestone complete when:** a Windows browser or `curl` can reach BareProxy running inside WSL through localhost.
