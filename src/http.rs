@@ -17,6 +17,7 @@ pub const MAX_REQUEST_LINE_SIZE: usize = 8192;
 pub const MAX_HEADER_SIZE: usize = 8192;
 pub const MAX_HEADER_BLOCK_SIZE: usize = 32768;
 pub const MAX_HEADER_COUNT: usize = 100;
+pub const MAX_REQUEST_HEAD_SIZE: usize = MAX_REQUEST_LINE_SIZE + 2 + MAX_HEADER_BLOCK_SIZE + 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
@@ -87,15 +88,32 @@ impl fmt::Display for ParseError {
 impl Error for ParseError {}
 
 pub fn parse_request(input: &[u8]) -> Result<Request, ParseError> {
-    let header_end = find_bytes(input, b"\r\n\r\n").ok_or(ParseError::IncompleteHeaders)?;
-    let request_line_end = find_bytes(input, b"\r\n").ok_or(ParseError::InvalidRequestLine)?;
+    parse_request_with_consumed(input).map(|(request, _)| request)
+}
 
-    if request_line_end > header_end {
-        return Err(ParseError::InvalidRequestLine);
-    }
+pub fn parse_request_with_consumed(input: &[u8]) -> Result<(Request, usize), ParseError> {
+    let request_line_end = match find_bytes(input, b"\r\n") {
+        Some(index) => index,
+        None if input.len() > MAX_REQUEST_LINE_SIZE => {
+            return Err(ParseError::RequestLineTooLong);
+        }
+        None => return Err(ParseError::IncompleteHeaders),
+    };
 
     if request_line_end > MAX_REQUEST_LINE_SIZE {
         return Err(ParseError::RequestLineTooLong);
+    }
+
+    let header_end = match find_bytes(input, b"\r\n\r\n") {
+        Some(index) => index,
+        None if input.len() >= MAX_REQUEST_HEAD_SIZE => {
+            return Err(ParseError::HeadersTooLarge);
+        }
+        None => return Err(ParseError::IncompleteHeaders),
+    };
+
+    if request_line_end > header_end {
+        return Err(ParseError::InvalidRequestLine);
     }
 
     let header_block = if request_line_end == header_end {
@@ -114,16 +132,20 @@ pub fn parse_request(input: &[u8]) -> Result<Request, ParseError> {
     let content_length = parse_content_length(&headers)?;
     let has_transfer_encoding = has_header(&headers, "transfer-encoding");
     let keep_alive = !header_contains_token(&headers, "connection", b"close");
+    let bytes_consumed = header_end + 4;
 
-    Ok(Request {
-        method,
-        target,
-        version,
-        headers,
-        content_length,
-        has_transfer_encoding,
-        keep_alive,
-    })
+    Ok((
+        Request {
+            method,
+            target,
+            version,
+            headers,
+            content_length,
+            has_transfer_encoding,
+            keep_alive,
+        },
+        bytes_consumed,
+    ))
 }
 
 fn parse_request_line(input: &[u8]) -> Result<(String, String, HttpVersion), ParseError> {

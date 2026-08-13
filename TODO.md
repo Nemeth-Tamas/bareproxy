@@ -86,10 +86,10 @@ Goal: understand incoming HTTP requests ourselves instead of treating them as ar
 * [x] Parse `Content-Length`.
 * [x] Detect `Transfer-Encoding`.
 * [x] Detect connection persistence semantics.
-* [ ] Handle partial TCP reads correctly.
-* [ ] Preserve unread bytes after the header parser finishes.
+* [x] Handle partial TCP reads correctly.
+* [x] Preserve unread bytes after the header parser finishes.
 * [x] Add parser tests for valid requests.
-* [ ] Add parser tests for fragmented requests.
+* [x] Add parser tests for fragmented requests.
 * [x] Add parser tests for invalid requests.
 * [x] Add parser tests for size-limit failures.
 

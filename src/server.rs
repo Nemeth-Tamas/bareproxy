@@ -7,7 +7,7 @@ use crate::http;
 
 pub const DEV_LISTEN_ADDR: &str = "127.0.0.1:8080";
 
-const REQUEST_BUFFER_SIZE: usize = 8192;
+const READ_CHUNK_SIZE: usize = 4096;
 const RESPONSE_BODY: &str = "BareProxy is alive.\n";
 
 pub fn bind_listener() -> io::Result<TcpListener> {
@@ -29,18 +29,22 @@ pub fn serve_one(listener: &TcpListener) -> io::Result<()> {
 }
 
 fn handle_connection(stream: &mut TcpStream) -> io::Result<()> {
-    let mut request = [0_u8; REQUEST_BUFFER_SIZE];
-    let bytes_read = stream.read(&mut request)?;
-
-    if bytes_read == 0 {
+    let Some(received) = read_request_head(stream)? else {
         println!("Client disconnected before sending a request");
         return Ok(());
+    };
+
+    let ReceivedRequest {
+        request,
+        buffered_body,
+        bytes_read,
+    } = received;
+
+    println!("Read {bytes_read} bytes while receiving request headers");
+
+    if !buffered_body.is_empty() {
+        println!("Buffered body prefix: {} bytes", buffered_body.len());
     }
-
-    println!("Read {bytes_read} request bytes");
-
-    let request = http::parse_request(&request[..bytes_read])
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
     println!(
         "Request: {} {} {}",
@@ -78,6 +82,59 @@ fn handle_connection(stream: &mut TcpStream) -> io::Result<()> {
     Ok(())
 }
 
+struct ReceivedRequest {
+    request: http::Request,
+    buffered_body: Vec<u8>,
+    bytes_read: usize,
+}
+
+fn read_request_head(reader: &mut impl Read) -> io::Result<Option<ReceivedRequest>> {
+    let mut buffer = Vec::with_capacity(READ_CHUNK_SIZE);
+    let mut chunk = [0_u8; READ_CHUNK_SIZE];
+
+    loop {
+        match http::parse_request_with_consumed(&buffer) {
+            Ok((request, bytes_consumed)) => {
+                let buffered_body = buffer[bytes_consumed..].to_vec();
+
+                return Ok(Some(ReceivedRequest {
+                    request,
+                    buffered_body,
+                    bytes_read: buffer.len(),
+                }));
+            }
+            Err(http::ParseError::IncompleteHeaders) => {}
+            Err(error) => {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, error));
+            }
+        }
+
+        if buffer.len() >= http::MAX_REQUEST_HEAD_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HTTP request headers exceed maximum size",
+            ));
+        }
+
+        let remaining_capacity = http::MAX_REQUEST_HEAD_SIZE - buffer.len();
+        let read_limit = remaining_capacity.min(chunk.len());
+        let bytes_read = reader.read(&mut chunk[..read_limit])?;
+
+        if bytes_read == 0 {
+            if buffer.is_empty() {
+                return Ok(None);
+            }
+
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "client disconnected before completing HTTP request headers",
+            ));
+        }
+
+        buffer.extend_from_slice(&chunk[..bytes_read]);
+    }
+}
+
 fn build_response() -> String {
     format!(
         concat!(
@@ -108,7 +165,43 @@ fn is_client_disconnect(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RESPONSE_BODY, build_response};
+    use std::io::{self, Read};
+
+    use super::{RESPONSE_BODY, build_response, read_request_head};
+
+    struct FragmentedReader {
+        data: Vec<u8>,
+        position: usize,
+        max_chunk: usize,
+    }
+
+    impl FragmentedReader {
+        fn new(data: Vec<u8>, max_chunk: usize) -> Self {
+            Self {
+                data,
+                position: 0,
+                max_chunk,
+            }
+        }
+    }
+
+    impl Read for FragmentedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.position == self.data.len() {
+                return Ok(0);
+            }
+
+            let remaining = self.data.len() - self.position;
+            let bytes_read = remaining.min(buffer.len()).min(self.max_chunk);
+
+            buffer[..bytes_read]
+                .copy_from_slice(&self.data[self.position..self.position + bytes_read]);
+
+            self.position += bytes_read;
+
+            Ok(bytes_read)
+        }
+    }
 
     #[test]
     fn response_is_valid_http_11_success() {
@@ -136,5 +229,33 @@ mod tests {
     #[test]
     fn response_contains_expected_body() {
         assert!(build_response().ends_with(RESPONSE_BODY));
+    }
+
+    #[test]
+    fn reads_fragmented_request_headers() {
+        let mut reader = FragmentedReader::new(
+            b"GET /fragmented HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            3,
+        );
+
+        let received = read_request_head(&mut reader).unwrap().unwrap();
+
+        assert_eq!(received.request.method, "GET");
+        assert_eq!(received.request.target, "/fragmented");
+        assert_eq!(received.request.host(), Some("localhost"));
+        assert!(received.buffered_body.is_empty());
+    }
+
+    #[test]
+    fn preserves_body_bytes_received_with_headers() {
+        let mut reader = FragmentedReader::new(
+            b"POST /body HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello".to_vec(),
+            usize::MAX,
+        );
+
+        let received = read_request_head(&mut reader).unwrap().unwrap();
+
+        assert_eq!(received.request.content_length, Some(5));
+        assert_eq!(received.buffered_body, b"hello".to_vec());
     }
 }
