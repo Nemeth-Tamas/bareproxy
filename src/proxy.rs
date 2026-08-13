@@ -7,14 +7,19 @@ use std::{
 
 use crate::{config, http};
 
+const STREAM_BUFFER_SIZE: usize = 16 * 1024;
+const MAX_RESPONSE_HEAD_SIZE: usize = 64 * 1024;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProxyError {
     MissingHost,
     Connect { address: String, message: String },
     Write { message: String },
     Read { message: String },
+    ClientRead { message: String },
     EmptyResponse,
     IncompleteResponse,
+    ResponseStarted { message: String },
 }
 
 impl fmt::Display for ProxyError {
@@ -36,9 +41,21 @@ impl fmt::Display for ProxyError {
                     "failed to read response from upstream: {message}"
                 )
             }
+            Self::ClientRead { message } => {
+                write!(
+                    formatter,
+                    "failed to read request body from client: {message}"
+                )
+            }
             Self::EmptyResponse => formatter.write_str("upstream closed without a response"),
             Self::IncompleteResponse => {
                 formatter.write_str("upstream disconnected before completing its HTTP response")
+            }
+            Self::ResponseStarted { message } => {
+                write!(
+                    formatter,
+                    "upstream failed after response started: {message}"
+                )
             }
         }
     }
@@ -46,12 +63,16 @@ impl fmt::Display for ProxyError {
 
 impl Error for ProxyError {}
 
-pub fn exchange(
+pub fn exchange<S>(
     route: &config::Route,
     request: &http::Request,
-    request_body: &[u8],
+    client: &mut S,
+    buffered_body: &[u8],
     client_ip: IpAddr,
-) -> Result<Vec<u8>, ProxyError> {
+) -> Result<(), ProxyError>
+where
+    S: Read + Write,
+{
     let address = route.upstream().address();
 
     let mut upstream = TcpStream::connect(&address).map_err(|source| ProxyError::Connect {
@@ -67,19 +88,59 @@ pub fn exchange(
             message: source.to_string(),
         })?;
 
-    if !request_body.is_empty() {
-        upstream
-            .write_all(request_body)
-            .map_err(|source| ProxyError::Write {
-                message: source.to_string(),
-            })?;
+    if let Some(content_length) = request.content_length {
+        stream_request_body(client, &mut upstream, content_length, buffered_body)?;
     }
 
     upstream.flush().map_err(|source| ProxyError::Write {
         message: source.to_string(),
     })?;
 
-    let mut response = Vec::new();
+    let (response_head, buffered_response_body) = read_response_head(&mut upstream)?;
+
+    if request.method.eq_ignore_ascii_case("HEAD") {
+        client
+            .write_all(&response_head)
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
+
+        client
+            .flush()
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
+
+        return Ok(());
+    }
+
+    let header_bytes = &response_head[..response_head.len() - 4];
+
+    if let Some(content_length) = response_content_length(header_bytes) {
+        client
+            .write_all(&response_head)
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
+
+        stream_fixed_response_body(
+            &mut upstream,
+            client,
+            content_length,
+            &buffered_response_body,
+        )?;
+
+        client
+            .flush()
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
+
+        return Ok(());
+    }
+
+    let mut response = response_head;
+    response.extend_from_slice(&buffered_response_body);
 
     upstream
         .read_to_end(&mut response)
@@ -87,31 +148,149 @@ pub fn exchange(
             message: source.to_string(),
         })?;
 
-    if response.is_empty() {
-        return Err(ProxyError::EmptyResponse);
-    }
+    client
+        .write_all(&response)
+        .map_err(|source| ProxyError::ResponseStarted {
+            message: source.to_string(),
+        })?;
 
-    validate_response_completion(&response, &request.method)?;
+    client
+        .flush()
+        .map_err(|source| ProxyError::ResponseStarted {
+            message: source.to_string(),
+        })?;
 
-    Ok(response)
+    Ok(())
 }
 
-fn validate_response_completion(response: &[u8], request_method: &str) -> Result<(), ProxyError> {
-    let header_end = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or(ProxyError::IncompleteResponse)?;
+fn stream_request_body(
+    client: &mut impl Read,
+    upstream: &mut impl Write,
+    content_length: u64,
+    buffered_body: &[u8],
+) -> Result<(), ProxyError> {
+    let buffered_length = buffered_body.len().min(content_length as usize);
 
-    if request_method.eq_ignore_ascii_case("HEAD") {
-        return Ok(());
+    if buffered_length > 0 {
+        upstream
+            .write_all(&buffered_body[..buffered_length])
+            .map_err(|source| ProxyError::Write {
+                message: source.to_string(),
+            })?;
     }
 
-    if let Some(content_length) = response_content_length(&response[..header_end]) {
-        let body_length = response.len().saturating_sub(header_end + 4) as u64;
+    let mut remaining = content_length.saturating_sub(buffered_length as u64);
+    let mut buffer = [0_u8; STREAM_BUFFER_SIZE];
 
-        if body_length < content_length {
+    while remaining > 0 {
+        let read_limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+
+        let bytes_read =
+            client
+                .read(&mut buffer[..read_limit])
+                .map_err(|source| ProxyError::ClientRead {
+                    message: source.to_string(),
+                })?;
+
+        if bytes_read == 0 {
+            return Err(ProxyError::ClientRead {
+                message: "client disconnected before completing request body".to_owned(),
+            });
+        }
+
+        upstream
+            .write_all(&buffer[..bytes_read])
+            .map_err(|source| ProxyError::Write {
+                message: source.to_string(),
+            })?;
+
+        remaining -= bytes_read as u64;
+    }
+
+    Ok(())
+}
+
+fn read_response_head(upstream: &mut impl Read) -> Result<(Vec<u8>, Vec<u8>), ProxyError> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; STREAM_BUFFER_SIZE];
+
+    loop {
+        if let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            let body_start = header_end + 4;
+            let buffered_body = buffer[body_start..].to_vec();
+
+            buffer.truncate(body_start);
+
+            return Ok((buffer, buffered_body));
+        }
+
+        if buffer.len() >= MAX_RESPONSE_HEAD_SIZE {
             return Err(ProxyError::IncompleteResponse);
         }
+
+        let remaining_capacity = MAX_RESPONSE_HEAD_SIZE - buffer.len();
+        let read_limit = remaining_capacity.min(chunk.len());
+
+        let bytes_read =
+            upstream
+                .read(&mut chunk[..read_limit])
+                .map_err(|source| ProxyError::Read {
+                    message: source.to_string(),
+                })?;
+
+        if bytes_read == 0 {
+            if buffer.is_empty() {
+                return Err(ProxyError::EmptyResponse);
+            }
+
+            return Err(ProxyError::IncompleteResponse);
+        }
+
+        buffer.extend_from_slice(&chunk[..bytes_read]);
+    }
+}
+
+fn stream_fixed_response_body(
+    upstream: &mut impl Read,
+    client: &mut impl Write,
+    content_length: u64,
+    buffered_body: &[u8],
+) -> Result<(), ProxyError> {
+    let buffered_length = buffered_body.len().min(content_length as usize);
+
+    if buffered_length > 0 {
+        client
+            .write_all(&buffered_body[..buffered_length])
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
+    }
+
+    let mut remaining = content_length.saturating_sub(buffered_length as u64);
+    let mut buffer = [0_u8; STREAM_BUFFER_SIZE];
+
+    while remaining > 0 {
+        let read_limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+
+        let bytes_read = upstream.read(&mut buffer[..read_limit]).map_err(|source| {
+            ProxyError::ResponseStarted {
+                message: source.to_string(),
+            }
+        })?;
+
+        if bytes_read == 0 {
+            return Err(ProxyError::ResponseStarted {
+                message: "upstream disconnected before completing response body".to_owned(),
+            });
+        }
+
+        client
+            .write_all(&buffer[..bytes_read])
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
+
+        remaining -= bytes_read as u64;
     }
 
     Ok(())
@@ -229,7 +408,7 @@ fn trim_optional_whitespace(mut value: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{Read, Write},
+        io::{Cursor, Read, Write},
         net::{IpAddr, TcpListener},
         thread,
     };
@@ -320,9 +499,20 @@ upstream works\n",
                 .unwrap()
                 .0;
 
-        let response = exchange(route, &request, &[], IpAddr::from([127, 0, 0, 1])).unwrap();
+        let mut client = Cursor::new(Vec::new());
+
+        exchange(
+            route,
+            &request,
+            &mut client,
+            &[],
+            IpAddr::from([127, 0, 0, 1]),
+        )
+        .unwrap();
 
         upstream_thread.join().unwrap();
+
+        let response = client.into_inner();
 
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert!(response.ends_with(b"upstream works\n"));
@@ -360,10 +550,18 @@ tiny",
                 .unwrap()
                 .0;
 
-        let result = exchange(route, &request, &[], IpAddr::from([127, 0, 0, 1]));
+        let mut client = Cursor::new(Vec::new());
+
+        let result = exchange(
+            route,
+            &request,
+            &mut client,
+            &[],
+            IpAddr::from([127, 0, 0, 1]),
+        );
 
         upstream_thread.join().unwrap();
 
-        assert_eq!(result, Err(ProxyError::IncompleteResponse));
+        assert!(matches!(result, Err(ProxyError::ResponseStarted { .. })));
     }
 }

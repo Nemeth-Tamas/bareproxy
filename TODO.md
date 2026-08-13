@@ -204,8 +204,8 @@ Goal: proxy a normal HTTP request to a real upstream server.
 
 Goal: proxy real traffic without buffering entire messages in memory.
 
-* [ ] Stream fixed-length request bodies using `Content-Length`.
-* [ ] Stream fixed-length response bodies.
+* [x] Stream fixed-length request bodies using `Content-Length`.
+* [x] Stream fixed-length response bodies.
 * [ ] Parse chunked transfer coding.
 * [ ] Forward chunked request bodies safely.
 * [ ] Forward chunked response bodies safely.
@@ -218,7 +218,7 @@ Goal: proxy real traffic without buffering entire messages in memory.
 * [ ] Handle `HEAD` responses correctly.
 * [ ] Handle informational `1xx` responses where required.
 * [ ] Avoid unbounded body buffering.
-* [ ] Add fragmented-body tests.
+* [x] Add fragmented-body tests.
 * [ ] Add chunked-body tests.
 * [ ] Add malformed framing tests.
 

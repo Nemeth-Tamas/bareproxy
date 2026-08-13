@@ -8,7 +8,6 @@ use crate::{config, http, proxy};
 pub const DEV_LISTEN_ADDR: &str = "127.0.0.1:8080";
 
 const READ_CHUNK_SIZE: usize = 4096;
-const MAX_BUFFERED_REQUEST_BODY_SIZE: u64 = 8 * 1024 * 1024;
 
 #[cfg(test)]
 const RESPONSE_BODY: &str = "BareProxy is alive.\n";
@@ -93,28 +92,18 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
         );
     }
 
-    let request_body = match request.content_length {
-        Some(content_length) if content_length > MAX_BUFFERED_REQUEST_BODY_SIZE => {
-            return write_text_response(
-                stream,
-                http::StatusCode::ContentTooLarge,
-                "Content Too Large\n",
-            );
-        }
-        Some(content_length) => read_request_body(stream, content_length, &buffered_body)?,
-        None => Vec::new(),
-    };
-
-    if !request_body.is_empty() {
-        println!("Request body: {} bytes", request_body.len());
-    }
-
     let client_ip = stream.peer_addr()?.ip();
 
-    match proxy::exchange(route, &request, &request_body, client_ip) {
-        Ok(response) => {
-            stream.write_all(&response)?;
-            stream.flush()?;
+    match proxy::exchange(route, &request, stream, &buffered_body, client_ip) {
+        Ok(()) => {
+            let _ = stream.shutdown(Shutdown::Both);
+            Ok(())
+        }
+        Err(proxy::ProxyError::ClientRead { message }) => {
+            Err(io::Error::new(io::ErrorKind::UnexpectedEof, message))
+        }
+        Err(proxy::ProxyError::ResponseStarted { message }) => {
+            eprintln!("BareProxy upstream streaming error: {message}");
 
             let _ = stream.shutdown(Shutdown::Both);
 
@@ -179,43 +168,6 @@ fn read_request_head(reader: &mut impl Read) -> io::Result<Option<ReceivedReques
 
         buffer.extend_from_slice(&chunk[..bytes_read]);
     }
-}
-
-fn read_request_body(
-    reader: &mut impl Read,
-    content_length: u64,
-    buffered_body: &[u8],
-) -> io::Result<Vec<u8>> {
-    let expected_length = usize::try_from(content_length).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "request body length does not fit in memory",
-        )
-    })?;
-
-    let buffered_length = buffered_body.len().min(expected_length);
-
-    let mut body = Vec::with_capacity(expected_length);
-    body.extend_from_slice(&buffered_body[..buffered_length]);
-
-    let mut chunk = [0_u8; READ_CHUNK_SIZE];
-
-    while body.len() < expected_length {
-        let remaining = expected_length - body.len();
-        let read_limit = remaining.min(chunk.len());
-        let bytes_read = reader.read(&mut chunk[..read_limit])?;
-
-        if bytes_read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "client disconnected before completing request body",
-            ));
-        }
-
-        body.extend_from_slice(&chunk[..bytes_read]);
-    }
-
-    Ok(body)
 }
 
 fn select_route<'a>(
@@ -288,10 +240,7 @@ mod tests {
 
     use crate::{config, http};
 
-    use super::{
-        RESPONSE_BODY, build_response, read_request_body, read_request_head, select_route,
-        serve_one,
-    };
+    use super::{RESPONSE_BODY, build_response, read_request_head, select_route, serve_one};
 
     struct FragmentedReader {
         data: Vec<u8>,
@@ -395,15 +344,6 @@ mod tests {
 
         assert_eq!(received.request.content_length, Some(5));
         assert_eq!(received.buffered_body, b"hello".to_vec());
-    }
-
-    #[test]
-    fn reads_fixed_length_body_from_buffer_and_reader() {
-        let mut reader = FragmentedReader::new(b"llo".to_vec(), 1);
-
-        let body = read_request_body(&mut reader, 5, b"he").unwrap();
-
-        assert_eq!(body, b"hello".to_vec());
     }
 
     #[test]
