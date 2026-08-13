@@ -3,6 +3,8 @@ use std::{
     net::{Shutdown, TcpListener, TcpStream},
 };
 
+use crate::http;
+
 pub const DEV_LISTEN_ADDR: &str = "127.0.0.1:8080";
 
 const REQUEST_BUFFER_SIZE: usize = 8192;
@@ -36,6 +38,14 @@ fn handle_connection(stream: &mut TcpStream) -> io::Result<()> {
     }
 
     println!("Read {bytes_read} request bytes");
+
+    let request = http::parse_request(&request[..bytes_read])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+    println!(
+        "Request: {} {} {}",
+        request.method, request.target, request.version
+    );
 
     let response = build_response();
 

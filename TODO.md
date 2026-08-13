@@ -66,18 +66,18 @@ Goal: prove BareProxy can accept real connections using only `std::net`.
 
 Goal: understand incoming HTTP requests ourselves instead of treating them as arbitrary bytes.
 
-* [ ] Create an HTTP request representation.
-* [ ] Parse the request line.
-* [ ] Parse the HTTP method.
-* [ ] Parse the request target.
-* [ ] Parse the HTTP version.
+* [x] Create an HTTP request representation.
+* [x] Parse the request line.
+* [x] Parse the HTTP method.
+* [x] Parse the request target.
+* [x] Parse the HTTP version.
 * [ ] Parse header names.
 * [ ] Parse header values.
 * [ ] Treat header names case-insensitively where required.
-* [ ] Detect the end of the header section.
-* [ ] Reject malformed request lines.
+* [x] Detect the end of the header section.
+* [x] Reject malformed request lines.
 * [ ] Reject malformed headers.
-* [ ] Reject unsupported HTTP versions.
+* [x] Reject unsupported HTTP versions.
 * [ ] Add a maximum request-line size.
 * [ ] Add a maximum individual header size.
 * [ ] Add a maximum total header size.
@@ -88,9 +88,9 @@ Goal: understand incoming HTTP requests ourselves instead of treating them as ar
 * [ ] Detect connection persistence semantics.
 * [ ] Handle partial TCP reads correctly.
 * [ ] Preserve unread bytes after the header parser finishes.
-* [ ] Add parser tests for valid requests.
+* [x] Add parser tests for valid requests.
 * [ ] Add parser tests for fragmented requests.
-* [ ] Add parser tests for invalid requests.
+* [x] Add parser tests for invalid requests.
 * [ ] Add parser tests for size-limit failures.
 
 **Milestone complete when:** BareProxy can reliably turn arbitrary fragmented TCP input into a validated HTTP/1.1 request header.

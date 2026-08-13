@@ -1,4 +1,5 @@
 mod app;
+mod http;
 mod server;
 
 fn main() -> std::process::ExitCode {
