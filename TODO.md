@@ -101,21 +101,21 @@ Goal: understand incoming HTTP requests ourselves instead of treating them as ar
 
 Goal: generate proper responses for BareProxy itself.
 
-* [ ] Create an HTTP response representation.
-* [ ] Implement status-code serialization.
-* [ ] Implement response-header serialization.
-* [ ] Implement body serialization.
-* [ ] Generate `400 Bad Request`.
-* [ ] Generate `404 Not Found`.
-* [ ] Generate `405 Method Not Allowed` where appropriate.
-* [ ] Generate `413 Content Too Large` or equivalent limit responses where applicable.
-* [ ] Generate `431 Request Header Fields Too Large`.
-* [ ] Generate `500 Internal Server Error`.
-* [ ] Generate `502 Bad Gateway`.
-* [ ] Generate `503 Service Unavailable`.
-* [ ] Ensure generated responses contain correct lengths.
-* [ ] Ensure generated responses cannot accidentally create malformed headers.
-* [ ] Add serialization tests.
+* [x] Create an HTTP response representation.
+* [x] Implement status-code serialization.
+* [x] Implement response-header serialization.
+* [x] Implement body serialization.
+* [x] Generate `400 Bad Request`.
+* [x] Generate `404 Not Found`.
+* [x] Generate `405 Method Not Allowed` where appropriate.
+* [x] Generate `413 Content Too Large` or equivalent limit responses where applicable.
+* [x] Generate `431 Request Header Fields Too Large`.
+* [x] Generate `500 Internal Server Error`.
+* [x] Generate `502 Bad Gateway`.
+* [x] Generate `503 Service Unavailable`.
+* [x] Ensure generated responses contain correct lengths.
+* [x] Ensure generated responses cannot accidentally create malformed headers.
+* [x] Add serialization tests.
 
 **Milestone complete when:** every BareProxy-originated HTTP error can be generated consistently.
 

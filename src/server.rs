@@ -72,9 +72,10 @@ fn handle_connection(stream: &mut TcpStream) -> io::Result<()> {
         }
     );
 
-    let response = build_response();
+    let response =
+        build_response().map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
-    stream.write_all(response.as_bytes())?;
+    stream.write_all(&response)?;
     stream.flush()?;
 
     let _ = stream.shutdown(Shutdown::Both);
@@ -135,21 +136,16 @@ fn read_request_head(reader: &mut impl Read) -> io::Result<Option<ReceivedReques
     }
 }
 
-fn build_response() -> String {
-    format!(
-        concat!(
-            "HTTP/1.1 200 OK\r\n",
-            "Content-Length: {}\r\n",
-            "Content-Type: text/plain; charset=utf-8\r\n",
-            "Server: BareProxy/{}\r\n",
-            "Connection: close\r\n",
-            "\r\n",
-            "{}"
-        ),
-        RESPONSE_BODY.len(),
-        env!("CARGO_PKG_VERSION"),
-        RESPONSE_BODY
-    )
+fn build_response() -> Result<Vec<u8>, http::ResponseError> {
+    let response = http::Response::new(http::StatusCode::Ok, RESPONSE_BODY.as_bytes().to_vec())
+        .with_header("Content-Type", b"text/plain; charset=utf-8")?
+        .with_header(
+            "Server",
+            format!("BareProxy/{}", env!("CARGO_PKG_VERSION")).as_bytes(),
+        )?
+        .with_header("Connection", b"close")?;
+
+    response.serialize()
 }
 
 fn is_client_disconnect(error: &io::Error) -> bool {
@@ -205,17 +201,25 @@ mod tests {
 
     #[test]
     fn response_is_valid_http_11_success() {
-        assert!(build_response().starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(
+            build_response()
+                .unwrap()
+                .starts_with(b"HTTP/1.1 200 OK\r\n")
+        );
     }
 
     #[test]
     fn response_has_correct_content_length() {
-        assert!(build_response().contains(&format!("Content-Length: {}\r\n", RESPONSE_BODY.len())));
+        let response = String::from_utf8(build_response().unwrap()).unwrap();
+
+        assert!(response.contains(&format!("Content-Length: {}\r\n", RESPONSE_BODY.len())));
     }
 
     #[test]
     fn response_has_bareproxy_server_header() {
-        assert!(build_response().contains(&format!(
+        let response = String::from_utf8(build_response().unwrap()).unwrap();
+
+        assert!(response.contains(&format!(
             "Server: BareProxy/{}\r\n",
             env!("CARGO_PKG_VERSION")
         )));
@@ -223,12 +227,18 @@ mod tests {
 
     #[test]
     fn response_closes_connection() {
-        assert!(build_response().contains("Connection: close\r\n"));
+        let response = String::from_utf8(build_response().unwrap()).unwrap();
+
+        assert!(response.contains("Connection: close\r\n"));
     }
 
     #[test]
     fn response_contains_expected_body() {
-        assert!(build_response().ends_with(RESPONSE_BODY));
+        assert!(
+            build_response()
+                .unwrap()
+                .ends_with(RESPONSE_BODY.as_bytes())
+        );
     }
 
     #[test]

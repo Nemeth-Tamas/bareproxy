@@ -25,6 +25,145 @@ pub struct Header {
     pub value: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusCode {
+    Ok,
+    BadRequest,
+    NotFound,
+    MethodNotAllowed,
+    ContentTooLarge,
+    RequestHeaderFieldsTooLarge,
+    InternalServerError,
+    BadGateway,
+    ServiceUnavailable,
+}
+
+impl StatusCode {
+    pub const fn code(self) -> u16 {
+        match self {
+            Self::Ok => 200,
+            Self::BadRequest => 400,
+            Self::NotFound => 404,
+            Self::MethodNotAllowed => 405,
+            Self::ContentTooLarge => 413,
+            Self::RequestHeaderFieldsTooLarge => 431,
+            Self::InternalServerError => 500,
+            Self::BadGateway => 502,
+            Self::ServiceUnavailable => 503,
+        }
+    }
+
+    pub const fn reason_phrase(self) -> &'static str {
+        match self {
+            Self::Ok => "OK",
+            Self::BadRequest => "Bad Request",
+            Self::NotFound => "Not Found",
+            Self::MethodNotAllowed => "Method Not Allowed",
+            Self::ContentTooLarge => "Content Too Large",
+            Self::RequestHeaderFieldsTooLarge => "Request Header Fields Too Large",
+            Self::InternalServerError => "Internal Server Error",
+            Self::BadGateway => "Bad Gateway",
+            Self::ServiceUnavailable => "Service Unavailable",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResponseError {
+    InvalidHeaderName,
+    InvalidHeaderValue,
+    ManagedHeader(String),
+}
+
+impl fmt::Display for ResponseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidHeaderName => formatter.write_str("invalid HTTP response header name"),
+            Self::InvalidHeaderValue => formatter.write_str("invalid HTTP response header value"),
+            Self::ManagedHeader(name) => {
+                write!(formatter, "BareProxy manages response header: {name}")
+            }
+        }
+    }
+}
+
+impl Error for ResponseError {}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Response {
+    status: StatusCode,
+    headers: Vec<Header>,
+    body: Vec<u8>,
+}
+
+impl Response {
+    pub fn new(status: StatusCode, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body,
+        }
+    }
+
+    pub fn with_header(mut self, name: &str, value: &[u8]) -> Result<Self, ResponseError> {
+        validate_response_header(name, value)?;
+
+        self.headers.push(Header {
+            name: name.to_owned(),
+            value: value.to_vec(),
+        });
+
+        Ok(self)
+    }
+
+    pub fn serialize(&self) -> Result<Vec<u8>, ResponseError> {
+        for header in &self.headers {
+            validate_response_header(&header.name, &header.value)?;
+        }
+
+        let mut output = Vec::new();
+
+        output.extend_from_slice(
+            format!(
+                "HTTP/1.1 {} {}\r\n",
+                self.status.code(),
+                self.status.reason_phrase()
+            )
+            .as_bytes(),
+        );
+
+        for header in &self.headers {
+            output.extend_from_slice(header.name.as_bytes());
+            output.extend_from_slice(b": ");
+            output.extend_from_slice(&header.value);
+            output.extend_from_slice(b"\r\n");
+        }
+
+        output.extend_from_slice(format!("Content-Length: {}\r\n", self.body.len()).as_bytes());
+        output.extend_from_slice(b"\r\n");
+        output.extend_from_slice(&self.body);
+
+        Ok(output)
+    }
+}
+
+fn validate_response_header(name: &str, value: &[u8]) -> Result<(), ResponseError> {
+    if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("transfer-encoding")
+    {
+        return Err(ResponseError::ManagedHeader(name.to_owned()));
+    }
+
+    if name.is_empty() || !name.bytes().all(is_token_byte) {
+        return Err(ResponseError::InvalidHeaderName);
+    }
+
+    if !value.iter().copied().all(is_valid_header_value_byte) {
+        return Err(ResponseError::InvalidHeaderValue);
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Request {
     pub method: String,
@@ -349,7 +488,8 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::{
         Header, HttpVersion, MAX_HEADER_BLOCK_SIZE, MAX_HEADER_COUNT, MAX_HEADER_SIZE,
-        MAX_REQUEST_LINE_SIZE, ParseError, Request, parse_request,
+        MAX_REQUEST_LINE_SIZE, ParseError, Request, Response, ResponseError, StatusCode,
+        parse_request,
     };
 
     #[test]
@@ -581,5 +721,103 @@ mod tests {
             parse_request(b"GET / HTTP/1.1\r\nConnection: keep-alive, CLOSE\r\n\r\n").unwrap();
 
         assert!(!request.keep_alive);
+    }
+
+    #[test]
+    fn serializes_response_headers_and_body() {
+        let response = Response::new(StatusCode::Ok, b"hello".to_vec())
+            .with_header("Content-Type", b"text/plain")
+            .unwrap()
+            .with_header("Connection", b"close")
+            .unwrap()
+            .serialize()
+            .unwrap();
+
+        assert_eq!(
+            response,
+            b"HTTP/1.1 200 OK\r\n\
+Content-Type: text/plain\r\n\
+Connection: close\r\n\
+Content-Length: 5\r\n\
+\r\n\
+hello"
+        );
+    }
+
+    #[test]
+    fn serializes_all_planned_status_codes() {
+        let cases = [
+            (StatusCode::Ok, "200 OK"),
+            (StatusCode::BadRequest, "400 Bad Request"),
+            (StatusCode::NotFound, "404 Not Found"),
+            (StatusCode::MethodNotAllowed, "405 Method Not Allowed"),
+            (StatusCode::ContentTooLarge, "413 Content Too Large"),
+            (
+                StatusCode::RequestHeaderFieldsTooLarge,
+                "431 Request Header Fields Too Large",
+            ),
+            (StatusCode::InternalServerError, "500 Internal Server Error"),
+            (StatusCode::BadGateway, "502 Bad Gateway"),
+            (StatusCode::ServiceUnavailable, "503 Service Unavailable"),
+        ];
+
+        for (status, expected) in cases {
+            let response = Response::new(status, Vec::new()).serialize().unwrap();
+            let status_line_end = response
+                .windows(2)
+                .position(|window| window == b"\r\n")
+                .unwrap();
+
+            assert_eq!(
+                &response[..status_line_end],
+                format!("HTTP/1.1 {expected}").as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn serializer_calculates_content_length_from_body() {
+        let response = Response::new(StatusCode::Ok, vec![0, 1, 2, 3, 4, 5, 6])
+            .serialize()
+            .unwrap();
+
+        assert!(
+            response
+                .windows(b"Content-Length: 7\r\n".len())
+                .any(|window| window == b"Content-Length: 7\r\n")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_response_header_name() {
+        assert_eq!(
+            Response::new(StatusCode::Ok, Vec::new()).with_header("Bad Header", b"value"),
+            Err(ResponseError::InvalidHeaderName)
+        );
+    }
+
+    #[test]
+    fn rejects_response_header_injection() {
+        assert_eq!(
+            Response::new(StatusCode::Ok, Vec::new())
+                .with_header("X-Test", b"safe\r\nInjected: absolutely-not"),
+            Err(ResponseError::InvalidHeaderValue)
+        );
+    }
+
+    #[test]
+    fn rejects_caller_supplied_content_length() {
+        assert_eq!(
+            Response::new(StatusCode::Ok, Vec::new()).with_header("Content-Length", b"9001"),
+            Err(ResponseError::ManagedHeader("Content-Length".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rejects_caller_supplied_transfer_encoding() {
+        assert_eq!(
+            Response::new(StatusCode::Ok, Vec::new()).with_header("Transfer-Encoding", b"chunked"),
+            Err(ResponseError::ManagedHeader("Transfer-Encoding".to_owned()))
+        );
     }
 }
