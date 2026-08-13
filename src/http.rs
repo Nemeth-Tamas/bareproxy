@@ -87,6 +87,7 @@ impl fmt::Display for ParseError {
 
 impl Error for ParseError {}
 
+#[cfg(test)]
 pub fn parse_request(input: &[u8]) -> Result<Request, ParseError> {
     parse_request_with_consumed(input).map(|(request, _)| request)
 }
