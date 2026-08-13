@@ -214,10 +214,10 @@ Goal: proxy real traffic without buffering entire messages in memory.
 * [x] Reject malformed chunk sizes.
 * [x] Reject conflicting `Content-Length` values.
 * [x] Reject unsafe `Content-Length` + `Transfer-Encoding` combinations.
-* [ ] Handle responses with no body.
-* [ ] Handle `HEAD` responses correctly.
+* [x] Handle responses with no body.
+* [x] Handle `HEAD` responses correctly.
 * [ ] Handle informational `1xx` responses where required.
-* [ ] Avoid unbounded body buffering.
+* [x] Avoid unbounded body buffering.
 * [x] Add fragmented-body tests.
 * [x] Add chunked-body tests.
 * [x] Add malformed framing tests.

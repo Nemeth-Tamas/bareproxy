@@ -117,97 +117,7 @@ where
         message: source.to_string(),
     })?;
 
-    let (response_head, buffered_response_body) = read_response_head(&mut upstream)?;
-
-    if request.method.eq_ignore_ascii_case("HEAD") {
-        client
-            .write_all(&response_head)
-            .map_err(|source| ProxyError::ResponseStarted {
-                message: source.to_string(),
-            })?;
-
-        client
-            .flush()
-            .map_err(|source| ProxyError::ResponseStarted {
-                message: source.to_string(),
-            })?;
-
-        return Ok(());
-    }
-
-    let header_bytes = &response_head[..response_head.len() - 4];
-    let transfer_framing = response_transfer_framing(header_bytes)?;
-    let content_length = response_content_length(header_bytes);
-
-    if transfer_framing != ResponseTransferFraming::None && content_length.is_some() {
-        return Err(ProxyError::InvalidUpstreamResponse {
-            message: "response contains both Content-Length and Transfer-Encoding".to_owned(),
-        });
-    }
-
-    if transfer_framing == ResponseTransferFraming::Chunked {
-        client
-            .write_all(&response_head)
-            .map_err(|source| ProxyError::ResponseStarted {
-                message: source.to_string(),
-            })?;
-
-        stream_chunked_response_body(&mut upstream, client, &buffered_response_body)?;
-
-        client
-            .flush()
-            .map_err(|source| ProxyError::ResponseStarted {
-                message: source.to_string(),
-            })?;
-
-        return Ok(());
-    }
-
-    if let Some(content_length) = content_length {
-        client
-            .write_all(&response_head)
-            .map_err(|source| ProxyError::ResponseStarted {
-                message: source.to_string(),
-            })?;
-
-        stream_fixed_response_body(
-            &mut upstream,
-            client,
-            content_length,
-            &buffered_response_body,
-        )?;
-
-        client
-            .flush()
-            .map_err(|source| ProxyError::ResponseStarted {
-                message: source.to_string(),
-            })?;
-
-        return Ok(());
-    }
-
-    let mut response = response_head;
-    response.extend_from_slice(&buffered_response_body);
-
-    upstream
-        .read_to_end(&mut response)
-        .map_err(|source| ProxyError::Read {
-            message: source.to_string(),
-        })?;
-
-    client
-        .write_all(&response)
-        .map_err(|source| ProxyError::ResponseStarted {
-            message: source.to_string(),
-        })?;
-
-    client
-        .flush()
-        .map_err(|source| ProxyError::ResponseStarted {
-            message: source.to_string(),
-        })?;
-
-    Ok(())
+    forward_response(&mut upstream, client, &request.method)
 }
 
 struct PrefixedReader<'a, R> {
@@ -575,8 +485,105 @@ fn stream_request_body(
     Ok(())
 }
 
-fn read_response_head(upstream: &mut impl Read) -> Result<(Vec<u8>, Vec<u8>), ProxyError> {
-    let mut buffer = Vec::new();
+fn forward_response(
+    upstream: &mut impl Read,
+    client: &mut impl Write,
+    request_method: &str,
+) -> Result<(), ProxyError> {
+    let mut buffered = Vec::new();
+
+    loop {
+        let (response_head, buffered_response_body) = read_response_head(upstream, &buffered)?;
+
+        let status = response_status_code(&response_head)?;
+
+        if status == 101 {
+            return Err(ProxyError::InvalidUpstreamResponse {
+                message: "101 Switching Protocols requires upgrade tunnelling".to_owned(),
+            });
+        }
+
+        if is_interim_response(status) {
+            client
+                .write_all(&response_head)
+                .map_err(|source| ProxyError::ResponseStarted {
+                    message: source.to_string(),
+                })?;
+
+            client
+                .flush()
+                .map_err(|source| ProxyError::ResponseStarted {
+                    message: source.to_string(),
+                })?;
+
+            buffered = buffered_response_body;
+            continue;
+        }
+
+        if response_has_no_body(request_method, status) {
+            client
+                .write_all(&response_head)
+                .map_err(|source| ProxyError::ResponseStarted {
+                    message: source.to_string(),
+                })?;
+
+            client
+                .flush()
+                .map_err(|source| ProxyError::ResponseStarted {
+                    message: source.to_string(),
+                })?;
+
+            return Ok(());
+        }
+
+        let header_bytes = &response_head[..response_head.len() - 4];
+        let transfer_framing = response_transfer_framing(header_bytes)?;
+        let content_length = response_content_length(header_bytes);
+
+        if transfer_framing != ResponseTransferFraming::None && content_length.is_some() {
+            return Err(ProxyError::InvalidUpstreamResponse {
+                message: "response contains both Content-Length and Transfer-Encoding".to_owned(),
+            });
+        }
+
+        client
+            .write_all(&response_head)
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
+
+        match (transfer_framing, content_length) {
+            (ResponseTransferFraming::Chunked, _) => {
+                stream_chunked_response_body(upstream, client, &buffered_response_body)?;
+            }
+            (_, Some(content_length)) => {
+                stream_fixed_response_body(
+                    upstream,
+                    client,
+                    content_length,
+                    &buffered_response_body,
+                )?;
+            }
+            _ => {
+                stream_close_delimited_response_body(upstream, client, &buffered_response_body)?;
+            }
+        }
+
+        client
+            .flush()
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
+
+        return Ok(());
+    }
+}
+
+fn read_response_head(
+    upstream: &mut impl Read,
+    buffered_prefix: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), ProxyError> {
+    let mut buffer = buffered_prefix.to_vec();
     let mut chunk = [0_u8; STREAM_BUFFER_SIZE];
 
     loop {
@@ -612,6 +619,102 @@ fn read_response_head(upstream: &mut impl Read) -> Result<(Vec<u8>, Vec<u8>), Pr
         }
 
         buffer.extend_from_slice(&chunk[..bytes_read]);
+    }
+}
+
+fn response_status_code(response_head: &[u8]) -> Result<u16, ProxyError> {
+    let line_end = response_head
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .ok_or_else(|| ProxyError::InvalidUpstreamResponse {
+            message: "response has no complete status line".to_owned(),
+        })?;
+
+    let status_line = &response_head[..line_end];
+
+    let first_space = status_line
+        .iter()
+        .position(|byte| *byte == b' ')
+        .ok_or_else(|| ProxyError::InvalidUpstreamResponse {
+            message: "malformed response status line".to_owned(),
+        })?;
+
+    let second_space = status_line[first_space + 1..]
+        .iter()
+        .position(|byte| *byte == b' ')
+        .map(|index| first_space + 1 + index)
+        .ok_or_else(|| ProxyError::InvalidUpstreamResponse {
+            message: "malformed response status line".to_owned(),
+        })?;
+
+    let version = &status_line[..first_space];
+    let code = &status_line[first_space + 1..second_space];
+
+    if version != b"HTTP/1.0" && version != b"HTTP/1.1" {
+        return Err(ProxyError::InvalidUpstreamResponse {
+            message: "unsupported upstream HTTP version".to_owned(),
+        });
+    }
+
+    if code.len() != 3 || !code.iter().all(|byte| byte.is_ascii_digit()) {
+        return Err(ProxyError::InvalidUpstreamResponse {
+            message: "invalid response status code".to_owned(),
+        });
+    }
+
+    let status = u16::from(code[0] - b'0') * 100
+        + u16::from(code[1] - b'0') * 10
+        + u16::from(code[2] - b'0');
+
+    if !(100..=599).contains(&status) {
+        return Err(ProxyError::InvalidUpstreamResponse {
+            message: "response status code is outside the valid range".to_owned(),
+        });
+    }
+
+    Ok(status)
+}
+
+fn is_interim_response(status: u16) -> bool {
+    (100..200).contains(&status) && status != 101
+}
+
+fn response_has_no_body(request_method: &str, status: u16) -> bool {
+    request_method.eq_ignore_ascii_case("HEAD") || matches!(status, 204 | 304)
+}
+
+fn stream_close_delimited_response_body(
+    upstream: &mut impl Read,
+    client: &mut impl Write,
+    buffered_body: &[u8],
+) -> Result<(), ProxyError> {
+    if !buffered_body.is_empty() {
+        client
+            .write_all(buffered_body)
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
+    }
+
+    let mut buffer = [0_u8; STREAM_BUFFER_SIZE];
+
+    loop {
+        let bytes_read =
+            upstream
+                .read(&mut buffer)
+                .map_err(|source| ProxyError::ResponseStarted {
+                    message: source.to_string(),
+                })?;
+
+        if bytes_read == 0 {
+            return Ok(());
+        }
+
+        client
+            .write_all(&buffer[..bytes_read])
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
     }
 }
 
@@ -1030,7 +1133,7 @@ mod tests {
 
     use super::{
         ProxyError, exchange, serialize_request_head, stream_chunked_request_body,
-        stream_chunked_response_body,
+        stream_chunked_response_body, stream_close_delimited_response_body,
     };
 
     struct FragmentedReader {
@@ -1151,6 +1254,16 @@ Trailer: X-End\r\n\
         stream_chunked_response_body(&mut upstream, &mut client, buffered).unwrap();
 
         assert_eq!(client, body);
+    }
+
+    #[test]
+    fn streams_close_delimited_response_without_buffering_whole_body() {
+        let mut upstream = FragmentedReader::new(b"llo world".to_vec(), 2);
+        let mut client = Vec::new();
+
+        stream_close_delimited_response_body(&mut upstream, &mut client, b"he").unwrap();
+
+        assert_eq!(client, b"hello world");
     }
 
     #[test]
@@ -1329,5 +1442,167 @@ X-End: yes\r\n\
         );
 
         assert!(response.ends_with(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\nX-End: yes\r\n\r\n"));
+    }
+
+    #[test]
+    fn head_response_does_not_require_a_body() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+
+            let _ = stream.read(&mut request).unwrap();
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+Content-Length: 999\r\n\
+Connection: close\r\n\
+\r\n",
+                )
+                .unwrap();
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let route = configuration.route_for_host("localhost").unwrap();
+
+        let request =
+            http::parse_request_with_consumed(b"HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap()
+                .0;
+
+        let mut client = Cursor::new(Vec::new());
+
+        exchange(
+            route,
+            &request,
+            &mut client,
+            &[],
+            IpAddr::from([127, 0, 0, 1]),
+        )
+        .unwrap();
+
+        upstream_thread.join().unwrap();
+
+        let response = client.into_inner();
+
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with(b"\r\n\r\n"));
+    }
+
+    #[test]
+    fn no_content_response_does_not_forward_a_body() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+
+            let _ = stream.read(&mut request).unwrap();
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\n\
+Connection: close\r\n\
+\r\n\
+this-must-not-be-forwarded",
+                )
+                .unwrap();
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let route = configuration.route_for_host("localhost").unwrap();
+
+        let request =
+            http::parse_request_with_consumed(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap()
+                .0;
+
+        let mut client = Cursor::new(Vec::new());
+
+        exchange(
+            route,
+            &request,
+            &mut client,
+            &[],
+            IpAddr::from([127, 0, 0, 1]),
+        )
+        .unwrap();
+
+        upstream_thread.join().unwrap();
+
+        let response = client.into_inner();
+
+        assert!(response.starts_with(b"HTTP/1.1 204 No Content\r\n"));
+        assert!(!response.ends_with(b"this-must-not-be-forwarded"));
+        assert!(response.ends_with(b"\r\n\r\n"));
+    }
+
+    #[test]
+    fn forwards_interim_response_before_final_response() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+
+            let _ = stream.read(&mut request).unwrap();
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 103 Early Hints\r\n\
+Link: </style.css>; rel=preload\r\n\
+\r\n\
+HTTP/1.1 200 OK\r\n\
+Content-Length: 2\r\n\
+Connection: close\r\n\
+\r\n\
+OK",
+                )
+                .unwrap();
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let route = configuration.route_for_host("localhost").unwrap();
+
+        let request =
+            http::parse_request_with_consumed(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap()
+                .0;
+
+        let mut client = Cursor::new(Vec::new());
+
+        exchange(
+            route,
+            &request,
+            &mut client,
+            &[],
+            IpAddr::from([127, 0, 0, 1]),
+        )
+        .unwrap();
+
+        upstream_thread.join().unwrap();
+
+        let response = client.into_inner();
+
+        assert!(response.starts_with(b"HTTP/1.1 103 Early Hints\r\n"));
+
+        assert!(
+            response
+                .windows(b"HTTP/1.1 200 OK\r\n".len())
+                .any(|window| window == b"HTTP/1.1 200 OK\r\n")
+        );
+
+        assert!(response.ends_with(b"OK"));
     }
 }
