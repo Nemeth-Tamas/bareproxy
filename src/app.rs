@@ -101,7 +101,7 @@ fn start_proxy(config_path: &str) -> Result<(), AppError> {
 
     println!("Listening on http://{}", server::DEV_LISTEN_ADDR);
 
-    server::serve_one(&listener).map_err(|source| AppError::Server {
+    server::serve_one(&listener, &config).map_err(|source| AppError::Server {
         message: source.to_string(),
     })
 }

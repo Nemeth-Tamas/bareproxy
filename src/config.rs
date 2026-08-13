@@ -9,6 +9,15 @@ impl Config {
     pub fn routes(&self) -> &[Route] {
         &self.routes
     }
+
+    pub fn route_for_host(&self, host: &str) -> Result<&Route, RouteLookupError> {
+        let hostname = normalize_request_host(host).ok_or(RouteLookupError::InvalidHost)?;
+
+        self.routes
+            .iter()
+            .find(|route| route.hostname == hostname)
+            .ok_or(RouteLookupError::NotFound(hostname))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +36,21 @@ impl fmt::Display for Route {
 pub struct Upstream {
     host: String,
     port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteLookupError {
+    InvalidHost,
+    NotFound(String),
+}
+
+impl fmt::Display for RouteLookupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidHost => formatter.write_str("invalid Host header"),
+            Self::NotFound(hostname) => write!(formatter, "no route for {hostname}"),
+        }
+    }
 }
 
 impl fmt::Display for Upstream {
@@ -131,6 +155,30 @@ fn normalize_hostname(hostname: &str) -> Option<String> {
     Some(hostname.to_ascii_lowercase())
 }
 
+fn normalize_request_host(host: &str) -> Option<String> {
+    let host = host.trim();
+
+    if host.is_empty() {
+        return None;
+    }
+
+    let hostname = if let Some((hostname, port)) = host.rsplit_once(':') {
+        if hostname.contains(':')
+            || port.is_empty()
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+            || port.parse::<u16>().is_err()
+        {
+            return None;
+        }
+
+        hostname
+    } else {
+        host
+    };
+
+    normalize_hostname(hostname)
+}
+
 fn is_valid_hostname(hostname: &str) -> bool {
     if hostname.is_empty() || hostname.len() > 253 || !hostname.is_ascii() {
         return false;
@@ -233,7 +281,7 @@ fn parse_port(port: &str) -> Result<u16, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigError, Route, Upstream, parse};
+    use super::{Config, ConfigError, Route, RouteLookupError, Upstream, parse};
 
     #[test]
     fn parses_route() {
@@ -364,6 +412,70 @@ example.test 127.0.0.1:3000"
                 line: 1,
                 message: "IPv6 upstreams must use `[address]:port` syntax".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn matches_route_by_hostname() {
+        let config = parse("example.test -> 127.0.0.1:3000").unwrap();
+
+        assert_eq!(
+            config.route_for_host("example.test").unwrap().hostname,
+            "example.test"
+        );
+    }
+
+    #[test]
+    fn route_lookup_ignores_hostname_case() {
+        let config = parse("example.test -> 127.0.0.1:3000").unwrap();
+
+        assert_eq!(
+            config.route_for_host("EXAMPLE.TEST").unwrap().hostname,
+            "example.test"
+        );
+    }
+
+    #[test]
+    fn route_lookup_ignores_explicit_host_port() {
+        let config = parse("example.test -> 127.0.0.1:3000").unwrap();
+
+        assert_eq!(
+            config.route_for_host("Example.Test:8080").unwrap().hostname,
+            "example.test"
+        );
+    }
+
+    #[test]
+    fn route_lookup_selects_correct_route() {
+        let config = parse(
+            "one.test -> 127.0.0.1:3000
+two.test -> 127.0.0.1:4000",
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.route_for_host("two.test").unwrap().upstream.port,
+            4000
+        );
+    }
+
+    #[test]
+    fn unknown_host_returns_not_found() {
+        let config = parse("example.test -> 127.0.0.1:3000").unwrap();
+
+        assert_eq!(
+            config.route_for_host("missing.test"),
+            Err(RouteLookupError::NotFound("missing.test".to_owned()))
+        );
+    }
+
+    #[test]
+    fn invalid_host_is_rejected() {
+        let config = parse("example.test -> 127.0.0.1:3000").unwrap();
+
+        assert_eq!(
+            config.route_for_host("example.test:potato"),
+            Err(RouteLookupError::InvalidHost)
         );
     }
 }

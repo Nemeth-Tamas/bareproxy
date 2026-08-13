@@ -3,7 +3,7 @@ use std::{
     net::{Shutdown, TcpListener, TcpStream},
 };
 
-use crate::http;
+use crate::{config, http};
 
 pub const DEV_LISTEN_ADDR: &str = "127.0.0.1:8080";
 
@@ -14,11 +14,11 @@ pub fn bind_listener() -> io::Result<TcpListener> {
     TcpListener::bind(DEV_LISTEN_ADDR)
 }
 
-pub fn serve_one(listener: &TcpListener) -> io::Result<()> {
+pub fn serve_one(listener: &TcpListener, configuration: &config::Config) -> io::Result<()> {
     let (mut stream, peer_addr) = listener.accept()?;
     println!("Accepted connection from {peer_addr}");
 
-    match handle_connection(&mut stream) {
+    match handle_connection(&mut stream, configuration) {
         Ok(()) => Ok(()),
         Err(error) if is_client_disconnect(&error) => {
             println!("Client {peer_addr} disconnected: {error}");
@@ -28,7 +28,7 @@ pub fn serve_one(listener: &TcpListener) -> io::Result<()> {
     }
 }
 
-fn handle_connection(stream: &mut TcpStream) -> io::Result<()> {
+fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> io::Result<()> {
     let Some(received) = read_request_head(stream)? else {
         println!("Client disconnected before sending a request");
         return Ok(());
@@ -72,15 +72,17 @@ fn handle_connection(stream: &mut TcpStream) -> io::Result<()> {
         }
     );
 
-    let response =
-        build_response().map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let route = match select_route(&request, configuration) {
+        Ok(route) => route,
+        Err(status) => {
+            let body = format!("{}\n", status.reason_phrase());
+            return write_text_response(stream, status, &body);
+        }
+    };
 
-    stream.write_all(&response)?;
-    stream.flush()?;
+    println!("Matched route: {route}");
 
-    let _ = stream.shutdown(Shutdown::Both);
-
-    Ok(())
+    write_text_response(stream, http::StatusCode::Ok, RESPONSE_BODY)
 }
 
 struct ReceivedRequest {
@@ -136,8 +138,40 @@ fn read_request_head(reader: &mut impl Read) -> io::Result<Option<ReceivedReques
     }
 }
 
-fn build_response() -> Result<Vec<u8>, http::ResponseError> {
-    let response = http::Response::new(http::StatusCode::Ok, RESPONSE_BODY.as_bytes().to_vec())
+fn select_route<'a>(
+    request: &http::Request,
+    configuration: &'a config::Config,
+) -> Result<&'a config::Route, http::StatusCode> {
+    let host = request.host().ok_or(http::StatusCode::BadRequest)?;
+
+    match configuration.route_for_host(host) {
+        Ok(route) => Ok(route),
+        Err(config::RouteLookupError::InvalidHost) => Err(http::StatusCode::BadRequest),
+        Err(config::RouteLookupError::NotFound(_)) => Err(http::StatusCode::NotFound),
+    }
+}
+
+fn write_text_response(
+    stream: &mut TcpStream,
+    status: http::StatusCode,
+    body: &str,
+) -> io::Result<()> {
+    let response = build_text_response(status, body)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+    stream.write_all(&response)?;
+    stream.flush()?;
+
+    let _ = stream.shutdown(Shutdown::Both);
+
+    Ok(())
+}
+
+fn build_text_response(
+    status: http::StatusCode,
+    body: &str,
+) -> Result<Vec<u8>, http::ResponseError> {
+    let response = http::Response::new(status, body.as_bytes().to_vec())
         .with_header("Content-Type", b"text/plain; charset=utf-8")?
         .with_header(
             "Server",
@@ -146,6 +180,11 @@ fn build_response() -> Result<Vec<u8>, http::ResponseError> {
         .with_header("Connection", b"close")?;
 
     response.serialize()
+}
+
+#[cfg(test)]
+fn build_response() -> Result<Vec<u8>, http::ResponseError> {
+    build_text_response(http::StatusCode::Ok, RESPONSE_BODY)
 }
 
 fn is_client_disconnect(error: &io::Error) -> bool {
@@ -163,7 +202,9 @@ fn is_client_disconnect(error: &io::Error) -> bool {
 mod tests {
     use std::io::{self, Read};
 
-    use super::{RESPONSE_BODY, build_response, read_request_head};
+    use crate::{config, http};
+
+    use super::{RESPONSE_BODY, build_response, read_request_head, select_route};
 
     struct FragmentedReader {
         data: Vec<u8>,
@@ -267,5 +308,45 @@ mod tests {
 
         assert_eq!(received.request.content_length, Some(5));
         assert_eq!(received.buffered_body, b"hello".to_vec());
+    }
+
+    #[test]
+    fn missing_host_is_bad_request() {
+        let request = http::parse_request_with_consumed(b"GET / HTTP/1.1\r\n\r\n")
+            .unwrap()
+            .0;
+        let configuration = config::parse("localhost -> 127.0.0.1:3000").unwrap();
+
+        assert_eq!(
+            select_route(&request, &configuration),
+            Err(http::StatusCode::BadRequest)
+        );
+    }
+
+    #[test]
+    fn unknown_host_is_not_found() {
+        let request =
+            http::parse_request_with_consumed(b"GET / HTTP/1.1\r\nHost: missing.test\r\n\r\n")
+                .unwrap()
+                .0;
+
+        let configuration = config::parse("localhost -> 127.0.0.1:3000").unwrap();
+
+        assert_eq!(
+            select_route(&request, &configuration),
+            Err(http::StatusCode::NotFound)
+        );
+    }
+
+    #[test]
+    fn configured_host_selects_route() {
+        let request =
+            http::parse_request_with_consumed(b"GET / HTTP/1.1\r\nHost: LOCALHOST:8080\r\n\r\n")
+                .unwrap()
+                .0;
+
+        let configuration = config::parse("localhost -> 127.0.0.1:3000").unwrap();
+
+        assert!(select_route(&request, &configuration).is_ok());
     }
 }

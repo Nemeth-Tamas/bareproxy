@@ -160,15 +160,15 @@ api.example.test -> 127.0.0.1:4000
 
 Goal: select an upstream based on the HTTP `Host` header.
 
-* [ ] Match an incoming `Host` against configured routes.
-* [ ] Correctly handle `Host` values containing a port.
-* [ ] Normalize hostname casing.
-* [ ] Reject requests without `Host` where HTTP/1.1 requires it.
-* [ ] Return `404` for unknown hosts.
-* [ ] Prevent ambiguous duplicate hostname mappings.
-* [ ] Add route lookup tests.
-* [ ] Add tests for host casing.
-* [ ] Add tests for explicit host ports.
+* [x] Match an incoming `Host` against configured routes.
+* [x] Correctly handle `Host` values containing a port.
+* [x] Normalize hostname casing.
+* [x] Reject requests without `Host` where HTTP/1.1 requires it.
+* [x] Return `404` for unknown hosts.
+* [x] Prevent ambiguous duplicate hostname mappings.
+* [x] Add route lookup tests.
+* [x] Add tests for host casing.
+* [x] Add tests for explicit host ports.
 
 **Milestone complete when:** multiple local hostnames can reach different upstream applications through one BareProxy listener.
 
