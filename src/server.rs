@@ -79,8 +79,10 @@ fn handle_accepted_connection(
 }
 
 fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> io::Result<()> {
+    let mut buffered = Vec::new();
+
     loop {
-        let Some(received) = read_request_head(stream)? else {
+        let Some(received) = read_request_head(stream, &buffered)? else {
             println!("Client disconnected before sending a request");
             return Ok(());
         };
@@ -136,11 +138,20 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
         let client_ip = stream.peer_addr()?.ip();
 
         match proxy::exchange(route, &request, stream, &buffered_body, client_ip) {
-            Ok(()) if request.keep_alive => {
+            Ok(result) if request.keep_alive && result.client_reusable => {
+                buffered = result.buffered_client_bytes;
+
+                if !buffered.is_empty() {
+                    println!(
+                        "Preserved {} buffered byte(s) for the next request",
+                        buffered.len()
+                    );
+                }
+
                 println!("Keeping client connection alive");
                 continue;
             }
-            Ok(()) => {
+            Ok(_) => {
                 let _ = stream.shutdown(Shutdown::Both);
                 return Ok(());
             }
@@ -174,8 +185,13 @@ struct ReceivedRequest {
     bytes_read: usize,
 }
 
-fn read_request_head(reader: &mut impl Read) -> io::Result<Option<ReceivedRequest>> {
-    let mut buffer = Vec::with_capacity(READ_CHUNK_SIZE);
+fn read_request_head(
+    reader: &mut impl Read,
+    buffered_prefix: &[u8],
+) -> io::Result<Option<ReceivedRequest>> {
+    let mut buffer = Vec::with_capacity(READ_CHUNK_SIZE.max(buffered_prefix.len()));
+    buffer.extend_from_slice(buffered_prefix);
+
     let mut chunk = [0_u8; READ_CHUNK_SIZE];
 
     loop {
@@ -382,7 +398,7 @@ mod tests {
             3,
         );
 
-        let received = read_request_head(&mut reader).unwrap().unwrap();
+        let received = read_request_head(&mut reader, &[]).unwrap().unwrap();
 
         assert_eq!(received.request.method, "GET");
         assert_eq!(received.request.target, "/fragmented");
@@ -397,7 +413,7 @@ mod tests {
             usize::MAX,
         );
 
-        let received = read_request_head(&mut reader).unwrap().unwrap();
+        let received = read_request_head(&mut reader, &[]).unwrap().unwrap();
 
         assert_eq!(received.request.content_length, Some(5));
         assert_eq!(received.buffered_body, b"hello".to_vec());
@@ -791,5 +807,109 @@ Content-Length: 6\r\n\
 \r\n\
 second"
         );
+    }
+
+    #[test]
+    fn preserves_pipelined_request_after_fixed_length_body() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let expected_requests: [&[u8]; 2] =
+                [b"POST /first HTTP/1.1\r\n", b"GET /second HTTP/1.1\r\n"];
+
+            let responses: [&[u8]; 2] = [
+                b"HTTP/1.1 200 OK\r\n\
+Content-Length: 5\r\n\
+\r\n\
+first",
+                b"HTTP/1.1 200 OK\r\n\
+Content-Length: 6\r\n\
+\r\n\
+second",
+            ];
+
+            for (expected_request, response) in expected_requests.into_iter().zip(responses) {
+                let (mut stream, _) = upstream_listener.accept().unwrap();
+
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 512];
+
+                loop {
+                    let bytes_read = stream.read(&mut chunk).unwrap();
+
+                    if bytes_read == 0 {
+                        break;
+                    }
+
+                    request.extend_from_slice(&chunk[..bytes_read]);
+
+                    let complete = if expected_request.starts_with(b"POST") {
+                        request
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .is_some_and(|header_end| request.len() >= header_end + 4 + 5)
+                    } else {
+                        request.windows(4).any(|window| window == b"\r\n\r\n")
+                    };
+
+                    if complete {
+                        break;
+                    }
+                }
+
+                assert!(request.starts_with(expected_request));
+
+                if expected_request.starts_with(b"POST") {
+                    assert!(request.ends_with(b"hello"));
+                }
+
+                stream.write_all(response).unwrap();
+            }
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let bare_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bare_address = bare_listener.local_addr().unwrap();
+
+        let bare_thread = thread::spawn(move || {
+            serve_one(&bare_listener, &configuration).unwrap();
+        });
+
+        let mut client = TcpStream::connect(bare_address).unwrap();
+
+        client
+            .write_all(
+                b"POST /first HTTP/1.1\r\n\
+Host: localhost\r\n\
+Content-Length: 5\r\n\
+\r\n\
+hello\
+GET /second HTTP/1.1\r\n\
+Host: localhost\r\n\
+Connection: close\r\n\
+\r\n",
+            )
+            .unwrap();
+
+        client.shutdown(Shutdown::Write).unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        bare_thread.join().unwrap();
+        upstream_thread.join().unwrap();
+
+        assert_eq!(
+            response
+                .windows(b"HTTP/1.1 200 OK\r\n".len())
+                .filter(|window| *window == b"HTTP/1.1 200 OK\r\n")
+                .count(),
+            2
+        );
+
+        assert!(response.ends_with(b"second"));
     }
 }

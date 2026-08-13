@@ -232,7 +232,7 @@ Goal: stop behaving like a single-request toy server.
 
 * [x] Support HTTP/1.1 client keep-alive.
 * [x] Parse multiple requests on one connection.
-* [ ] Preserve buffered bytes between requests.
+* [x] Preserve buffered bytes between requests.
 * [ ] Support upstream keep-alive where safe.
 * [ ] Decide when upstream connections may be reused.
 * [ ] Close connections when protocol rules require it.

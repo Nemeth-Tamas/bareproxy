@@ -88,13 +88,19 @@ enum ContinueOutcome {
     FinalResponseForwarded,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExchangeResult {
+    pub buffered_client_bytes: Vec<u8>,
+    pub client_reusable: bool,
+}
+
 pub fn exchange<S>(
     route: &config::Route,
     request: &http::Request,
     client: &mut S,
     buffered_body: &[u8],
     client_ip: IpAddr,
-) -> Result<(), ProxyError>
+) -> Result<ExchangeResult, ProxyError>
 where
     S: Read + Write,
 {
@@ -120,23 +126,35 @@ where
 
         match await_continue_or_final_response(&mut upstream, client, &request.method)? {
             ContinueOutcome::Continue(buffered) => buffered,
-            ContinueOutcome::FinalResponseForwarded => return Ok(()),
+            ContinueOutcome::FinalResponseForwarded => {
+                return Ok(ExchangeResult {
+                    buffered_client_bytes: Vec::new(),
+                    client_reusable: false,
+                });
+            }
         }
     } else {
         Vec::new()
     };
 
-    if request.has_transfer_encoding {
-        stream_chunked_request_body(client, &mut upstream, buffered_body)?;
+    let buffered_client_bytes = if request.has_transfer_encoding {
+        stream_chunked_request_body(client, &mut upstream, buffered_body)?
     } else if let Some(content_length) = request.content_length {
-        stream_request_body(client, &mut upstream, content_length, buffered_body)?;
-    }
+        stream_request_body(client, &mut upstream, content_length, buffered_body)?
+    } else {
+        buffered_body.to_vec()
+    };
 
     upstream.flush().map_err(|source| ProxyError::Write {
         message: source.to_string(),
     })?;
 
-    forward_response(&mut upstream, client, &request.method, &buffered_response)
+    forward_response(&mut upstream, client, &request.method, &buffered_response)?;
+
+    Ok(ExchangeResult {
+        buffered_client_bytes,
+        client_reusable: true,
+    })
 }
 
 struct PrefixedReader<'a, R> {
@@ -152,6 +170,10 @@ impl<'a, R> PrefixedReader<'a, R> {
             prefix_position: 0,
             inner,
         }
+    }
+
+    fn remaining_prefix(&self) -> &[u8] {
+        &self.prefix[self.prefix_position..]
     }
 }
 
@@ -179,7 +201,7 @@ fn stream_chunked_request_body(
     client: &mut impl Read,
     upstream: &mut impl Write,
     buffered_body: &[u8],
-) -> Result<(), ProxyError> {
+) -> Result<Vec<u8>, ProxyError> {
     let mut reader = PrefixedReader::new(buffered_body, client);
 
     loop {
@@ -195,7 +217,7 @@ fn stream_chunked_request_body(
 
         if chunk_size == 0 {
             stream_request_trailers(&mut reader, upstream)?;
-            return Ok(());
+            return Ok(reader.remaining_prefix().to_vec());
         }
 
         stream_chunk_data(&mut reader, upstream, chunk_size)?;
@@ -462,8 +484,9 @@ fn stream_request_body(
     upstream: &mut impl Write,
     content_length: u64,
     buffered_body: &[u8],
-) -> Result<(), ProxyError> {
+) -> Result<Vec<u8>, ProxyError> {
     let buffered_length = buffered_body.len().min(content_length as usize);
+    let buffered_client_bytes = buffered_body[buffered_length..].to_vec();
 
     if buffered_length > 0 {
         upstream
@@ -501,7 +524,7 @@ fn stream_request_body(
         remaining -= bytes_read as u64;
     }
 
-    Ok(())
+    Ok(buffered_client_bytes)
 }
 
 fn request_expects_continue(request: &http::Request) -> bool {
@@ -1374,13 +1397,19 @@ Trailer: X-End\r\n\
     #[test]
     fn streams_fragmented_chunked_body_with_trailer() {
         let body = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\nX-End: yes\r\n\r\n";
-        let buffered = &body[..5];
-        let mut client = FragmentedReader::new(body[5..].to_vec(), 2);
+        let next_request = b"GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        let mut buffered = Vec::new();
+        buffered.extend_from_slice(body);
+        buffered.extend_from_slice(next_request);
+
+        let mut client = FragmentedReader::new(Vec::new(), 2);
         let mut upstream = Vec::new();
 
-        stream_chunked_request_body(&mut client, &mut upstream, buffered).unwrap();
+        let remaining = stream_chunked_request_body(&mut client, &mut upstream, &buffered).unwrap();
 
         assert_eq!(upstream, body);
+        assert_eq!(remaining, next_request);
     }
 
     #[test]
