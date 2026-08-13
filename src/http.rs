@@ -197,6 +197,8 @@ pub enum ParseError {
     InvalidHeader,
     InvalidContentLength,
     ConflictingContentLength,
+    InvalidTransferEncoding,
+    AmbiguousBodyFraming,
     RequestLineTooLong,
     HeaderTooLong,
     HeadersTooLarge,
@@ -213,6 +215,12 @@ impl fmt::Display for ParseError {
             Self::InvalidContentLength => formatter.write_str("invalid Content-Length"),
             Self::ConflictingContentLength => {
                 formatter.write_str("conflicting Content-Length values")
+            }
+            Self::InvalidTransferEncoding => {
+                formatter.write_str("invalid or unsupported Transfer-Encoding")
+            }
+            Self::AmbiguousBodyFraming => {
+                formatter.write_str("request contains both Content-Length and Transfer-Encoding")
             }
             Self::RequestLineTooLong => formatter.write_str("HTTP request line is too long"),
             Self::HeaderTooLong => formatter.write_str("HTTP header is too long"),
@@ -271,7 +279,12 @@ pub fn parse_request_with_consumed(input: &[u8]) -> Result<(Request, usize), Par
     let (method, target, version) = parse_request_line(&input[..request_line_end])?;
     let headers = parse_headers(header_block)?;
     let content_length = parse_content_length(&headers)?;
-    let has_transfer_encoding = has_header(&headers, "transfer-encoding");
+    let has_transfer_encoding = parse_transfer_encoding(&headers)?;
+
+    if content_length.is_some() && has_transfer_encoding {
+        return Err(ParseError::AmbiguousBodyFraming);
+    }
+
     let keep_alive = !header_contains_token(&headers, "connection", b"close");
     let bytes_consumed = header_end + 4;
 
@@ -411,10 +424,25 @@ fn parse_content_length(headers: &[Header]) -> Result<Option<u64>, ParseError> {
     Ok(content_length)
 }
 
-fn has_header(headers: &[Header], name: &str) -> bool {
-    headers
+fn parse_transfer_encoding(headers: &[Header]) -> Result<bool, ParseError> {
+    let mut saw_chunked = false;
+
+    for header in headers
         .iter()
-        .any(|header| header.name.eq_ignore_ascii_case(name))
+        .filter(|header| header.name.eq_ignore_ascii_case("transfer-encoding"))
+    {
+        for coding in header.value.split(|byte| *byte == b',') {
+            let coding = trim_optional_whitespace(coding);
+
+            if coding.is_empty() || !coding.eq_ignore_ascii_case(b"chunked") || saw_chunked {
+                return Err(ParseError::InvalidTransferEncoding);
+            }
+
+            saw_chunked = true;
+        }
+    }
+
+    Ok(saw_chunked)
 }
 
 fn header_contains_token(headers: &[Header], name: &str, token: &[u8]) -> bool {
@@ -707,6 +735,32 @@ mod tests {
             parse_request(b"POST / HTTP/1.1\r\nTrAnSfEr-EnCoDiNg: chunked\r\n\r\n").unwrap();
 
         assert!(request.has_transfer_encoding);
+    }
+
+    #[test]
+    fn rejects_unsupported_transfer_encoding() {
+        assert_eq!(
+            parse_request(b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"),
+            Err(ParseError::InvalidTransferEncoding)
+        );
+    }
+
+    #[test]
+    fn rejects_repeated_chunked_transfer_encoding() {
+        assert_eq!(
+            parse_request(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked, chunked\r\n\r\n"),
+            Err(ParseError::InvalidTransferEncoding)
+        );
+    }
+
+    #[test]
+    fn rejects_content_length_with_transfer_encoding() {
+        assert_eq!(
+            parse_request(
+                b"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"
+            ),
+            Err(ParseError::AmbiguousBodyFraming)
+        );
     }
 
     #[test]

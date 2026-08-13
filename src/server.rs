@@ -84,20 +84,17 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
 
     println!("Matched route: {route}");
 
-    if request.has_transfer_encoding {
-        return write_text_response(
-            stream,
-            http::StatusCode::BadRequest,
-            "Transfer-Encoding request bodies are not available yet.\n",
-        );
-    }
-
     let client_ip = stream.peer_addr()?.ip();
 
     match proxy::exchange(route, &request, stream, &buffered_body, client_ip) {
         Ok(()) => {
             let _ = stream.shutdown(Shutdown::Both);
             Ok(())
+        }
+        Err(proxy::ProxyError::InvalidClientBody { message }) => {
+            eprintln!("BareProxy request framing error: {message}");
+
+            write_text_response(stream, http::StatusCode::BadRequest, "Bad Request\n")
         }
         Err(proxy::ProxyError::ClientRead { message }) => {
             Err(io::Error::new(io::ErrorKind::UnexpectedEof, message))

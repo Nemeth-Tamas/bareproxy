@@ -206,21 +206,21 @@ Goal: proxy real traffic without buffering entire messages in memory.
 
 * [x] Stream fixed-length request bodies using `Content-Length`.
 * [x] Stream fixed-length response bodies.
-* [ ] Parse chunked transfer coding.
-* [ ] Forward chunked request bodies safely.
+* [x] Parse chunked transfer coding.
+* [x] Forward chunked request bodies safely.
 * [ ] Forward chunked response bodies safely.
-* [ ] Handle the terminating zero-size chunk.
-* [ ] Handle trailer sections.
-* [ ] Reject malformed chunk sizes.
-* [ ] Reject conflicting `Content-Length` values.
-* [ ] Reject unsafe `Content-Length` + `Transfer-Encoding` combinations.
+* [x] Handle the terminating zero-size chunk.
+* [x] Handle trailer sections.
+* [x] Reject malformed chunk sizes.
+* [x] Reject conflicting `Content-Length` values.
+* [x] Reject unsafe `Content-Length` + `Transfer-Encoding` combinations.
 * [ ] Handle responses with no body.
 * [ ] Handle `HEAD` responses correctly.
 * [ ] Handle informational `1xx` responses where required.
 * [ ] Avoid unbounded body buffering.
 * [x] Add fragmented-body tests.
-* [ ] Add chunked-body tests.
-* [ ] Add malformed framing tests.
+* [x] Add chunked-body tests.
+* [x] Add malformed framing tests.
 
 **Milestone complete when:** large uploads and downloads can pass through BareProxy with bounded memory usage.
 
