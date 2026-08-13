@@ -47,6 +47,10 @@ fn handle_connection(stream: &mut TcpStream) -> io::Result<()> {
         request.method, request.target, request.version
     );
 
+    if let Some(host) = request.host() {
+        println!("Host: {host}");
+    }
+
     let response = build_response();
 
     stream.write_all(response.as_bytes())?;

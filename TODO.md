@@ -71,18 +71,18 @@ Goal: understand incoming HTTP requests ourselves instead of treating them as ar
 * [x] Parse the HTTP method.
 * [x] Parse the request target.
 * [x] Parse the HTTP version.
-* [ ] Parse header names.
-* [ ] Parse header values.
-* [ ] Treat header names case-insensitively where required.
+* [x] Parse header names.
+* [x] Parse header values.
+* [x] Treat header names case-insensitively where required.
 * [x] Detect the end of the header section.
 * [x] Reject malformed request lines.
-* [ ] Reject malformed headers.
+* [x] Reject malformed headers.
 * [x] Reject unsupported HTTP versions.
-* [ ] Add a maximum request-line size.
-* [ ] Add a maximum individual header size.
-* [ ] Add a maximum total header size.
-* [ ] Add a maximum header count.
-* [ ] Parse `Host`.
+* [x] Add a maximum request-line size.
+* [x] Add a maximum individual header size.
+* [x] Add a maximum total header size.
+* [x] Add a maximum header count.
+* [x] Parse `Host`.
 * [ ] Parse `Content-Length`.
 * [ ] Detect `Transfer-Encoding`.
 * [ ] Detect connection persistence semantics.
@@ -91,7 +91,7 @@ Goal: understand incoming HTTP requests ourselves instead of treating them as ar
 * [x] Add parser tests for valid requests.
 * [ ] Add parser tests for fragmented requests.
 * [x] Add parser tests for invalid requests.
-* [ ] Add parser tests for size-limit failures.
+* [x] Add parser tests for size-limit failures.
 
 **Milestone complete when:** BareProxy can reliably turn arbitrary fragmented TCP input into a validated HTTP/1.1 request header.
 
