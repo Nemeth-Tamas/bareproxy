@@ -8,6 +8,7 @@ use crate::{config, http, proxy};
 pub const DEV_LISTEN_ADDR: &str = "127.0.0.1:8080";
 
 const READ_CHUNK_SIZE: usize = 4096;
+const MAX_BUFFERED_REQUEST_BODY_SIZE: u64 = 8 * 1024 * 1024;
 
 #[cfg(test)]
 const RESPONSE_BODY: &str = "BareProxy is alive.\n";
@@ -84,17 +85,33 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
 
     println!("Matched route: {route}");
 
-    if request.has_transfer_encoding || request.content_length.unwrap_or(0) > 0 {
+    if request.has_transfer_encoding {
         return write_text_response(
             stream,
             http::StatusCode::BadRequest,
-            "Request body proxying is not available yet.\n",
+            "Transfer-Encoding request bodies are not available yet.\n",
         );
+    }
+
+    let request_body = match request.content_length {
+        Some(content_length) if content_length > MAX_BUFFERED_REQUEST_BODY_SIZE => {
+            return write_text_response(
+                stream,
+                http::StatusCode::ContentTooLarge,
+                "Content Too Large\n",
+            );
+        }
+        Some(content_length) => read_request_body(stream, content_length, &buffered_body)?,
+        None => Vec::new(),
+    };
+
+    if !request_body.is_empty() {
+        println!("Request body: {} bytes", request_body.len());
     }
 
     let client_ip = stream.peer_addr()?.ip();
 
-    match proxy::exchange(route, &request, client_ip) {
+    match proxy::exchange(route, &request, &request_body, client_ip) {
         Ok(response) => {
             stream.write_all(&response)?;
             stream.flush()?;
@@ -162,6 +179,43 @@ fn read_request_head(reader: &mut impl Read) -> io::Result<Option<ReceivedReques
 
         buffer.extend_from_slice(&chunk[..bytes_read]);
     }
+}
+
+fn read_request_body(
+    reader: &mut impl Read,
+    content_length: u64,
+    buffered_body: &[u8],
+) -> io::Result<Vec<u8>> {
+    let expected_length = usize::try_from(content_length).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request body length does not fit in memory",
+        )
+    })?;
+
+    let buffered_length = buffered_body.len().min(expected_length);
+
+    let mut body = Vec::with_capacity(expected_length);
+    body.extend_from_slice(&buffered_body[..buffered_length]);
+
+    let mut chunk = [0_u8; READ_CHUNK_SIZE];
+
+    while body.len() < expected_length {
+        let remaining = expected_length - body.len();
+        let read_limit = remaining.min(chunk.len());
+        let bytes_read = reader.read(&mut chunk[..read_limit])?;
+
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "client disconnected before completing request body",
+            ));
+        }
+
+        body.extend_from_slice(&chunk[..bytes_read]);
+    }
+
+    Ok(body)
 }
 
 fn select_route<'a>(
@@ -234,7 +288,10 @@ mod tests {
 
     use crate::{config, http};
 
-    use super::{RESPONSE_BODY, build_response, read_request_head, select_route, serve_one};
+    use super::{
+        RESPONSE_BODY, build_response, read_request_body, read_request_head, select_route,
+        serve_one,
+    };
 
     struct FragmentedReader {
         data: Vec<u8>,
@@ -338,6 +395,15 @@ mod tests {
 
         assert_eq!(received.request.content_length, Some(5));
         assert_eq!(received.buffered_body, b"hello".to_vec());
+    }
+
+    #[test]
+    fn reads_fixed_length_body_from_buffer_and_reader() {
+        let mut reader = FragmentedReader::new(b"llo".to_vec(), 1);
+
+        let body = read_request_body(&mut reader, 5, b"he").unwrap();
+
+        assert_eq!(body, b"hello".to_vec());
     }
 
     #[test]
@@ -453,5 +519,90 @@ Connection: close\r\n\
 
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert!(response.ends_with(b"hello upstream!\n"));
+    }
+
+    #[test]
+    fn proxies_post_body_end_to_end() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 512];
+
+            loop {
+                let bytes_read = stream.read(&mut chunk).unwrap();
+
+                if bytes_read == 0 {
+                    break;
+                }
+
+                request.extend_from_slice(&chunk[..bytes_read]);
+
+                let complete = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .is_some_and(|header_end| request.len() >= header_end + 4 + 5);
+
+                if complete {
+                    break;
+                }
+            }
+
+            assert!(request.starts_with(b"POST /body HTTP/1.1\r\n"));
+            assert!(
+                request
+                    .windows(b"Content-Length: 5\r\n".len())
+                    .any(|window| window == b"Content-Length: 5\r\n")
+            );
+            assert!(request.ends_with(b"hello"));
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+Content-Length: 10\r\n\
+Connection: close\r\n\
+\r\n\
+got hello\n",
+                )
+                .unwrap();
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let bare_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bare_address = bare_listener.local_addr().unwrap();
+
+        let bare_thread = thread::spawn(move || {
+            serve_one(&bare_listener, &configuration).unwrap();
+        });
+
+        let mut client = TcpStream::connect(bare_address).unwrap();
+
+        client
+            .write_all(
+                b"POST /body HTTP/1.1\r\n\
+Host: localhost\r\n\
+Content-Length: 5\r\n\
+Connection: close\r\n\
+\r\n\
+he",
+            )
+            .unwrap();
+
+        client.write_all(b"llo").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        bare_thread.join().unwrap();
+        upstream_thread.join().unwrap();
+
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with(b"got hello\n"));
     }
 }

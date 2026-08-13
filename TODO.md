@@ -188,11 +188,11 @@ Goal: proxy a normal HTTP request to a real upstream server.
 * [x] Add `X-Forwarded-For`.
 * [x] Add `X-Forwarded-Host`.
 * [x] Add `X-Forwarded-Proto`.
-* [ ] Send the request body upstream.
+* [x] Send the request body upstream.
 * [x] Read the upstream response.
 * [x] Forward the upstream response to the client.
 * [x] Handle upstream connection refusal.
-* [ ] Handle upstream disconnects.
+* [x] Handle upstream disconnects.
 * [x] Return `502 Bad Gateway` when appropriate.
 * [x] Add an end-to-end proxy test using a local test upstream.
 

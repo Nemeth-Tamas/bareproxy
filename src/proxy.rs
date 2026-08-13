@@ -14,6 +14,7 @@ pub enum ProxyError {
     Write { message: String },
     Read { message: String },
     EmptyResponse,
+    IncompleteResponse,
 }
 
 impl fmt::Display for ProxyError {
@@ -36,6 +37,9 @@ impl fmt::Display for ProxyError {
                 )
             }
             Self::EmptyResponse => formatter.write_str("upstream closed without a response"),
+            Self::IncompleteResponse => {
+                formatter.write_str("upstream disconnected before completing its HTTP response")
+            }
         }
     }
 }
@@ -45,6 +49,7 @@ impl Error for ProxyError {}
 pub fn exchange(
     route: &config::Route,
     request: &http::Request,
+    request_body: &[u8],
     client_ip: IpAddr,
 ) -> Result<Vec<u8>, ProxyError> {
     let address = route.upstream().address();
@@ -62,6 +67,14 @@ pub fn exchange(
             message: source.to_string(),
         })?;
 
+    if !request_body.is_empty() {
+        upstream
+            .write_all(request_body)
+            .map_err(|source| ProxyError::Write {
+                message: source.to_string(),
+            })?;
+    }
+
     upstream.flush().map_err(|source| ProxyError::Write {
         message: source.to_string(),
     })?;
@@ -78,7 +91,50 @@ pub fn exchange(
         return Err(ProxyError::EmptyResponse);
     }
 
+    validate_response_completion(&response, &request.method)?;
+
     Ok(response)
+}
+
+fn validate_response_completion(response: &[u8], request_method: &str) -> Result<(), ProxyError> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or(ProxyError::IncompleteResponse)?;
+
+    if request_method.eq_ignore_ascii_case("HEAD") {
+        return Ok(());
+    }
+
+    if let Some(content_length) = response_content_length(&response[..header_end]) {
+        let body_length = response.len().saturating_sub(header_end + 4) as u64;
+
+        if body_length < content_length {
+            return Err(ProxyError::IncompleteResponse);
+        }
+    }
+
+    Ok(())
+}
+
+fn response_content_length(headers: &[u8]) -> Option<u64> {
+    for line in headers.split(|byte| *byte == b'\n').skip(1) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let separator = line.iter().position(|byte| *byte == b':')?;
+
+        let name = &line[..separator];
+
+        if !name.eq_ignore_ascii_case(b"content-length") {
+            continue;
+        }
+
+        let value = trim_optional_whitespace(&line[separator + 1..]);
+        let value = std::str::from_utf8(value).ok()?;
+
+        return value.parse::<u64>().ok();
+    }
+
+    None
 }
 
 fn serialize_request_head(
@@ -180,7 +236,7 @@ mod tests {
 
     use crate::{config, http};
 
-    use super::{exchange, serialize_request_head};
+    use super::{ProxyError, exchange, serialize_request_head};
 
     #[test]
     fn serializes_request_for_upstream() {
@@ -264,11 +320,50 @@ upstream works\n",
                 .unwrap()
                 .0;
 
-        let response = exchange(route, &request, IpAddr::from([127, 0, 0, 1])).unwrap();
+        let response = exchange(route, &request, &[], IpAddr::from([127, 0, 0, 1])).unwrap();
 
         upstream_thread.join().unwrap();
 
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert!(response.ends_with(b"upstream works\n"));
+    }
+
+    #[test]
+    fn rejects_truncated_upstream_response() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+
+            let _ = stream.read(&mut request).unwrap();
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+Content-Length: 100\r\n\
+Connection: close\r\n\
+\r\n\
+tiny",
+                )
+                .unwrap();
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let route = configuration.route_for_host("localhost").unwrap();
+
+        let request =
+            http::parse_request_with_consumed(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap()
+                .0;
+
+        let result = exchange(route, &request, &[], IpAddr::from([127, 0, 0, 1]));
+
+        upstream_thread.join().unwrap();
+
+        assert_eq!(result, Err(ProxyError::IncompleteResponse));
     }
 }
