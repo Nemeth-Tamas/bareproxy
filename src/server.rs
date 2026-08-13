@@ -3,11 +3,13 @@ use std::{
     net::{Shutdown, TcpListener, TcpStream},
 };
 
-use crate::{config, http};
+use crate::{config, http, proxy};
 
 pub const DEV_LISTEN_ADDR: &str = "127.0.0.1:8080";
 
 const READ_CHUNK_SIZE: usize = 4096;
+
+#[cfg(test)]
 const RESPONSE_BODY: &str = "BareProxy is alive.\n";
 
 pub fn bind_listener() -> io::Result<TcpListener> {
@@ -82,7 +84,31 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
 
     println!("Matched route: {route}");
 
-    write_text_response(stream, http::StatusCode::Ok, RESPONSE_BODY)
+    if request.has_transfer_encoding || request.content_length.unwrap_or(0) > 0 {
+        return write_text_response(
+            stream,
+            http::StatusCode::BadRequest,
+            "Request body proxying is not available yet.\n",
+        );
+    }
+
+    let client_ip = stream.peer_addr()?.ip();
+
+    match proxy::exchange(route, &request, client_ip) {
+        Ok(response) => {
+            stream.write_all(&response)?;
+            stream.flush()?;
+
+            let _ = stream.shutdown(Shutdown::Both);
+
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("BareProxy upstream error: {error}");
+
+            write_text_response(stream, http::StatusCode::BadGateway, "Bad Gateway\n")
+        }
+    }
 }
 
 struct ReceivedRequest {
@@ -200,11 +226,15 @@ fn is_client_disconnect(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Read};
+    use std::{
+        io::{self, Read, Write},
+        net::{Shutdown, TcpListener, TcpStream},
+        thread,
+    };
 
     use crate::{config, http};
 
-    use super::{RESPONSE_BODY, build_response, read_request_head, select_route};
+    use super::{RESPONSE_BODY, build_response, read_request_head, select_route, serve_one};
 
     struct FragmentedReader {
         data: Vec<u8>,
@@ -348,5 +378,80 @@ mod tests {
         let configuration = config::parse("localhost -> 127.0.0.1:3000").unwrap();
 
         assert!(select_route(&request, &configuration).is_ok());
+    }
+
+    #[test]
+    fn proxies_get_request_end_to_end() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 512];
+
+            loop {
+                let bytes_read = stream.read(&mut chunk).unwrap();
+
+                if bytes_read == 0 {
+                    break;
+                }
+
+                request.extend_from_slice(&chunk[..bytes_read]);
+
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let request = String::from_utf8(request).unwrap();
+
+            assert!(request.starts_with("GET /proxied HTTP/1.1\r\n"));
+            assert!(request.contains("Host: localhost\r\n"));
+            assert!(request.contains("X-Forwarded-Proto: http\r\n"));
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+Content-Length: 16\r\n\
+Connection: close\r\n\
+\r\n\
+hello upstream!\n",
+                )
+                .unwrap();
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let bare_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bare_address = bare_listener.local_addr().unwrap();
+
+        let bare_thread = thread::spawn(move || {
+            serve_one(&bare_listener, &configuration).unwrap();
+        });
+
+        let mut client = TcpStream::connect(bare_address).unwrap();
+
+        client
+            .write_all(
+                b"GET /proxied HTTP/1.1\r\n\
+Host: localhost\r\n\
+Connection: close\r\n\
+\r\n",
+            )
+            .unwrap();
+
+        client.shutdown(Shutdown::Write).unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        bare_thread.join().unwrap();
+        upstream_thread.join().unwrap();
+
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with(b"hello upstream!\n"));
     }
 }

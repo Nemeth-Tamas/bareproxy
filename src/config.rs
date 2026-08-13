@@ -26,6 +26,12 @@ pub struct Route {
     upstream: Upstream,
 }
 
+impl Route {
+    pub fn upstream(&self) -> &Upstream {
+        &self.upstream
+    }
+}
+
 impl fmt::Display for Route {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{} -> {}", self.hostname, self.upstream)
@@ -36,6 +42,12 @@ impl fmt::Display for Route {
 pub struct Upstream {
     host: String,
     port: u16,
+}
+
+impl Upstream {
+    pub fn address(&self) -> String {
+        self.to_string()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

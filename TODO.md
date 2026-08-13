@@ -178,23 +178,23 @@ Goal: select an upstream based on the HTTP `Host` header.
 
 Goal: proxy a normal HTTP request to a real upstream server.
 
-* [ ] Open a TCP connection to the selected upstream.
-* [ ] Serialize the incoming request toward the upstream.
-* [ ] Preserve the method.
-* [ ] Preserve the request target.
-* [ ] Preserve ordinary request headers.
-* [ ] Rewrite or normalize connection-specific headers where required.
-* [ ] Add or update `Host` according to defined BareProxy behavior.
-* [ ] Add `X-Forwarded-For`.
-* [ ] Add `X-Forwarded-Host`.
-* [ ] Add `X-Forwarded-Proto`.
+* [x] Open a TCP connection to the selected upstream.
+* [x] Serialize the incoming request toward the upstream.
+* [x] Preserve the method.
+* [x] Preserve the request target.
+* [x] Preserve ordinary request headers.
+* [x] Rewrite or normalize connection-specific headers where required.
+* [x] Add or update `Host` according to defined BareProxy behavior.
+* [x] Add `X-Forwarded-For`.
+* [x] Add `X-Forwarded-Host`.
+* [x] Add `X-Forwarded-Proto`.
 * [ ] Send the request body upstream.
-* [ ] Read the upstream response.
-* [ ] Forward the upstream response to the client.
-* [ ] Handle upstream connection refusal.
+* [x] Read the upstream response.
+* [x] Forward the upstream response to the client.
+* [x] Handle upstream connection refusal.
 * [ ] Handle upstream disconnects.
-* [ ] Return `502 Bad Gateway` when appropriate.
-* [ ] Add an end-to-end proxy test using a local test upstream.
+* [x] Return `502 Bad Gateway` when appropriate.
+* [x] Add an end-to-end proxy test using a local test upstream.
 
 **Milestone complete when:** `browser -> BareProxy -> local HTTP application` works end to end.
 
