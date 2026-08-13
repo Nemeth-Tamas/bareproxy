@@ -236,15 +236,15 @@ Goal: stop behaving like a single-request toy server.
 * [ ] Support upstream keep-alive where safe.
 * [ ] Decide when upstream connections may be reused.
 * [ ] Close connections when protocol rules require it.
-* [ ] Handle multiple clients concurrently.
-* [ ] Begin with a straightforward thread-per-client model.
-* [ ] Ensure one slow client cannot block all other clients.
-* [ ] Track active connection count.
+* [x] Handle multiple clients concurrently.
+* [x] Begin with a straightforward thread-per-client model.
+* [x] Ensure one slow client cannot block all other clients.
+* [x] Track active connection count.
 * [ ] Add a configurable connection limit.
 * [ ] Reject excessive connections gracefully.
 * [ ] Add idle read timeouts where the platform permits.
 * [ ] Add upstream connection timeouts where practical.
-* [ ] Test several simultaneous clients.
+* [x] Test several simultaneous clients.
 * [ ] Test multiple sequential requests over one client connection.
 
 **Milestone complete when:** BareProxy can serve normal multi-client localhost traffic continuously.

@@ -1,6 +1,11 @@
 use std::{
     io::{self, Read, Write},
-    net::{Shutdown, TcpListener, TcpStream},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread::{self, JoinHandle},
 };
 
 use crate::{config, http, proxy};
@@ -16,10 +21,52 @@ pub fn bind_listener() -> io::Result<TcpListener> {
     TcpListener::bind(DEV_LISTEN_ADDR)
 }
 
+pub fn serve(listener: &TcpListener, configuration: &config::Config) -> io::Result<()> {
+    let active_connections = Arc::new(AtomicUsize::new(0));
+
+    loop {
+        let _ = accept_and_spawn(listener, configuration, &active_connections)?;
+    }
+}
+
 pub fn serve_one(listener: &TcpListener, configuration: &config::Config) -> io::Result<()> {
-    let (mut stream, peer_addr) = listener.accept()?;
+    let (stream, peer_addr) = listener.accept()?;
     println!("Accepted connection from {peer_addr}");
 
+    handle_accepted_connection(stream, peer_addr, configuration)
+}
+
+fn accept_and_spawn(
+    listener: &TcpListener,
+    configuration: &config::Config,
+    active_connections: &Arc<AtomicUsize>,
+) -> io::Result<JoinHandle<()>> {
+    let (stream, peer_addr) = listener.accept()?;
+    let configuration = configuration.clone();
+    let active_connections = Arc::clone(active_connections);
+
+    let active = active_connections.fetch_add(1, Ordering::SeqCst) + 1;
+
+    println!("Accepted connection from {peer_addr}; active connections: {active}");
+
+    Ok(thread::spawn(move || {
+        let result = handle_accepted_connection(stream, peer_addr, &configuration);
+
+        let active = active_connections.fetch_sub(1, Ordering::SeqCst) - 1;
+
+        if let Err(error) = result {
+            eprintln!("BareProxy connection error for {peer_addr}: {error}");
+        }
+
+        println!("Connection {peer_addr} closed; active connections: {active}");
+    }))
+}
+
+fn handle_accepted_connection(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    configuration: &config::Config,
+) -> io::Result<()> {
     match handle_connection(&mut stream, configuration) {
         Ok(()) => Ok(()),
         Err(error) if is_client_disconnect(&error) => {
@@ -232,12 +279,18 @@ mod tests {
     use std::{
         io::{self, Read, Write},
         net::{Shutdown, TcpListener, TcpStream},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         thread,
     };
 
     use crate::{config, http};
 
-    use super::{RESPONSE_BODY, build_response, read_request_head, select_route, serve_one};
+    use super::{
+        RESPONSE_BODY, accept_and_spawn, build_response, read_request_head, select_route, serve_one,
+    };
 
     struct FragmentedReader {
         data: Vec<u8>,
@@ -541,5 +594,96 @@ he",
 
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert!(response.ends_with(b"got hello\n"));
+    }
+
+    #[test]
+    fn slow_client_does_not_block_another_client() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 512];
+
+            loop {
+                let bytes_read = stream.read(&mut chunk).unwrap();
+
+                if bytes_read == 0 {
+                    break;
+                }
+
+                request.extend_from_slice(&chunk[..bytes_read]);
+
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            assert!(request.starts_with(b"GET /fast HTTP/1.1\r\n"));
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+Content-Length: 13\r\n\
+Connection: close\r\n\
+\r\n\
+second works\n",
+                )
+                .unwrap();
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let bare_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bare_address = bare_listener.local_addr().unwrap();
+        let active_connections = Arc::new(AtomicUsize::new(0));
+
+        let active_for_server = Arc::clone(&active_connections);
+
+        let bare_thread = thread::spawn(move || {
+            let first =
+                accept_and_spawn(&bare_listener, &configuration, &active_for_server).unwrap();
+
+            let second =
+                accept_and_spawn(&bare_listener, &configuration, &active_for_server).unwrap();
+
+            first.join().unwrap();
+            second.join().unwrap();
+        });
+
+        let mut slow_client = TcpStream::connect(bare_address).unwrap();
+
+        slow_client
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n")
+            .unwrap();
+
+        let mut fast_client = TcpStream::connect(bare_address).unwrap();
+
+        fast_client
+            .write_all(
+                b"GET /fast HTTP/1.1\r\n\
+Host: localhost\r\n\
+Connection: close\r\n\
+\r\n",
+            )
+            .unwrap();
+
+        fast_client.shutdown(Shutdown::Write).unwrap();
+
+        let mut response = Vec::new();
+        fast_client.read_to_end(&mut response).unwrap();
+
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with(b"second works\n"));
+
+        slow_client.shutdown(Shutdown::Both).unwrap();
+
+        bare_thread.join().unwrap();
+        upstream_thread.join().unwrap();
+
+        assert_eq!(active_connections.load(Ordering::SeqCst), 0);
     }
 }
