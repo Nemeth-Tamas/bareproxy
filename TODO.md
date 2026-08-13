@@ -48,15 +48,15 @@ Goal: prove BareProxy can accept real connections using only `std::net`.
 * [x] Bind a `TcpListener`.
 * [x] Default development listener to `127.0.0.1:8080`.
 * [x] Print the bound address during startup.
-* [ ] Accept one incoming TCP connection.
-* [ ] Read bytes from the client.
-* [ ] Return a hard-coded valid HTTP/1.1 response.
-* [ ] Return a correct `Content-Length`.
-* [ ] Return a useful `Server` header.
-* [ ] Close the connection cleanly.
-* [ ] Handle client disconnects without crashing the process.
+* [x] Accept one incoming TCP connection.
+* [x] Read bytes from the client.
+* [x] Return a hard-coded valid HTTP/1.1 response.
+* [x] Return a correct `Content-Length`.
+* [x] Return a useful `Server` header.
+* [x] Close the connection cleanly.
+* [x] Handle client disconnects without crashing the process.
 * [x] Handle listener errors explicitly.
-* [ ] Add a minimal localhost smoke-test procedure.
+* [x] Add a minimal localhost smoke-test procedure.
 
 **Milestone complete when:** a Windows browser or `curl` can reach BareProxy running inside WSL through localhost.
 

@@ -12,9 +12,31 @@ The initial development listener is:
 
 ```text
 127.0.0.1:8080
-````
+```
 
 WSL is the primary target during early development. Native Windows support is planned later without changing the dependency-free architecture.
+
+## Localhost smoke test
+
+Start BareProxy from WSL:
+
+```bash
+cargo run
+```
+
+Then, from Windows PowerShell:
+
+```powershell
+curl.exe http://localhost:8080/
+```
+
+The response body should be:
+
+```text
+BareProxy is alive.
+```
+
+During Milestone 1, BareProxy intentionally serves one connection and then exits. A persistent accept loop is introduced in the next development phase.
 
 ## Development gates
 
