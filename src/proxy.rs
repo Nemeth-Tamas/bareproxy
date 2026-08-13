@@ -82,6 +82,12 @@ enum ResponseTransferFraming {
     Chunked,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ContinueOutcome {
+    Continue(Vec<u8>),
+    FinalResponseForwarded,
+}
+
 pub fn exchange<S>(
     route: &config::Route,
     request: &http::Request,
@@ -107,6 +113,19 @@ where
             message: source.to_string(),
         })?;
 
+    let buffered_response = if request_expects_continue(request) && request_has_body(request) {
+        upstream.flush().map_err(|source| ProxyError::Write {
+            message: source.to_string(),
+        })?;
+
+        match await_continue_or_final_response(&mut upstream, client, &request.method)? {
+            ContinueOutcome::Continue(buffered) => buffered,
+            ContinueOutcome::FinalResponseForwarded => return Ok(()),
+        }
+    } else {
+        Vec::new()
+    };
+
     if request.has_transfer_encoding {
         stream_chunked_request_body(client, &mut upstream, buffered_body)?;
     } else if let Some(content_length) = request.content_length {
@@ -117,7 +136,7 @@ where
         message: source.to_string(),
     })?;
 
-    forward_response(&mut upstream, client, &request.method)
+    forward_response(&mut upstream, client, &request.method, &buffered_response)
 }
 
 struct PrefixedReader<'a, R> {
@@ -485,12 +504,93 @@ fn stream_request_body(
     Ok(())
 }
 
+fn request_expects_continue(request: &http::Request) -> bool {
+    request
+        .headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("expect"))
+        .any(|header| {
+            header
+                .value
+                .split(|byte| *byte == b',')
+                .map(trim_optional_whitespace)
+                .any(|expectation| expectation.eq_ignore_ascii_case(b"100-continue"))
+        })
+}
+
+fn request_has_body(request: &http::Request) -> bool {
+    request.has_transfer_encoding
+        || request
+            .content_length
+            .is_some_and(|content_length| content_length > 0)
+}
+
+fn await_continue_or_final_response(
+    upstream: &mut impl Read,
+    client: &mut impl Write,
+    request_method: &str,
+) -> Result<ContinueOutcome, ProxyError> {
+    let mut buffered = Vec::new();
+
+    loop {
+        let (response_head, buffered_response) = read_response_head(upstream, &buffered)?;
+        let status = response_status_code(&response_head)?;
+
+        if status == 101 {
+            return Err(ProxyError::InvalidUpstreamResponse {
+                message: "101 Switching Protocols requires upgrade tunnelling".to_owned(),
+            });
+        }
+
+        if status == 100 {
+            client
+                .write_all(&response_head)
+                .map_err(|source| ProxyError::ResponseStarted {
+                    message: source.to_string(),
+                })?;
+
+            client
+                .flush()
+                .map_err(|source| ProxyError::ResponseStarted {
+                    message: source.to_string(),
+                })?;
+
+            return Ok(ContinueOutcome::Continue(buffered_response));
+        }
+
+        if is_interim_response(status) {
+            client
+                .write_all(&response_head)
+                .map_err(|source| ProxyError::ResponseStarted {
+                    message: source.to_string(),
+                })?;
+
+            client
+                .flush()
+                .map_err(|source| ProxyError::ResponseStarted {
+                    message: source.to_string(),
+                })?;
+
+            buffered = buffered_response;
+            continue;
+        }
+
+        let mut final_response = response_head;
+        final_response.extend_from_slice(&buffered_response);
+
+        forward_response(upstream, client, request_method, &final_response)?;
+
+        return Ok(ContinueOutcome::FinalResponseForwarded);
+    }
+}
+
 fn forward_response(
     upstream: &mut impl Read,
     client: &mut impl Write,
     request_method: &str,
+    buffered_prefix: &[u8],
 ) -> Result<(), ProxyError> {
-    let mut buffered = Vec::new();
+    let mut buffered = buffered_prefix.to_vec();
 
     loop {
         let (response_head, buffered_response_body) = read_response_head(upstream, &buffered)?;
@@ -1170,6 +1270,55 @@ mod tests {
         }
     }
 
+    struct TestClient {
+        request_body: Vec<u8>,
+        request_position: usize,
+        response: Vec<u8>,
+        bytes_read: usize,
+    }
+
+    impl TestClient {
+        fn new(request_body: Vec<u8>) -> Self {
+            Self {
+                request_body,
+                request_position: 0,
+                response: Vec::new(),
+                bytes_read: 0,
+            }
+        }
+    }
+
+    impl Read for TestClient {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.request_position == self.request_body.len() {
+                return Ok(0);
+            }
+
+            let remaining = self.request_body.len() - self.request_position;
+            let bytes_read = remaining.min(buffer.len());
+
+            buffer[..bytes_read].copy_from_slice(
+                &self.request_body[self.request_position..self.request_position + bytes_read],
+            );
+
+            self.request_position += bytes_read;
+            self.bytes_read += bytes_read;
+
+            Ok(bytes_read)
+        }
+    }
+
+    impl Write for TestClient {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.response.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn serializes_request_for_upstream() {
         let request = http::parse_request_with_consumed(
@@ -1604,5 +1753,155 @@ OK",
         );
 
         assert!(response.ends_with(b"OK"));
+    }
+
+    #[test]
+    fn waits_for_100_continue_before_sending_request_body() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+
+            let mut request_head = Vec::new();
+            let mut chunk = [0_u8; 512];
+
+            while !request_head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let bytes_read = stream.read(&mut chunk).unwrap();
+                assert!(bytes_read > 0);
+                request_head.extend_from_slice(&chunk[..bytes_read]);
+            }
+
+            assert!(
+                request_head
+                    .windows(b"Expect: 100-continue\r\n".len())
+                    .any(|window| window == b"Expect: 100-continue\r\n")
+            );
+
+            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
+            stream.flush().unwrap();
+
+            let mut body = [0_u8; 5];
+            stream.read_exact(&mut body).unwrap();
+
+            assert_eq!(&body, b"hello");
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+Content-Length: 2\r\n\
+Connection: close\r\n\
+\r\n\
+OK",
+                )
+                .unwrap();
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let route = configuration.route_for_host("localhost").unwrap();
+
+        let request = http::parse_request_with_consumed(
+            b"POST /continue HTTP/1.1\r\n\
+Host: localhost\r\n\
+Content-Length: 5\r\n\
+Expect: 100-continue\r\n\
+\r\n",
+        )
+        .unwrap()
+        .0;
+
+        let mut client = TestClient::new(b"hello".to_vec());
+
+        exchange(
+            route,
+            &request,
+            &mut client,
+            &[],
+            IpAddr::from([127, 0, 0, 1]),
+        )
+        .unwrap();
+
+        upstream_thread.join().unwrap();
+
+        assert_eq!(client.bytes_read, 5);
+        assert!(
+            client
+                .response
+                .starts_with(b"HTTP/1.1 100 Continue\r\n\r\n")
+        );
+
+        assert!(
+            client
+                .response
+                .windows(b"HTTP/1.1 200 OK\r\n".len())
+                .any(|window| window == b"HTTP/1.1 200 OK\r\n")
+        );
+
+        assert!(client.response.ends_with(b"OK"));
+    }
+
+    #[test]
+    fn final_response_before_continue_does_not_consume_request_body() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+
+            let mut request_head = Vec::new();
+            let mut chunk = [0_u8; 512];
+
+            while !request_head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let bytes_read = stream.read(&mut chunk).unwrap();
+                assert!(bytes_read > 0);
+                request_head.extend_from_slice(&chunk[..bytes_read]);
+            }
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 417 Expectation Failed\r\n\
+Content-Length: 0\r\n\
+Connection: close\r\n\
+\r\n",
+                )
+                .unwrap();
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let route = configuration.route_for_host("localhost").unwrap();
+
+        let request = http::parse_request_with_consumed(
+            b"POST /rejected HTTP/1.1\r\n\
+Host: localhost\r\n\
+Content-Length: 5\r\n\
+Expect: 100-continue\r\n\
+\r\n",
+        )
+        .unwrap()
+        .0;
+
+        let mut client = TestClient::new(b"hello".to_vec());
+
+        exchange(
+            route,
+            &request,
+            &mut client,
+            &[],
+            IpAddr::from([127, 0, 0, 1]),
+        )
+        .unwrap();
+
+        upstream_thread.join().unwrap();
+
+        assert_eq!(client.bytes_read, 0);
+        assert!(
+            client
+                .response
+                .starts_with(b"HTTP/1.1 417 Expectation Failed\r\n")
+        );
     }
 }

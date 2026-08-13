@@ -216,7 +216,7 @@ Goal: proxy real traffic without buffering entire messages in memory.
 * [x] Reject unsafe `Content-Length` + `Transfer-Encoding` combinations.
 * [x] Handle responses with no body.
 * [x] Handle `HEAD` responses correctly.
-* [ ] Handle informational `1xx` responses where required.
+* [x] Handle informational `1xx` responses where required.
 * [x] Avoid unbounded body buffering.
 * [x] Add fragmented-body tests.
 * [x] Add chunked-body tests.
