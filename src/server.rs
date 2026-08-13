@@ -151,7 +151,13 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
                 println!("Keeping client connection alive");
                 continue;
             }
-            Ok(_) => {
+            Ok(result) => {
+                if request.keep_alive && !result.client_reusable {
+                    println!(
+                        "Closing client connection because the upstream response is not reusable"
+                    );
+                }
+
                 let _ = stream.shutdown(Shutdown::Both);
                 return Ok(());
             }

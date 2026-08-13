@@ -235,7 +235,7 @@ Goal: stop behaving like a single-request toy server.
 * [x] Preserve buffered bytes between requests.
 * [ ] Support upstream keep-alive where safe.
 * [ ] Decide when upstream connections may be reused.
-* [ ] Close connections when protocol rules require it.
+* [x] Close connections when protocol rules require it.
 * [x] Handle multiple clients concurrently.
 * [x] Begin with a straightforward thread-per-client model.
 * [x] Ensure one slow client cannot block all other clients.

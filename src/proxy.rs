@@ -149,11 +149,12 @@ where
         message: source.to_string(),
     })?;
 
-    forward_response(&mut upstream, client, &request.method, &buffered_response)?;
+    let client_reusable =
+        forward_response(&mut upstream, client, &request.method, &buffered_response)?;
 
     Ok(ExchangeResult {
         buffered_client_bytes,
-        client_reusable: true,
+        client_reusable,
     })
 }
 
@@ -612,7 +613,7 @@ fn forward_response(
     client: &mut impl Write,
     request_method: &str,
     buffered_prefix: &[u8],
-) -> Result<(), ProxyError> {
+) -> Result<bool, ProxyError> {
     let mut buffered = buffered_prefix.to_vec();
 
     loop {
@@ -644,6 +645,8 @@ fn forward_response(
         }
 
         if response_has_no_body(request_method, status) {
+            let client_reusable = response_allows_client_reuse(&response_head, false);
+
             client
                 .write_all(&response_head)
                 .map_err(|source| ProxyError::ResponseStarted {
@@ -656,7 +659,7 @@ fn forward_response(
                     message: source.to_string(),
                 })?;
 
-            return Ok(());
+            return Ok(client_reusable);
         }
 
         let header_bytes = &response_head[..response_head.len() - 4];
@@ -668,6 +671,11 @@ fn forward_response(
                 message: "response contains both Content-Length and Transfer-Encoding".to_owned(),
             });
         }
+
+        let close_delimited =
+            content_length.is_none() && transfer_framing != ResponseTransferFraming::Chunked;
+
+        let client_reusable = response_allows_client_reuse(&response_head, close_delimited);
 
         client
             .write_all(&response_head)
@@ -698,7 +706,7 @@ fn forward_response(
                 message: source.to_string(),
             })?;
 
-        return Ok(());
+        return Ok(client_reusable);
     }
 }
 
@@ -743,6 +751,40 @@ fn read_response_head(
 
         buffer.extend_from_slice(&chunk[..bytes_read]);
     }
+}
+
+fn response_allows_client_reuse(response_head: &[u8], close_delimited: bool) -> bool {
+    if close_delimited || response_header_contains_token(response_head, b"connection", b"close") {
+        return false;
+    }
+
+    if response_head.starts_with(b"HTTP/1.1 ") {
+        return true;
+    }
+
+    response_header_contains_token(response_head, b"connection", b"keep-alive")
+}
+
+fn response_header_contains_token(response_head: &[u8], name: &[u8], token: &[u8]) -> bool {
+    response_head
+        .split(|byte| *byte == b'\n')
+        .skip(1)
+        .filter_map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let separator = line.iter().position(|byte| *byte == b':')?;
+
+            if !line[..separator].eq_ignore_ascii_case(name) {
+                return None;
+            }
+
+            Some(&line[separator + 1..])
+        })
+        .any(|value| {
+            value
+                .split(|byte| *byte == b',')
+                .map(trim_optional_whitespace)
+                .any(|candidate| candidate.eq_ignore_ascii_case(token))
+        })
 }
 
 fn response_status_code(response_head: &[u8]) -> Result<u16, ProxyError> {
@@ -1497,7 +1539,7 @@ upstream works\n",
 
         let mut client = Cursor::new(Vec::new());
 
-        exchange(
+        let result = exchange(
             route,
             &request,
             &mut client,
@@ -1507,6 +1549,8 @@ upstream works\n",
         .unwrap();
 
         upstream_thread.join().unwrap();
+
+        assert!(!result.client_reusable);
 
         let response = client.into_inner();
 
