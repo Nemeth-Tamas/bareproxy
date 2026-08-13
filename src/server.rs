@@ -51,6 +51,23 @@ fn handle_connection(stream: &mut TcpStream) -> io::Result<()> {
         println!("Host: {host}");
     }
 
+    if let Some(content_length) = request.content_length {
+        println!("Content-Length: {content_length}");
+    }
+
+    if request.has_transfer_encoding {
+        println!("Transfer-Encoding: present");
+    }
+
+    println!(
+        "Connection persistence: {}",
+        if request.keep_alive {
+            "keep-alive"
+        } else {
+            "close"
+        }
+    );
+
     let response = build_response();
 
     stream.write_all(response.as_bytes())?;

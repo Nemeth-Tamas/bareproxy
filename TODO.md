@@ -83,9 +83,9 @@ Goal: understand incoming HTTP requests ourselves instead of treating them as ar
 * [x] Add a maximum total header size.
 * [x] Add a maximum header count.
 * [x] Parse `Host`.
-* [ ] Parse `Content-Length`.
-* [ ] Detect `Transfer-Encoding`.
-* [ ] Detect connection persistence semantics.
+* [x] Parse `Content-Length`.
+* [x] Detect `Transfer-Encoding`.
+* [x] Detect connection persistence semantics.
 * [ ] Handle partial TCP reads correctly.
 * [ ] Preserve unread bytes after the header parser finishes.
 * [x] Add parser tests for valid requests.

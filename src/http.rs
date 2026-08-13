@@ -30,6 +30,9 @@ pub struct Request {
     pub target: String,
     pub version: HttpVersion,
     pub headers: Vec<Header>,
+    pub content_length: Option<u64>,
+    pub has_transfer_encoding: bool,
+    pub keep_alive: bool,
 }
 
 impl Request {
@@ -51,6 +54,8 @@ pub enum ParseError {
     IncompleteHeaders,
     InvalidRequestLine,
     InvalidHeader,
+    InvalidContentLength,
+    ConflictingContentLength,
     RequestLineTooLong,
     HeaderTooLong,
     HeadersTooLarge,
@@ -64,6 +69,10 @@ impl fmt::Display for ParseError {
             Self::IncompleteHeaders => formatter.write_str("incomplete HTTP request headers"),
             Self::InvalidRequestLine => formatter.write_str("invalid HTTP request line"),
             Self::InvalidHeader => formatter.write_str("invalid HTTP header"),
+            Self::InvalidContentLength => formatter.write_str("invalid Content-Length"),
+            Self::ConflictingContentLength => {
+                formatter.write_str("conflicting Content-Length values")
+            }
             Self::RequestLineTooLong => formatter.write_str("HTTP request line is too long"),
             Self::HeaderTooLong => formatter.write_str("HTTP header is too long"),
             Self::HeadersTooLarge => formatter.write_str("HTTP header block is too large"),
@@ -102,12 +111,18 @@ pub fn parse_request(input: &[u8]) -> Result<Request, ParseError> {
 
     let (method, target, version) = parse_request_line(&input[..request_line_end])?;
     let headers = parse_headers(header_block)?;
+    let content_length = parse_content_length(&headers)?;
+    let has_transfer_encoding = has_header(&headers, "transfer-encoding");
+    let keep_alive = !header_contains_token(&headers, "connection", b"close");
 
     Ok(Request {
         method,
         target,
         version,
         headers,
+        content_length,
+        has_transfer_encoding,
+        keep_alive,
     })
 }
 
@@ -199,6 +214,59 @@ fn parse_header(input: &[u8]) -> Result<Header, ParseError> {
     })
 }
 
+fn parse_content_length(headers: &[Header]) -> Result<Option<u64>, ParseError> {
+    let mut content_length = None;
+
+    for header in headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("content-length"))
+    {
+        let value =
+            std::str::from_utf8(&header.value).map_err(|_| ParseError::InvalidContentLength)?;
+
+        for value in value.split(',') {
+            let value = value.trim_matches(|character| character == ' ' || character == '\t');
+
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(ParseError::InvalidContentLength);
+            }
+
+            let parsed = value
+                .parse::<u64>()
+                .map_err(|_| ParseError::InvalidContentLength)?;
+
+            match content_length {
+                Some(existing) if existing != parsed => {
+                    return Err(ParseError::ConflictingContentLength);
+                }
+                Some(_) => {}
+                None => content_length = Some(parsed),
+            }
+        }
+    }
+
+    Ok(content_length)
+}
+
+fn has_header(headers: &[Header], name: &str) -> bool {
+    headers
+        .iter()
+        .any(|header| header.name.eq_ignore_ascii_case(name))
+}
+
+fn header_contains_token(headers: &[Header], name: &str, token: &[u8]) -> bool {
+    headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case(name))
+        .any(|header| {
+            header
+                .value
+                .split(|byte| *byte == b',')
+                .map(trim_optional_whitespace)
+                .any(|value| value.eq_ignore_ascii_case(token))
+        })
+}
+
 fn trim_optional_whitespace(mut value: &[u8]) -> &[u8] {
     while matches!(value.first(), Some(b' ' | b'\t')) {
         value = &value[1..];
@@ -281,6 +349,9 @@ mod tests {
                         value: b"BareTest".to_vec(),
                     },
                 ],
+                content_length: None,
+                has_transfer_encoding: false,
+                keep_alive: true,
             })
         );
     }
@@ -294,6 +365,9 @@ mod tests {
                 target: "/".to_owned(),
                 version: HttpVersion::Http11,
                 headers: Vec::new(),
+                content_length: None,
+                has_transfer_encoding: false,
+                keep_alive: true,
             })
         );
     }
@@ -429,5 +503,60 @@ mod tests {
             parse_request(request.as_bytes()),
             Err(ParseError::HeadersTooLarge)
         );
+    }
+
+    #[test]
+    fn parses_content_length() {
+        let request = parse_request(b"POST / HTTP/1.1\r\nContent-Length: 123\r\n\r\n").unwrap();
+
+        assert_eq!(request.content_length, Some(123));
+    }
+
+    #[test]
+    fn accepts_repeated_identical_content_length() {
+        let request =
+            parse_request(b"POST / HTTP/1.1\r\nContent-Length: 123\r\nContent-Length: 123\r\n\r\n")
+                .unwrap();
+
+        assert_eq!(request.content_length, Some(123));
+    }
+
+    #[test]
+    fn rejects_conflicting_content_length() {
+        assert_eq!(
+            parse_request(b"POST / HTTP/1.1\r\nContent-Length: 123\r\nContent-Length: 124\r\n\r\n"),
+            Err(ParseError::ConflictingContentLength)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_content_length() {
+        assert_eq!(
+            parse_request(b"POST / HTTP/1.1\r\nContent-Length: potato\r\n\r\n"),
+            Err(ParseError::InvalidContentLength)
+        );
+    }
+
+    #[test]
+    fn detects_transfer_encoding() {
+        let request =
+            parse_request(b"POST / HTTP/1.1\r\nTrAnSfEr-EnCoDiNg: chunked\r\n\r\n").unwrap();
+
+        assert!(request.has_transfer_encoding);
+    }
+
+    #[test]
+    fn http_11_is_persistent_by_default() {
+        let request = parse_request(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+
+        assert!(request.keep_alive);
+    }
+
+    #[test]
+    fn connection_close_disables_persistence() {
+        let request =
+            parse_request(b"GET / HTTP/1.1\r\nConnection: keep-alive, CLOSE\r\n\r\n").unwrap();
+
+        assert!(!request.keep_alive);
     }
 }
