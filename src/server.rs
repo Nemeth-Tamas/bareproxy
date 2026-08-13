@@ -29,6 +29,7 @@ pub fn serve(listener: &TcpListener, configuration: &config::Config) -> io::Resu
     }
 }
 
+#[cfg(test)]
 pub fn serve_one(listener: &TcpListener, configuration: &config::Config) -> io::Result<()> {
     let (stream, peer_addr) = listener.accept()?;
     println!("Accepted connection from {peer_addr}");
@@ -78,85 +79,91 @@ fn handle_accepted_connection(
 }
 
 fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> io::Result<()> {
-    let Some(received) = read_request_head(stream)? else {
-        println!("Client disconnected before sending a request");
-        return Ok(());
-    };
+    loop {
+        let Some(received) = read_request_head(stream)? else {
+            println!("Client disconnected before sending a request");
+            return Ok(());
+        };
 
-    let ReceivedRequest {
-        request,
-        buffered_body,
-        bytes_read,
-    } = received;
+        let ReceivedRequest {
+            request,
+            buffered_body,
+            bytes_read,
+        } = received;
 
-    println!("Read {bytes_read} bytes while receiving request headers");
+        println!("Read {bytes_read} bytes while receiving request headers");
 
-    if !buffered_body.is_empty() {
-        println!("Buffered body prefix: {} bytes", buffered_body.len());
-    }
-
-    println!(
-        "Request: {} {} {}",
-        request.method, request.target, request.version
-    );
-
-    if let Some(host) = request.host() {
-        println!("Host: {host}");
-    }
-
-    if let Some(content_length) = request.content_length {
-        println!("Content-Length: {content_length}");
-    }
-
-    if request.has_transfer_encoding {
-        println!("Transfer-Encoding: present");
-    }
-
-    println!(
-        "Connection persistence: {}",
-        if request.keep_alive {
-            "keep-alive"
-        } else {
-            "close"
+        if !buffered_body.is_empty() {
+            println!("Buffered body prefix: {} bytes", buffered_body.len());
         }
-    );
 
-    let route = match select_route(&request, configuration) {
-        Ok(route) => route,
-        Err(status) => {
-            let body = format!("{}\n", status.reason_phrase());
-            return write_text_response(stream, status, &body);
+        println!(
+            "Request: {} {} {}",
+            request.method, request.target, request.version
+        );
+
+        if let Some(host) = request.host() {
+            println!("Host: {host}");
         }
-    };
 
-    println!("Matched route: {route}");
-
-    let client_ip = stream.peer_addr()?.ip();
-
-    match proxy::exchange(route, &request, stream, &buffered_body, client_ip) {
-        Ok(()) => {
-            let _ = stream.shutdown(Shutdown::Both);
-            Ok(())
+        if let Some(content_length) = request.content_length {
+            println!("Content-Length: {content_length}");
         }
-        Err(proxy::ProxyError::InvalidClientBody { message }) => {
-            eprintln!("BareProxy request framing error: {message}");
 
-            write_text_response(stream, http::StatusCode::BadRequest, "Bad Request\n")
+        if request.has_transfer_encoding {
+            println!("Transfer-Encoding: present");
         }
-        Err(proxy::ProxyError::ClientRead { message }) => {
-            Err(io::Error::new(io::ErrorKind::UnexpectedEof, message))
-        }
-        Err(proxy::ProxyError::ResponseStarted { message }) => {
-            eprintln!("BareProxy upstream streaming error: {message}");
 
-            let _ = stream.shutdown(Shutdown::Both);
+        println!(
+            "Connection persistence: {}",
+            if request.keep_alive {
+                "keep-alive"
+            } else {
+                "close"
+            }
+        );
 
-            Ok(())
-        }
-        Err(error) => {
-            eprintln!("BareProxy upstream error: {error}");
+        let route = match select_route(&request, configuration) {
+            Ok(route) => route,
+            Err(status) => {
+                let body = format!("{}\n", status.reason_phrase());
+                return write_text_response(stream, status, &body);
+            }
+        };
 
-            write_text_response(stream, http::StatusCode::BadGateway, "Bad Gateway\n")
+        println!("Matched route: {route}");
+
+        let client_ip = stream.peer_addr()?.ip();
+
+        match proxy::exchange(route, &request, stream, &buffered_body, client_ip) {
+            Ok(()) if request.keep_alive => {
+                println!("Keeping client connection alive");
+                continue;
+            }
+            Ok(()) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                return Ok(());
+            }
+            Err(proxy::ProxyError::InvalidClientBody { message }) => {
+                eprintln!("BareProxy request framing error: {message}");
+
+                return write_text_response(stream, http::StatusCode::BadRequest, "Bad Request\n");
+            }
+            Err(proxy::ProxyError::ClientRead { message }) => {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, message));
+            }
+            Err(proxy::ProxyError::ResponseStarted { message }) => {
+                eprintln!("BareProxy upstream streaming error: {message}");
+
+                let _ = stream.shutdown(Shutdown::Both);
+
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("BareProxy upstream error: {error}");
+
+                return write_text_response(stream, http::StatusCode::BadGateway, "Bad Gateway\n");
+            }
         }
     }
 }
@@ -685,5 +692,104 @@ Connection: close\r\n\
         upstream_thread.join().unwrap();
 
         assert_eq!(active_connections.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn serves_two_sequential_requests_on_one_client_connection() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let responses: [&[u8]; 2] = [
+                b"HTTP/1.1 200 OK\r\n\
+Content-Length: 5\r\n\
+\r\n\
+first",
+                b"HTTP/1.1 200 OK\r\n\
+Content-Length: 6\r\n\
+\r\n\
+second",
+            ];
+
+            let targets: [&[u8]; 2] = [b"GET /first HTTP/1.1\r\n", b"GET /second HTTP/1.1\r\n"];
+
+            for (expected_target, response) in targets.into_iter().zip(responses) {
+                let (mut stream, _) = upstream_listener.accept().unwrap();
+
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 512];
+
+                loop {
+                    let bytes_read = stream.read(&mut chunk).unwrap();
+
+                    if bytes_read == 0 {
+                        break;
+                    }
+
+                    request.extend_from_slice(&chunk[..bytes_read]);
+
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+
+                assert!(request.starts_with(expected_target));
+
+                stream.write_all(response).unwrap();
+            }
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let bare_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bare_address = bare_listener.local_addr().unwrap();
+
+        let bare_thread = thread::spawn(move || {
+            serve_one(&bare_listener, &configuration).unwrap();
+        });
+
+        let mut client = TcpStream::connect(bare_address).unwrap();
+
+        client
+            .write_all(
+                b"GET /first HTTP/1.1\r\n\
+Host: localhost\r\n\
+\r\n",
+            )
+            .unwrap();
+
+        let expected_first = b"HTTP/1.1 200 OK\r\n\
+Content-Length: 5\r\n\
+\r\n\
+first";
+
+        let mut first_response = vec![0_u8; expected_first.len()];
+        client.read_exact(&mut first_response).unwrap();
+
+        assert_eq!(first_response, expected_first);
+
+        client
+            .write_all(
+                b"GET /second HTTP/1.1\r\n\
+Host: localhost\r\n\
+Connection: close\r\n\
+\r\n",
+            )
+            .unwrap();
+
+        let mut second_response = Vec::new();
+        client.read_to_end(&mut second_response).unwrap();
+
+        bare_thread.join().unwrap();
+        upstream_thread.join().unwrap();
+
+        assert_eq!(
+            second_response,
+            b"HTTP/1.1 200 OK\r\n\
+Content-Length: 6\r\n\
+\r\n\
+second"
+        );
     }
 }

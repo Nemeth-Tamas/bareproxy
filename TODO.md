@@ -230,8 +230,8 @@ Goal: proxy real traffic without buffering entire messages in memory.
 
 Goal: stop behaving like a single-request toy server.
 
-* [ ] Support HTTP/1.1 client keep-alive.
-* [ ] Parse multiple requests on one connection.
+* [x] Support HTTP/1.1 client keep-alive.
+* [x] Parse multiple requests on one connection.
 * [ ] Preserve buffered bytes between requests.
 * [ ] Support upstream keep-alive where safe.
 * [ ] Decide when upstream connections may be reused.
@@ -245,7 +245,7 @@ Goal: stop behaving like a single-request toy server.
 * [ ] Add idle read timeouts where the platform permits.
 * [ ] Add upstream connection timeouts where practical.
 * [x] Test several simultaneous clients.
-* [ ] Test multiple sequential requests over one client connection.
+* [x] Test multiple sequential requests over one client connection.
 
 **Milestone complete when:** BareProxy can serve normal multi-client localhost traffic continuously.
 
