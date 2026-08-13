@@ -1,6 +1,6 @@
 use std::{env, error::Error, fmt, process::ExitCode};
 
-use crate::server;
+use crate::{config, server};
 
 const APP_NAME: &str = "BareProxy";
 const DEFAULT_CONFIG_PATH: &str = "bareproxy.conf";
@@ -19,6 +19,9 @@ enum AppError {
     UnknownArgument(String),
     MissingConfigPath,
     TooManyArguments,
+    Config {
+        message: String,
+    },
     ListenerBind {
         address: &'static str,
         message: String,
@@ -34,6 +37,7 @@ impl fmt::Display for AppError {
             Self::UnknownArgument(argument) => write!(formatter, "unknown argument: {argument}"),
             Self::MissingConfigPath => write!(formatter, "--config requires a path"),
             Self::TooManyArguments => write!(formatter, "too many arguments"),
+            Self::Config { message } => write!(formatter, "configuration error: {message}"),
             Self::ListenerBind { address, message } => {
                 write!(formatter, "failed to listen on {address}: {message}")
             }
@@ -47,7 +51,9 @@ impl Error for AppError {}
 impl AppError {
     fn exit_code(&self) -> u8 {
         match self {
-            Self::ListenerBind { .. } | Self::Server { .. } => STARTUP_ERROR_EXIT_CODE,
+            Self::Config { .. } | Self::ListenerBind { .. } | Self::Server { .. } => {
+                STARTUP_ERROR_EXIT_CODE
+            }
             Self::UnknownArgument(_) | Self::MissingConfigPath | Self::TooManyArguments => {
                 CLI_ERROR_EXIT_CODE
             }
@@ -77,6 +83,16 @@ fn run() -> Result<(), AppError> {
 
 fn start_proxy(config_path: &str) -> Result<(), AppError> {
     print_startup_banner(config_path);
+
+    let config = config::load(config_path).map_err(|source| AppError::Config {
+        message: source.to_string(),
+    })?;
+
+    println!("Loaded {} route(s)", config.routes().len());
+
+    for route in config.routes() {
+        println!("Route: {route}");
+    }
 
     let listener = server::bind_listener().map_err(|source| AppError::ListenerBind {
         address: server::DEV_LISTEN_ADDR,
@@ -242,6 +258,17 @@ mod tests {
         assert_eq!(
             AppError::Server {
                 message: "accept failed".to_owned(),
+            }
+            .exit_code(),
+            1
+        );
+    }
+
+    #[test]
+    fn config_error_uses_exit_code_one() {
+        assert_eq!(
+            AppError::Config {
+                message: "bad config".to_owned(),
             }
             .exit_code(),
             1

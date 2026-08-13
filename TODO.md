@@ -127,21 +127,21 @@ Goal: describe proxy routes without recompiling BareProxy.
 
 Initial configuration should stay intentionally boring.
 
-* [ ] Define the BareProxy configuration syntax.
-* [ ] Support comments.
-* [ ] Support blank lines.
-* [ ] Support one hostname mapped to one upstream.
-* [ ] Parse hostname values.
-* [ ] Parse upstream host/IP values.
-* [ ] Parse upstream ports.
-* [ ] Validate port ranges.
-* [ ] Normalize hostnames.
-* [ ] Reject duplicate routes.
-* [ ] Reject malformed configuration.
-* [ ] Include configuration line numbers in errors.
-* [ ] Load configuration at startup.
-* [ ] Reject startup when configuration is invalid.
-* [ ] Add configuration parser tests.
+* [x] Define the BareProxy configuration syntax.
+* [x] Support comments.
+* [x] Support blank lines.
+* [x] Support one hostname mapped to one upstream.
+* [x] Parse hostname values.
+* [x] Parse upstream host/IP values.
+* [x] Parse upstream ports.
+* [x] Validate port ranges.
+* [x] Normalize hostnames.
+* [x] Reject duplicate routes.
+* [x] Reject malformed configuration.
+* [x] Include configuration line numbers in errors.
+* [x] Load configuration at startup.
+* [x] Reject startup when configuration is invalid.
+* [x] Add configuration parser tests.
 * [x] Add `--config <path>`.
 * [x] Define a sensible default config filename.
 

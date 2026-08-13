@@ -25,6 +25,10 @@ pub struct Header {
     pub value: Vec<u8>,
 }
 
+#[expect(
+    dead_code,
+    reason = "error status variants are staged for upcoming routing and proxy milestones"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusCode {
     Ok,
