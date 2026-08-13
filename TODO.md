@@ -208,7 +208,7 @@ Goal: proxy real traffic without buffering entire messages in memory.
 * [x] Stream fixed-length response bodies.
 * [x] Parse chunked transfer coding.
 * [x] Forward chunked request bodies safely.
-* [ ] Forward chunked response bodies safely.
+* [x] Forward chunked response bodies safely.
 * [x] Handle the terminating zero-size chunk.
 * [x] Handle trailer sections.
 * [x] Reject malformed chunk sizes.

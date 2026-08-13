@@ -24,6 +24,7 @@ pub enum ProxyError {
     InvalidClientBody { message: String },
     EmptyResponse,
     IncompleteResponse,
+    InvalidUpstreamResponse { message: String },
     ResponseStarted { message: String },
 }
 
@@ -59,6 +60,9 @@ impl fmt::Display for ProxyError {
             Self::IncompleteResponse => {
                 formatter.write_str("upstream disconnected before completing its HTTP response")
             }
+            Self::InvalidUpstreamResponse { message } => {
+                write!(formatter, "invalid upstream HTTP response: {message}")
+            }
             Self::ResponseStarted { message } => {
                 write!(
                     formatter,
@@ -70,6 +74,13 @@ impl fmt::Display for ProxyError {
 }
 
 impl Error for ProxyError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseTransferFraming {
+    None,
+    CloseDelimited,
+    Chunked,
+}
 
 pub fn exchange<S>(
     route: &config::Route,
@@ -125,8 +136,34 @@ where
     }
 
     let header_bytes = &response_head[..response_head.len() - 4];
+    let transfer_framing = response_transfer_framing(header_bytes)?;
+    let content_length = response_content_length(header_bytes);
 
-    if let Some(content_length) = response_content_length(header_bytes) {
+    if transfer_framing != ResponseTransferFraming::None && content_length.is_some() {
+        return Err(ProxyError::InvalidUpstreamResponse {
+            message: "response contains both Content-Length and Transfer-Encoding".to_owned(),
+        });
+    }
+
+    if transfer_framing == ResponseTransferFraming::Chunked {
+        client
+            .write_all(&response_head)
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
+
+        stream_chunked_response_body(&mut upstream, client, &buffered_response_body)?;
+
+        client
+            .flush()
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
+
+        return Ok(());
+    }
+
+    if let Some(content_length) = content_length {
         client
             .write_all(&response_head)
             .map_err(|source| ProxyError::ResponseStarted {
@@ -578,6 +615,171 @@ fn read_response_head(upstream: &mut impl Read) -> Result<(Vec<u8>, Vec<u8>), Pr
     }
 }
 
+fn stream_chunked_response_body(
+    upstream: &mut impl Read,
+    client: &mut impl Write,
+    buffered_body: &[u8],
+) -> Result<(), ProxyError> {
+    let mut reader = PrefixedReader::new(buffered_body, upstream);
+
+    loop {
+        let size_line = read_response_chunk_line(&mut reader, MAX_CHUNK_LINE_SIZE)?;
+        let chunk_size = parse_response_chunk_size(&size_line)?;
+
+        client
+            .write_all(&size_line)
+            .and_then(|()| client.write_all(b"\r\n"))
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
+
+        if chunk_size == 0 {
+            stream_response_trailers(&mut reader, client)?;
+            return Ok(());
+        }
+
+        stream_response_chunk_data(&mut reader, client, chunk_size)?;
+
+        let mut ending = [0_u8; 2];
+
+        reader
+            .read_exact(&mut ending)
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
+
+        if ending != *b"\r\n" {
+            return Err(ProxyError::ResponseStarted {
+                message: "chunk data is not followed by CRLF".to_owned(),
+            });
+        }
+
+        client
+            .write_all(b"\r\n")
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
+    }
+}
+
+fn stream_response_chunk_data(
+    reader: &mut impl Read,
+    client: &mut impl Write,
+    mut remaining: u64,
+) -> Result<(), ProxyError> {
+    let mut buffer = [0_u8; STREAM_BUFFER_SIZE];
+
+    while remaining > 0 {
+        let read_limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+
+        let bytes_read = reader.read(&mut buffer[..read_limit]).map_err(|source| {
+            ProxyError::ResponseStarted {
+                message: source.to_string(),
+            }
+        })?;
+
+        if bytes_read == 0 {
+            return Err(ProxyError::ResponseStarted {
+                message: "upstream disconnected during chunk data".to_owned(),
+            });
+        }
+
+        client
+            .write_all(&buffer[..bytes_read])
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
+
+        remaining -= bytes_read as u64;
+    }
+
+    Ok(())
+}
+
+fn stream_response_trailers(
+    reader: &mut impl Read,
+    client: &mut impl Write,
+) -> Result<(), ProxyError> {
+    let mut trailer_count = 0;
+    let mut trailer_bytes: usize = 0;
+
+    loop {
+        let line = read_response_chunk_line(reader, MAX_TRAILER_LINE_SIZE)?;
+
+        trailer_bytes = trailer_bytes.checked_add(line.len() + 2).ok_or_else(|| {
+            ProxyError::ResponseStarted {
+                message: "upstream trailer section is too large".to_owned(),
+            }
+        })?;
+
+        if trailer_bytes > MAX_TRAILER_BLOCK_SIZE {
+            return Err(ProxyError::ResponseStarted {
+                message: "upstream trailer section is too large".to_owned(),
+            });
+        }
+
+        if line.is_empty() {
+            client
+                .write_all(b"\r\n")
+                .map_err(|source| ProxyError::ResponseStarted {
+                    message: source.to_string(),
+                })?;
+
+            return Ok(());
+        }
+
+        if trailer_count >= MAX_TRAILER_COUNT {
+            return Err(ProxyError::ResponseStarted {
+                message: "too many upstream trailer fields".to_owned(),
+            });
+        }
+
+        validate_response_trailer_line(&line)?;
+        trailer_count += 1;
+
+        client
+            .write_all(&line)
+            .and_then(|()| client.write_all(b"\r\n"))
+            .map_err(|source| ProxyError::ResponseStarted {
+                message: source.to_string(),
+            })?;
+    }
+}
+
+fn read_response_chunk_line(
+    reader: &mut impl Read,
+    maximum_size: usize,
+) -> Result<Vec<u8>, ProxyError> {
+    match read_chunk_line(reader, maximum_size) {
+        Ok(line) => Ok(line),
+        Err(ProxyError::ClientRead { message })
+        | Err(ProxyError::InvalidClientBody { message }) => Err(ProxyError::ResponseStarted {
+            message: format!("invalid chunked upstream response: {message}"),
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+fn parse_response_chunk_size(line: &[u8]) -> Result<u64, ProxyError> {
+    match parse_chunk_size(line) {
+        Ok(size) => Ok(size),
+        Err(ProxyError::InvalidClientBody { message }) => Err(ProxyError::ResponseStarted {
+            message: format!("invalid chunked upstream response: {message}"),
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_response_trailer_line(line: &[u8]) -> Result<(), ProxyError> {
+    match validate_trailer_line(line) {
+        Ok(()) => Ok(()),
+        Err(ProxyError::InvalidClientBody { message }) => Err(ProxyError::ResponseStarted {
+            message: format!("invalid upstream trailer: {message}"),
+        }),
+        Err(error) => Err(error),
+    }
+}
+
 fn stream_fixed_response_body(
     upstream: &mut impl Read,
     client: &mut impl Write,
@@ -622,6 +824,75 @@ fn stream_fixed_response_body(
     }
 
     Ok(())
+}
+
+fn response_transfer_framing(headers: &[u8]) -> Result<ResponseTransferFraming, ProxyError> {
+    let mut codings = Vec::new();
+
+    for line in headers.split(|byte| *byte == b'\n').skip(1) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let separator = line.iter().position(|byte| *byte == b':').ok_or_else(|| {
+            ProxyError::InvalidUpstreamResponse {
+                message: "malformed response header".to_owned(),
+            }
+        })?;
+
+        let name = &line[..separator];
+
+        if !name.eq_ignore_ascii_case(b"transfer-encoding") {
+            continue;
+        }
+
+        let value = &line[separator + 1..];
+
+        for coding in value.split(|byte| *byte == b',') {
+            let coding = trim_optional_whitespace(coding);
+
+            if coding.is_empty() {
+                return Err(ProxyError::InvalidUpstreamResponse {
+                    message: "empty Transfer-Encoding value".to_owned(),
+                });
+            }
+
+            let coding_name = coding.split(|byte| *byte == b';').next().unwrap_or(coding);
+
+            if coding_name.eq_ignore_ascii_case(b"chunked") && coding.len() != coding_name.len() {
+                return Err(ProxyError::InvalidUpstreamResponse {
+                    message: "chunked transfer coding cannot have parameters".to_owned(),
+                });
+            }
+
+            codings.push(coding_name);
+        }
+    }
+
+    if codings.is_empty() {
+        return Ok(ResponseTransferFraming::None);
+    }
+
+    let mut chunked_count = 0;
+
+    for (index, coding) in codings.iter().enumerate() {
+        if coding.eq_ignore_ascii_case(b"chunked") {
+            chunked_count += 1;
+
+            if chunked_count > 1 || index + 1 != codings.len() {
+                return Err(ProxyError::InvalidUpstreamResponse {
+                    message: "chunked must appear exactly once and as the final transfer coding"
+                        .to_owned(),
+                });
+            }
+        }
+    }
+
+    if codings
+        .last()
+        .is_some_and(|coding| coding.eq_ignore_ascii_case(b"chunked"))
+    {
+        Ok(ResponseTransferFraming::Chunked)
+    } else {
+        Ok(ResponseTransferFraming::CloseDelimited)
+    }
 }
 
 fn response_content_length(headers: &[u8]) -> Option<u64> {
@@ -757,7 +1028,10 @@ mod tests {
 
     use crate::{config, http};
 
-    use super::{ProxyError, exchange, serialize_request_head, stream_chunked_request_body};
+    use super::{
+        ProxyError, exchange, serialize_request_head, stream_chunked_request_body,
+        stream_chunked_response_body,
+    };
 
     struct FragmentedReader {
         data: Vec<u8>,
@@ -865,6 +1139,18 @@ Trailer: X-End\r\n\
         let result = stream_chunked_request_body(&mut client, &mut upstream, &[]);
 
         assert!(matches!(result, Err(ProxyError::InvalidClientBody { .. })));
+    }
+
+    #[test]
+    fn streams_fragmented_chunked_response_with_trailer() {
+        let body = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\nX-End: yes\r\n\r\n";
+        let buffered = &body[..4];
+        let mut upstream = FragmentedReader::new(body[4..].to_vec(), 2);
+        let mut client = Vec::new();
+
+        stream_chunked_response_body(&mut upstream, &mut client, buffered).unwrap();
+
+        assert_eq!(client, body);
     }
 
     #[test]
@@ -982,5 +1268,66 @@ tiny",
         upstream_thread.join().unwrap();
 
         assert!(matches!(result, Err(ProxyError::ResponseStarted { .. })));
+    }
+
+    #[test]
+    fn forwards_chunked_upstream_response() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+
+            let _ = stream.read(&mut request).unwrap();
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+Transfer-Encoding: chunked\r\n\
+Trailer: X-End\r\n\
+Connection: close\r\n\
+\r\n\
+4\r\nWiki\r\n\
+5\r\npedia\r\n\
+0\r\n\
+X-End: yes\r\n\
+\r\n",
+                )
+                .unwrap();
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let route = configuration.route_for_host("localhost").unwrap();
+
+        let request =
+            http::parse_request_with_consumed(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap()
+                .0;
+
+        let mut client = Cursor::new(Vec::new());
+
+        exchange(
+            route,
+            &request,
+            &mut client,
+            &[],
+            IpAddr::from([127, 0, 0, 1]),
+        )
+        .unwrap();
+
+        upstream_thread.join().unwrap();
+
+        let response = client.into_inner();
+
+        assert!(
+            response
+                .windows(b"Transfer-Encoding: chunked\r\n".len())
+                .any(|window| window == b"Transfer-Encoding: chunked\r\n")
+        );
+
+        assert!(response.ends_with(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\nX-End: yes\r\n\r\n"));
     }
 }
