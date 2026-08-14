@@ -2,12 +2,14 @@ use std::{collections::HashSet, error::Error, fmt, fs, net::IpAddr};
 
 const DEFAULT_MAX_CONNECTIONS: usize = 128;
 const DEFAULT_CLIENT_IDLE_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_UPSTREAM_TIMEOUT_SECONDS: u64 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     routes: Vec<Route>,
     max_connections: usize,
     client_idle_timeout_seconds: u64,
+    upstream_timeout_seconds: u64,
 }
 
 impl Config {
@@ -21,6 +23,10 @@ impl Config {
 
     pub fn client_idle_timeout_seconds(&self) -> u64 {
         self.client_idle_timeout_seconds
+    }
+
+    pub fn upstream_timeout_seconds(&self) -> u64 {
+        self.upstream_timeout_seconds
     }
 
     pub fn route_for_host(&self, host: &str) -> Result<&Route, RouteLookupError> {
@@ -125,6 +131,8 @@ pub fn parse(input: &str) -> Result<Config, ConfigError> {
     let mut max_connections_set = false;
     let mut client_idle_timeout_seconds = DEFAULT_CLIENT_IDLE_TIMEOUT_SECONDS;
     let mut client_idle_timeout_set = false;
+    let mut upstream_timeout_seconds = DEFAULT_UPSTREAM_TIMEOUT_SECONDS;
+    let mut upstream_timeout_set = false;
 
     for (index, raw_line) in input.lines().enumerate() {
         let line_number = index + 1;
@@ -176,6 +184,28 @@ pub fn parse(input: &str) -> Result<Config, ConfigError> {
             continue;
         }
 
+        if let Some((directive, value)) = line.split_once('=')
+            && directive.trim() == "upstream_timeout_seconds"
+        {
+            if upstream_timeout_set {
+                return Err(ConfigError::Line {
+                    line: line_number,
+                    message: "duplicate upstream_timeout_seconds setting".to_owned(),
+                });
+            }
+
+            upstream_timeout_seconds =
+                parse_upstream_timeout_seconds(value.trim()).map_err(|message| {
+                    ConfigError::Line {
+                        line: line_number,
+                        message,
+                    }
+                })?;
+
+            upstream_timeout_set = true;
+            continue;
+        }
+
         let (hostname, upstream) = line.split_once("->").ok_or_else(|| ConfigError::Line {
             line: line_number,
             message: "expected `hostname -> upstream:port`".to_owned(),
@@ -212,6 +242,7 @@ pub fn parse(input: &str) -> Result<Config, ConfigError> {
         routes,
         max_connections,
         client_idle_timeout_seconds,
+        upstream_timeout_seconds,
     })
 }
 
@@ -386,11 +417,27 @@ fn parse_client_idle_timeout_seconds(value: &str) -> Result<u64, String> {
     Ok(value)
 }
 
+fn parse_upstream_timeout_seconds(value: &str) -> Result<u64, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("upstream_timeout_seconds must be a positive integer".to_owned());
+    }
+
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| "upstream_timeout_seconds must be a positive integer".to_owned())?;
+
+    if value == 0 {
+        return Err("upstream_timeout_seconds must be a positive integer".to_owned());
+    }
+
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ConfigError, DEFAULT_CLIENT_IDLE_TIMEOUT_SECONDS, DEFAULT_MAX_CONNECTIONS, Route,
-        RouteLookupError, Upstream, parse,
+        Config, ConfigError, DEFAULT_CLIENT_IDLE_TIMEOUT_SECONDS, DEFAULT_MAX_CONNECTIONS,
+        DEFAULT_UPSTREAM_TIMEOUT_SECONDS, Route, RouteLookupError, Upstream, parse,
     };
 
     #[test]
@@ -407,6 +454,7 @@ mod tests {
                 }],
                 max_connections: DEFAULT_MAX_CONNECTIONS,
                 client_idle_timeout_seconds: DEFAULT_CLIENT_IDLE_TIMEOUT_SECONDS,
+                upstream_timeout_seconds: DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
             })
         );
     }
@@ -448,6 +496,56 @@ example.test -> 127.0.0.1:3000",
         .unwrap();
 
         assert_eq!(config.client_idle_timeout_seconds(), 12);
+    }
+
+    #[test]
+    fn uses_default_upstream_timeout() {
+        let config = parse("example.test -> 127.0.0.1:3000").unwrap();
+
+        assert_eq!(
+            config.upstream_timeout_seconds(),
+            DEFAULT_UPSTREAM_TIMEOUT_SECONDS
+        );
+    }
+
+    #[test]
+    fn parses_upstream_timeout() {
+        let config = parse(
+            "upstream_timeout_seconds = 3\n\
+example.test -> 127.0.0.1:3000",
+        )
+        .unwrap();
+
+        assert_eq!(config.upstream_timeout_seconds(), 3);
+    }
+
+    #[test]
+    fn rejects_zero_upstream_timeout() {
+        assert_eq!(
+            parse(
+                "upstream_timeout_seconds = 0\n\
+example.test -> 127.0.0.1:3000"
+            ),
+            Err(ConfigError::Line {
+                line: 1,
+                message: "upstream_timeout_seconds must be a positive integer".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_upstream_timeout() {
+        assert_eq!(
+            parse(
+                "upstream_timeout_seconds = 10\n\
+upstream_timeout_seconds = 20\n\
+example.test -> 127.0.0.1:3000"
+            ),
+            Err(ConfigError::Line {
+                line: 2,
+                message: "duplicate upstream_timeout_seconds setting".to_owned(),
+            })
+        );
     }
 
     #[test]

@@ -113,7 +113,7 @@ fn handle_accepted_connection(
 
 fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> io::Result<()> {
     let mut buffered = Vec::new();
-    let mut proxy_session = proxy::Session::new();
+    let mut proxy_session = proxy::Session::new(configuration.upstream_timeout_seconds());
 
     loop {
         let Some(received) = read_request_head(stream, &buffered)? else {
@@ -209,6 +209,15 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
                 let _ = stream.shutdown(Shutdown::Both);
 
                 return Ok(());
+            }
+            Err(error) if error.is_upstream_timeout() => {
+                eprintln!("BareProxy upstream timeout: {error}");
+
+                return write_text_response(
+                    stream,
+                    http::StatusCode::GatewayTimeout,
+                    "Gateway Timeout\n",
+                );
             }
             Err(error) => {
                 eprintln!("BareProxy upstream error: {error}");
@@ -1040,5 +1049,65 @@ localhost -> 127.0.0.1:3000",
         bare_thread.join().unwrap();
 
         assert!(response.is_empty());
+    }
+
+    #[test]
+    fn returns_gateway_timeout_when_upstream_stalls() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 512];
+
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let bytes_read = stream.read(&mut chunk).unwrap();
+
+                assert!(bytes_read > 0);
+
+                request.extend_from_slice(&chunk[..bytes_read]);
+            }
+
+            thread::sleep(Duration::from_millis(1500));
+        });
+
+        let configuration = config::parse(&format!(
+            "upstream_timeout_seconds = 1\n\
+localhost -> 127.0.0.1:{upstream_port}"
+        ))
+        .unwrap();
+
+        let bare_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bare_address = bare_listener.local_addr().unwrap();
+
+        let bare_thread = thread::spawn(move || {
+            serve_one(&bare_listener, &configuration).unwrap();
+        });
+
+        let mut client = TcpStream::connect(bare_address).unwrap();
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+
+        client
+            .write_all(
+                b"GET /stall HTTP/1.1\r\n\
+Host: localhost\r\n\
+Connection: close\r\n\
+\r\n",
+            )
+            .unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        bare_thread.join().unwrap();
+        upstream_thread.join().unwrap();
+
+        assert!(response.starts_with(b"HTTP/1.1 504 Gateway Timeout\r\n"));
+        assert!(response.ends_with(b"Gateway Timeout\n"));
     }
 }

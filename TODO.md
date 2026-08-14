@@ -243,7 +243,7 @@ Goal: stop behaving like a single-request toy server.
 * [x] Add a configurable connection limit.
 * [x] Reject excessive connections gracefully.
 * [x] Add idle read timeouts where the platform permits.
-* [ ] Add upstream connection timeouts where practical.
+* [x] Add upstream connection timeouts where practical.
 * [x] Test several simultaneous clients.
 * [x] Test multiple sequential requests over one client connection.
 

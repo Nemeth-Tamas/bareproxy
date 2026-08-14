@@ -2,7 +2,8 @@ use std::{
     error::Error,
     fmt,
     io::{self, Read, Write},
-    net::{IpAddr, TcpStream},
+    net::{IpAddr, TcpStream, ToSocketAddrs},
+    time::{Duration, Instant},
 };
 
 use crate::{config, http};
@@ -19,12 +20,15 @@ pub enum ProxyError {
     MissingHost,
     Connect {
         address: String,
+        kind: io::ErrorKind,
         message: String,
     },
     Write {
+        kind: io::ErrorKind,
         message: String,
     },
     Read {
+        kind: io::ErrorKind,
         message: String,
     },
     ClientRead {
@@ -48,16 +52,18 @@ impl fmt::Display for ProxyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingHost => formatter.write_str("request has no Host header"),
-            Self::Connect { address, message } => {
+            Self::Connect {
+                address, message, ..
+            } => {
                 write!(
                     formatter,
                     "failed to connect to upstream {address}: {message}"
                 )
             }
-            Self::Write { message } => {
+            Self::Write { message, .. } => {
                 write!(formatter, "failed to write request to upstream: {message}")
             }
-            Self::Read { message } => {
+            Self::Read { message, .. } => {
                 write!(
                     formatter,
                     "failed to read response from upstream: {message}"
@@ -91,6 +97,21 @@ impl fmt::Display for ProxyError {
 
 impl Error for ProxyError {}
 
+impl ProxyError {
+    pub fn is_upstream_timeout(&self) -> bool {
+        match self {
+            Self::Connect { kind, .. } | Self::Write { kind, .. } | Self::Read { kind, .. } => {
+                is_timeout_kind(*kind)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn is_timeout_kind(kind: io::ErrorKind) -> bool {
+    matches!(kind, io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponseTransferFraming {
     None,
@@ -110,19 +131,96 @@ pub struct ExchangeResult {
     pub client_reusable: bool,
 }
 
+fn connect_upstream(address: &str, timeout: Duration) -> Result<TcpStream, ProxyError> {
+    let socket_addresses = address
+        .to_socket_addrs()
+        .map_err(|source| ProxyError::Connect {
+            address: address.to_owned(),
+            kind: source.kind(),
+            message: source.to_string(),
+        })?;
+
+    let started = Instant::now();
+    let mut last_error = None;
+    let mut resolved_address = false;
+
+    for socket_address in socket_addresses {
+        resolved_address = true;
+
+        let elapsed = started.elapsed();
+
+        if elapsed >= timeout {
+            return Err(ProxyError::Connect {
+                address: address.to_owned(),
+                kind: io::ErrorKind::TimedOut,
+                message: "upstream connection timed out".to_owned(),
+            });
+        }
+
+        let remaining = timeout - elapsed;
+
+        match TcpStream::connect_timeout(&socket_address, remaining) {
+            Ok(stream) => {
+                stream
+                    .set_read_timeout(Some(timeout))
+                    .and_then(|()| stream.set_write_timeout(Some(timeout)))
+                    .map_err(|source| ProxyError::Connect {
+                        address: address.to_owned(),
+                        kind: source.kind(),
+                        message: source.to_string(),
+                    })?;
+
+                return Ok(stream);
+            }
+            Err(source) if is_timeout_kind(source.kind()) => {
+                return Err(ProxyError::Connect {
+                    address: address.to_owned(),
+                    kind: io::ErrorKind::TimedOut,
+                    message: source.to_string(),
+                });
+            }
+            Err(source) => {
+                last_error = Some((source.kind(), source.to_string()));
+            }
+        }
+    }
+
+    if !resolved_address {
+        return Err(ProxyError::Connect {
+            address: address.to_owned(),
+            kind: io::ErrorKind::AddrNotAvailable,
+            message: "upstream address resolved to no endpoints".to_owned(),
+        });
+    }
+
+    let (kind, message) = last_error.unwrap_or((
+        io::ErrorKind::Other,
+        "failed to connect to upstream".to_owned(),
+    ));
+
+    Err(ProxyError::Connect {
+        address: address.to_owned(),
+        kind,
+        message,
+    })
+}
+
 struct UpstreamConnection {
     address: String,
     stream: TcpStream,
 }
 
-#[derive(Default)]
 pub struct Session {
     upstream: Option<UpstreamConnection>,
+    upstream_timeout: Duration,
 }
 
 impl Session {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(upstream_timeout_seconds: u64) -> Self {
+        Self {
+            upstream: None,
+            upstream_timeout: Duration::from_secs(upstream_timeout_seconds),
+        }
     }
 
     pub fn exchange<S>(
@@ -146,11 +244,7 @@ impl Session {
             Some(_) | None => {
                 println!("Opening upstream connection to {address}");
 
-                let stream =
-                    TcpStream::connect(&address).map_err(|source| ProxyError::Connect {
-                        address: address.clone(),
-                        message: source.to_string(),
-                    })?;
+                let stream = connect_upstream(&address, self.upstream_timeout)?;
 
                 UpstreamConnection { address, stream }
             }
@@ -163,11 +257,13 @@ impl Session {
         upstream
             .write_all(&request_head)
             .map_err(|source| ProxyError::Write {
+                kind: source.kind(),
                 message: source.to_string(),
             })?;
 
         let buffered_response = if request_expects_continue(request) && request_has_body(request) {
             upstream.flush().map_err(|source| ProxyError::Write {
+                kind: source.kind(),
                 message: source.to_string(),
             })?;
 
@@ -193,6 +289,7 @@ impl Session {
         };
 
         upstream.flush().map_err(|source| ProxyError::Write {
+            kind: source.kind(),
             message: source.to_string(),
         })?;
 
@@ -221,7 +318,7 @@ fn exchange<S>(
 where
     S: Read + Write,
 {
-    Session::new().exchange(route, request, client, buffered_body, client_ip)
+    Session::new(30).exchange(route, request, client, buffered_body, client_ip)
 }
 
 struct PrefixedReader<'a, R> {
@@ -279,6 +376,7 @@ fn stream_chunked_request_body(
             .write_all(&size_line)
             .and_then(|()| upstream.write_all(b"\r\n"))
             .map_err(|source| ProxyError::Write {
+                kind: source.kind(),
                 message: source.to_string(),
             })?;
 
@@ -307,6 +405,7 @@ fn stream_chunked_request_body(
         upstream
             .write_all(b"\r\n")
             .map_err(|source| ProxyError::Write {
+                kind: source.kind(),
                 message: source.to_string(),
             })?;
     }
@@ -340,6 +439,7 @@ fn stream_chunk_data(
         upstream
             .write_all(&buffer[..bytes_read])
             .map_err(|source| ProxyError::Write {
+                kind: source.kind(),
                 message: source.to_string(),
             })?;
 
@@ -375,6 +475,7 @@ fn stream_request_trailers(
             upstream
                 .write_all(b"\r\n")
                 .map_err(|source| ProxyError::Write {
+                    kind: source.kind(),
                     message: source.to_string(),
                 })?;
 
@@ -394,6 +495,7 @@ fn stream_request_trailers(
             .write_all(&line)
             .and_then(|()| upstream.write_all(b"\r\n"))
             .map_err(|source| ProxyError::Write {
+                kind: source.kind(),
                 message: source.to_string(),
             })?;
     }
@@ -564,6 +666,7 @@ fn stream_request_body(
         upstream
             .write_all(&buffered_body[..buffered_length])
             .map_err(|source| ProxyError::Write {
+                kind: source.kind(),
                 message: source.to_string(),
             })?;
     }
@@ -592,6 +695,7 @@ fn stream_request_body(
         upstream
             .write_all(&buffer[..bytes_read])
             .map_err(|source| ProxyError::Write {
+                kind: source.kind(),
                 message: source.to_string(),
             })?;
 
@@ -811,6 +915,7 @@ fn read_response_head(
             upstream
                 .read(&mut chunk[..read_limit])
                 .map_err(|source| ProxyError::Read {
+                    kind: source.kind(),
                     message: source.to_string(),
                 })?;
 

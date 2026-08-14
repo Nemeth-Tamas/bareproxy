@@ -37,6 +37,7 @@ pub enum StatusCode {
     InternalServerError,
     BadGateway,
     ServiceUnavailable,
+    GatewayTimeout,
 }
 
 impl StatusCode {
@@ -51,6 +52,7 @@ impl StatusCode {
             Self::InternalServerError => 500,
             Self::BadGateway => 502,
             Self::ServiceUnavailable => 503,
+            Self::GatewayTimeout => 504,
         }
     }
 
@@ -65,6 +67,7 @@ impl StatusCode {
             Self::InternalServerError => "Internal Server Error",
             Self::BadGateway => "Bad Gateway",
             Self::ServiceUnavailable => "Service Unavailable",
+            Self::GatewayTimeout => "Gateway Timeout",
         }
     }
 }
