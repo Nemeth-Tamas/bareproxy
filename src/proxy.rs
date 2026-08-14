@@ -234,6 +234,7 @@ impl Session {
     where
         S: Read + Write,
     {
+        let requested_upgrade_protocols = request_upgrade_protocols(request)?;
         let address = route.upstream().address();
 
         let mut upstream_connection = match self.upstream.take() {
@@ -267,7 +268,12 @@ impl Session {
                 message: source.to_string(),
             })?;
 
-            match await_continue_or_final_response(upstream, client, &request.method)? {
+            match await_continue_or_final_response(
+                upstream,
+                client,
+                &request.method,
+                requested_upgrade_protocols.as_deref(),
+            )? {
                 ContinueOutcome::Continue(buffered) => buffered,
                 ContinueOutcome::FinalResponseForwarded => {
                     return Ok(ExchangeResult {
@@ -293,8 +299,13 @@ impl Session {
             message: source.to_string(),
         })?;
 
-        let client_reusable =
-            forward_response(upstream, client, &request.method, &buffered_response)?;
+        let client_reusable = forward_response(
+            upstream,
+            client,
+            &request.method,
+            &buffered_response,
+            requested_upgrade_protocols.as_deref(),
+        )?;
 
         if client_reusable {
             self.upstream = Some(upstream_connection);
@@ -730,6 +741,7 @@ fn await_continue_or_final_response(
     upstream: &mut impl Read,
     client: &mut impl Write,
     request_method: &str,
+    requested_upgrade_protocols: Option<&[Vec<u8>]>,
 ) -> Result<ContinueOutcome, ProxyError> {
     let mut buffered = Vec::new();
 
@@ -744,7 +756,7 @@ fn await_continue_or_final_response(
         }
 
         if status == 100 {
-            let response_head = sanitize_response_head(&response_head, None, false)?;
+            let response_head = sanitize_response_head(&response_head, None, false, false)?;
 
             client
                 .write_all(&response_head)
@@ -762,7 +774,7 @@ fn await_continue_or_final_response(
         }
 
         if is_interim_response(status) {
-            let response_head = sanitize_response_head(&response_head, None, false)?;
+            let response_head = sanitize_response_head(&response_head, None, false, false)?;
 
             client
                 .write_all(&response_head)
@@ -783,7 +795,13 @@ fn await_continue_or_final_response(
         let mut final_response = response_head;
         final_response.extend_from_slice(&buffered_response);
 
-        forward_response(upstream, client, request_method, &final_response)?;
+        forward_response(
+            upstream,
+            client,
+            request_method,
+            &final_response,
+            requested_upgrade_protocols,
+        )?;
 
         return Ok(ContinueOutcome::FinalResponseForwarded);
     }
@@ -794,6 +812,7 @@ fn forward_response(
     client: &mut impl Write,
     request_method: &str,
     buffered_prefix: &[u8],
+    requested_upgrade_protocols: Option<&[Vec<u8>]>,
 ) -> Result<bool, ProxyError> {
     let mut buffered = buffered_prefix.to_vec();
 
@@ -803,13 +822,35 @@ fn forward_response(
         let status = response_status_code(&response_head)?;
 
         if status == 101 {
-            return Err(ProxyError::InvalidUpstreamResponse {
-                message: "101 Switching Protocols requires upgrade tunnelling".to_owned(),
-            });
+            let requested_upgrade_protocols =
+                requested_upgrade_protocols.ok_or_else(|| ProxyError::InvalidUpstreamResponse {
+                    message: "upstream switched protocols without a client Upgrade request"
+                        .to_owned(),
+                })?;
+
+            validate_switching_protocols_response(&response_head, requested_upgrade_protocols)?;
+
+            let response_head =
+                sanitize_response_head(&response_head, Some(b"Upgrade"), false, true)?;
+
+            client
+                .write_all(&response_head)
+                .and_then(|()| client.write_all(&buffered_response_body))
+                .map_err(|source| ProxyError::ResponseStarted {
+                    message: source.to_string(),
+                })?;
+
+            client
+                .flush()
+                .map_err(|source| ProxyError::ResponseStarted {
+                    message: source.to_string(),
+                })?;
+
+            return Ok(false);
         }
 
         if is_interim_response(status) {
-            let response_head = sanitize_response_head(&response_head, None, false)?;
+            let response_head = sanitize_response_head(&response_head, None, false, false)?;
 
             client
                 .write_all(&response_head)
@@ -831,7 +872,8 @@ fn forward_response(
             let client_reusable = response_allows_client_reuse(&response_head, false);
             let connection_header = downstream_connection_header(&response_head, client_reusable);
 
-            let response_head = sanitize_response_head(&response_head, connection_header, false)?;
+            let response_head =
+                sanitize_response_head(&response_head, connection_header, false, false)?;
 
             client
                 .write_all(&response_head)
@@ -868,6 +910,7 @@ fn forward_response(
             &response_head,
             connection_header,
             transfer_framing == ResponseTransferFraming::Chunked,
+            false,
         )?;
 
         client
@@ -951,6 +994,7 @@ fn sanitize_response_head(
     response_head: &[u8],
     connection_header: Option<&[u8]>,
     preserve_trailer_header: bool,
+    preserve_upgrade_header: bool,
 ) -> Result<Vec<u8>, ProxyError> {
     let connection_tokens = response_connection_tokens(response_head)?;
 
@@ -984,7 +1028,12 @@ fn sanitize_response_head(
 
         let name = &line[..separator];
 
-        if should_remove_response_header(name, &connection_tokens, preserve_trailer_header) {
+        if should_remove_response_header(
+            name,
+            &connection_tokens,
+            preserve_trailer_header,
+            preserve_upgrade_header,
+        ) {
             continue;
         }
 
@@ -1061,15 +1110,20 @@ fn should_remove_response_header(
     name: &[u8],
     connection_tokens: &[Vec<u8>],
     preserve_trailer_header: bool,
+    preserve_upgrade_header: bool,
 ) -> bool {
     name.eq_ignore_ascii_case(b"connection")
         || name.eq_ignore_ascii_case(b"keep-alive")
         || name.eq_ignore_ascii_case(b"proxy-connection")
         || name.eq_ignore_ascii_case(b"te")
         || (name.eq_ignore_ascii_case(b"trailer") && !preserve_trailer_header)
-        || connection_tokens
-            .iter()
-            .any(|token| name.eq_ignore_ascii_case(token))
+        || (name.eq_ignore_ascii_case(b"upgrade") && !preserve_upgrade_header)
+        || connection_tokens.iter().any(|token| {
+            name.eq_ignore_ascii_case(token)
+                && !(preserve_upgrade_header
+                    && name.eq_ignore_ascii_case(b"upgrade")
+                    && token.eq_ignore_ascii_case(b"upgrade"))
+        })
 }
 
 fn downstream_connection_header(
@@ -1522,6 +1576,8 @@ fn serialize_request_head(
     client_ip: IpAddr,
 ) -> Result<Vec<u8>, ProxyError> {
     let original_host = request.host().ok_or(ProxyError::MissingHost)?;
+    let upgrade_protocols = request_upgrade_protocols(request)?;
+    let accepts_trailers = request_accepts_trailers(request);
 
     let mut output = Vec::new();
 
@@ -1571,9 +1627,29 @@ fn serialize_request_head(
         }
     }
 
-    if request_accepts_trailers(request) {
+    if accepts_trailers {
         output.extend_from_slice(b"TE: trailers\r\n");
-        output.extend_from_slice(b"Connection: TE\r\n");
+    }
+
+    if let Some(protocols) = &upgrade_protocols {
+        output.extend_from_slice(b"Upgrade: ");
+
+        for (index, protocol) in protocols.iter().enumerate() {
+            if index > 0 {
+                output.extend_from_slice(b", ");
+            }
+
+            output.extend_from_slice(protocol);
+        }
+
+        output.extend_from_slice(b"\r\n");
+    }
+
+    match (accepts_trailers, upgrade_protocols.is_some()) {
+        (true, true) => output.extend_from_slice(b"Connection: TE, Upgrade\r\n"),
+        (true, false) => output.extend_from_slice(b"Connection: TE\r\n"),
+        (false, true) => output.extend_from_slice(b"Connection: Upgrade\r\n"),
+        (false, false) => {}
     }
 
     output.extend_from_slice(b"X-Forwarded-For: ");
@@ -1618,6 +1694,163 @@ fn named_by_connection_header(request: &http::Request, name: &str) -> bool {
                 .map(trim_optional_whitespace)
                 .any(|token| token.eq_ignore_ascii_case(name.as_bytes()))
         })
+}
+
+fn request_upgrade_protocols(request: &http::Request) -> Result<Option<Vec<Vec<u8>>>, ProxyError> {
+    let connection_names_upgrade = named_by_connection_header(request, "upgrade");
+
+    let mut protocols = Vec::new();
+
+    for header in request
+        .headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("upgrade"))
+    {
+        protocols.extend(parse_upgrade_protocols(&header.value).map_err(|message| {
+            ProxyError::InvalidClientBody {
+                message: message.to_owned(),
+            }
+        })?);
+    }
+
+    if protocols.is_empty() {
+        if connection_names_upgrade {
+            return Err(ProxyError::InvalidClientBody {
+                message: "Connection names Upgrade without an Upgrade header".to_owned(),
+            });
+        }
+
+        return Ok(None);
+    }
+
+    if !connection_names_upgrade {
+        return Err(ProxyError::InvalidClientBody {
+            message: "Upgrade header requires Connection: Upgrade".to_owned(),
+        });
+    }
+
+    Ok(Some(protocols))
+}
+
+fn parse_upgrade_protocols(value: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
+    let mut protocols = Vec::new();
+
+    for protocol in value.split(|byte| *byte == b',') {
+        let protocol = trim_optional_whitespace(protocol);
+
+        if protocol.is_empty() {
+            return Err("Upgrade header contains an empty protocol");
+        }
+
+        let slash = protocol.iter().position(|byte| *byte == b'/');
+
+        match slash {
+            Some(index) => {
+                let name = &protocol[..index];
+                let version = &protocol[index + 1..];
+
+                if name.is_empty()
+                    || version.is_empty()
+                    || version.contains(&b'/')
+                    || !name.iter().copied().all(is_token_byte)
+                    || !version.iter().copied().all(is_token_byte)
+                {
+                    return Err("Upgrade header contains an invalid protocol");
+                }
+            }
+            None => {
+                if !protocol.iter().copied().all(is_token_byte) {
+                    return Err("Upgrade header contains an invalid protocol");
+                }
+            }
+        }
+
+        protocols.push(protocol.to_vec());
+    }
+
+    if protocols.is_empty() {
+        return Err("Upgrade header contains no protocols");
+    }
+
+    Ok(protocols)
+}
+
+fn validate_switching_protocols_response(
+    response_head: &[u8],
+    requested_protocols: &[Vec<u8>],
+) -> Result<(), ProxyError> {
+    if !response_header_contains_token(response_head, b"connection", b"upgrade") {
+        return Err(ProxyError::InvalidUpstreamResponse {
+            message: "101 response is missing Connection: Upgrade".to_owned(),
+        });
+    }
+
+    let selected_protocols = response_upgrade_protocols(response_head)?;
+
+    if selected_protocols.is_empty() {
+        return Err(ProxyError::InvalidUpstreamResponse {
+            message: "101 response is missing an Upgrade protocol".to_owned(),
+        });
+    }
+
+    for selected in &selected_protocols {
+        if !requested_protocols
+            .iter()
+            .any(|requested| upgrade_protocols_match(requested, selected))
+        {
+            return Err(ProxyError::InvalidUpstreamResponse {
+                message: "101 response selected an unrequested Upgrade protocol".to_owned(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn response_upgrade_protocols(response_head: &[u8]) -> Result<Vec<Vec<u8>>, ProxyError> {
+    let mut protocols = Vec::new();
+
+    for line in response_head.split(|byte| *byte == b'\n').skip(1) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+
+        if line.is_empty() {
+            continue;
+        }
+
+        let separator = line.iter().position(|byte| *byte == b':').ok_or_else(|| {
+            ProxyError::InvalidUpstreamResponse {
+                message: "malformed response header".to_owned(),
+            }
+        })?;
+
+        if !line[..separator].eq_ignore_ascii_case(b"upgrade") {
+            continue;
+        }
+
+        protocols.extend(
+            parse_upgrade_protocols(&line[separator + 1..]).map_err(|message| {
+                ProxyError::InvalidUpstreamResponse {
+                    message: message.to_owned(),
+                }
+            })?,
+        );
+    }
+
+    Ok(protocols)
+}
+
+fn upgrade_protocols_match(left: &[u8], right: &[u8]) -> bool {
+    let (left_name, left_version) = split_upgrade_protocol(left);
+    let (right_name, right_version) = split_upgrade_protocol(right);
+
+    left_name.eq_ignore_ascii_case(right_name) && left_version == right_version
+}
+
+fn split_upgrade_protocol(protocol: &[u8]) -> (&[u8], Option<&[u8]>) {
+    match protocol.iter().position(|byte| *byte == b'/') {
+        Some(index) => (&protocol[..index], Some(&protocol[index + 1..])),
+        None => (protocol, None),
+    }
 }
 
 fn request_accepts_trailers(request: &http::Request) -> bool {
@@ -1816,6 +2049,7 @@ X-End-To-End: keep-me\r\n\
 \r\n",
             Some(b"close"),
             false,
+            false,
         )
         .unwrap();
 
@@ -1829,6 +2063,44 @@ X-End-To-End: keep-me\r\n\
         assert!(!response.contains("Connection: keep-alive"));
         assert!(!response.contains("Keep-Alive:"));
         assert!(!response.contains("X-Hop:"));
+    }
+
+    #[test]
+    fn serializes_upgrade_request_for_upstream() {
+        let request = http::parse_request_with_consumed(
+            b"GET /socket HTTP/1.1\r\n\
+Host: example.test\r\n\
+Connection: keep-alive, Upgrade\r\n\
+Upgrade: websocket\r\n\
+\r\n",
+        )
+        .unwrap()
+        .0;
+
+        let serialized = serialize_request_head(&request, IpAddr::from([127, 0, 0, 1])).unwrap();
+
+        let serialized = String::from_utf8(serialized).unwrap();
+
+        assert!(serialized.contains("Upgrade: websocket\r\n"));
+        assert!(serialized.contains("Connection: Upgrade\r\n"));
+
+        assert!(!serialized.contains("Connection: keep-alive"));
+    }
+
+    #[test]
+    fn rejects_upgrade_without_connection_option() {
+        let request = http::parse_request_with_consumed(
+            b"GET /socket HTTP/1.1\r\n\
+Host: example.test\r\n\
+Upgrade: websocket\r\n\
+\r\n",
+        )
+        .unwrap()
+        .0;
+
+        let result = serialize_request_head(&request, IpAddr::from([127, 0, 0, 1]));
+
+        assert!(matches!(result, Err(ProxyError::InvalidClientBody { .. })));
     }
 
     #[test]
@@ -1924,6 +2196,7 @@ Trailer: Content-Length\r\n\
 \r\n",
             None,
             true,
+            false,
         );
 
         assert!(matches!(
@@ -2040,6 +2313,98 @@ upstream works\n",
         );
 
         assert!(response.ends_with(b"upstream works\n"));
+    }
+
+    #[test]
+    fn forwards_valid_upgrade_handshake() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 512];
+
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let bytes_read = stream.read(&mut chunk).unwrap();
+
+                assert!(bytes_read > 0);
+
+                request.extend_from_slice(&chunk[..bytes_read]);
+            }
+
+            assert!(
+                request
+                    .windows(b"Upgrade: websocket\r\n".len())
+                    .any(|window| window == b"Upgrade: websocket\r\n")
+            );
+
+            assert!(
+                request
+                    .windows(b"Connection: Upgrade\r\n".len())
+                    .any(|window| window == b"Connection: Upgrade\r\n")
+            );
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\n\
+Connection: Upgrade\r\n\
+Upgrade: websocket\r\n\
+X-Handshake: yes\r\n\
+\r\n\
+UPGRADE-READY\n",
+                )
+                .unwrap();
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let route = configuration.route_for_host("localhost").unwrap();
+
+        let request = http::parse_request_with_consumed(
+            b"GET /socket HTTP/1.1\r\n\
+Host: localhost\r\n\
+Connection: Upgrade\r\n\
+Upgrade: websocket\r\n\
+\r\n",
+        )
+        .unwrap()
+        .0;
+
+        let mut client = Cursor::new(Vec::new());
+
+        let result = exchange(
+            route,
+            &request,
+            &mut client,
+            &[],
+            IpAddr::from([127, 0, 0, 1]),
+        )
+        .unwrap();
+
+        upstream_thread.join().unwrap();
+
+        assert!(!result.client_reusable);
+
+        let response = client.into_inner();
+
+        assert!(response.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"));
+
+        assert!(
+            response
+                .windows(b"Connection: Upgrade\r\n".len())
+                .any(|window| window == b"Connection: Upgrade\r\n")
+        );
+
+        assert!(
+            response
+                .windows(b"Upgrade: websocket\r\n".len())
+                .any(|window| window == b"Upgrade: websocket\r\n")
+        );
+
+        assert!(response.ends_with(b"UPGRADE-READY\n"));
     }
 
     #[test]

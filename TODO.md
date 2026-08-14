@@ -259,7 +259,7 @@ Goal: handle the annoying corners needed for a trustworthy HTTP reverse proxy.
 * [x] Correctly process the `Connection` header's named hop-by-hop headers.
 * [x] Handle `TE`.
 * [x] Handle `Trailer`.
-* [ ] Handle `Upgrade`.
+* [x] Handle `Upgrade`.
 * [ ] Support HTTP protocol upgrade tunnelling.
 * [ ] Support WebSocket upgrade traffic.
 * [ ] Switch upgraded connections into bidirectional byte tunnelling.
