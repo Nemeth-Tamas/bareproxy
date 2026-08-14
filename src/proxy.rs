@@ -94,7 +94,108 @@ pub struct ExchangeResult {
     pub client_reusable: bool,
 }
 
-pub fn exchange<S>(
+struct UpstreamConnection {
+    address: String,
+    stream: TcpStream,
+}
+
+#[derive(Default)]
+pub struct Session {
+    upstream: Option<UpstreamConnection>,
+}
+
+impl Session {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn exchange<S>(
+        &mut self,
+        route: &config::Route,
+        request: &http::Request,
+        client: &mut S,
+        buffered_body: &[u8],
+        client_ip: IpAddr,
+    ) -> Result<ExchangeResult, ProxyError>
+    where
+        S: Read + Write,
+    {
+        let address = route.upstream().address();
+
+        let mut upstream_connection = match self.upstream.take() {
+            Some(connection) if connection.address == address => {
+                println!("Reusing upstream connection to {address}");
+                connection
+            }
+            Some(_) | None => {
+                println!("Opening upstream connection to {address}");
+
+                let stream =
+                    TcpStream::connect(&address).map_err(|source| ProxyError::Connect {
+                        address: address.clone(),
+                        message: source.to_string(),
+                    })?;
+
+                UpstreamConnection { address, stream }
+            }
+        };
+
+        let upstream = &mut upstream_connection.stream;
+
+        let request_head = serialize_request_head(request, client_ip)?;
+
+        upstream
+            .write_all(&request_head)
+            .map_err(|source| ProxyError::Write {
+                message: source.to_string(),
+            })?;
+
+        let buffered_response = if request_expects_continue(request) && request_has_body(request) {
+            upstream.flush().map_err(|source| ProxyError::Write {
+                message: source.to_string(),
+            })?;
+
+            match await_continue_or_final_response(upstream, client, &request.method)? {
+                ContinueOutcome::Continue(buffered) => buffered,
+                ContinueOutcome::FinalResponseForwarded => {
+                    return Ok(ExchangeResult {
+                        buffered_client_bytes: Vec::new(),
+                        client_reusable: false,
+                    });
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        let buffered_client_bytes = if request.has_transfer_encoding {
+            stream_chunked_request_body(client, upstream, buffered_body)?
+        } else if let Some(content_length) = request.content_length {
+            stream_request_body(client, upstream, content_length, buffered_body)?
+        } else {
+            buffered_body.to_vec()
+        };
+
+        upstream.flush().map_err(|source| ProxyError::Write {
+            message: source.to_string(),
+        })?;
+
+        let client_reusable =
+            forward_response(upstream, client, &request.method, &buffered_response)?;
+
+        if client_reusable {
+            self.upstream = Some(upstream_connection);
+        }
+
+        Ok(ExchangeResult {
+            buffered_client_bytes,
+            client_reusable,
+        })
+    }
+}
+
+#[cfg(test)]
+fn exchange<S>(
     route: &config::Route,
     request: &http::Request,
     client: &mut S,
@@ -104,58 +205,7 @@ pub fn exchange<S>(
 where
     S: Read + Write,
 {
-    let address = route.upstream().address();
-
-    let mut upstream = TcpStream::connect(&address).map_err(|source| ProxyError::Connect {
-        address,
-        message: source.to_string(),
-    })?;
-
-    let request_head = serialize_request_head(request, client_ip)?;
-
-    upstream
-        .write_all(&request_head)
-        .map_err(|source| ProxyError::Write {
-            message: source.to_string(),
-        })?;
-
-    let buffered_response = if request_expects_continue(request) && request_has_body(request) {
-        upstream.flush().map_err(|source| ProxyError::Write {
-            message: source.to_string(),
-        })?;
-
-        match await_continue_or_final_response(&mut upstream, client, &request.method)? {
-            ContinueOutcome::Continue(buffered) => buffered,
-            ContinueOutcome::FinalResponseForwarded => {
-                return Ok(ExchangeResult {
-                    buffered_client_bytes: Vec::new(),
-                    client_reusable: false,
-                });
-            }
-        }
-    } else {
-        Vec::new()
-    };
-
-    let buffered_client_bytes = if request.has_transfer_encoding {
-        stream_chunked_request_body(client, &mut upstream, buffered_body)?
-    } else if let Some(content_length) = request.content_length {
-        stream_request_body(client, &mut upstream, content_length, buffered_body)?
-    } else {
-        buffered_body.to_vec()
-    };
-
-    upstream.flush().map_err(|source| ProxyError::Write {
-        message: source.to_string(),
-    })?;
-
-    let client_reusable =
-        forward_response(&mut upstream, client, &request.method, &buffered_response)?;
-
-    Ok(ExchangeResult {
-        buffered_client_bytes,
-        client_reusable,
-    })
+    Session::new().exchange(route, request, client, buffered_body, client_ip)
 }
 
 struct PrefixedReader<'a, R> {
@@ -1238,7 +1288,6 @@ fn serialize_request_head(
     output.extend_from_slice(b"\r\n");
 
     output.extend_from_slice(b"X-Forwarded-Proto: http\r\n");
-    output.extend_from_slice(b"Connection: close\r\n");
     output.extend_from_slice(b"\r\n");
 
     Ok(output)
@@ -1408,11 +1457,11 @@ X-Forwarded-For: spoofed\r\n\
         assert!(serialized.contains("X-Forwarded-For: 127.0.0.42\r\n"));
         assert!(serialized.contains("X-Forwarded-Host: Example.Test:8080\r\n"));
         assert!(serialized.contains("X-Forwarded-Proto: http\r\n"));
-        assert!(serialized.contains("Connection: close\r\n"));
 
         assert!(!serialized.contains("X-Remove: nope"));
         assert!(!serialized.contains("X-Forwarded-For: spoofed"));
         assert!(!serialized.contains("Connection: keep-alive"));
+        assert!(!serialized.contains("Connection: close"));
     }
 
     #[test]
@@ -1514,7 +1563,7 @@ Trailer: X-End\r\n\
 
             assert!(request.starts_with("GET /through HTTP/1.1\r\n"));
             assert!(request.contains("Host: localhost\r\n"));
-            assert!(request.contains("Connection: close\r\n"));
+            assert!(!request.contains("Connection: close\r\n"));
 
             stream
                 .write_all(

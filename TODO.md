@@ -233,8 +233,8 @@ Goal: stop behaving like a single-request toy server.
 * [x] Support HTTP/1.1 client keep-alive.
 * [x] Parse multiple requests on one connection.
 * [x] Preserve buffered bytes between requests.
-* [ ] Support upstream keep-alive where safe.
-* [ ] Decide when upstream connections may be reused.
+* [x] Support upstream keep-alive where safe.
+* [x] Decide when upstream connections may be reused.
 * [x] Close connections when protocol rules require it.
 * [x] Handle multiple clients concurrently.
 * [x] Begin with a straightforward thread-per-client model.

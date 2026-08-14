@@ -80,6 +80,7 @@ fn handle_accepted_connection(
 
 fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> io::Result<()> {
     let mut buffered = Vec::new();
+    let mut proxy_session = proxy::Session::new();
 
     loop {
         let Some(received) = read_request_head(stream, &buffered)? else {
@@ -137,7 +138,7 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
 
         let client_ip = stream.peer_addr()?.ip();
 
-        match proxy::exchange(route, &request, stream, &buffered_body, client_ip) {
+        match proxy_session.exchange(route, &request, stream, &buffered_body, client_ip) {
             Ok(result) if request.keep_alive && result.client_reusable => {
                 buffered = result.buffered_client_bytes;
 
@@ -722,6 +723,8 @@ Connection: close\r\n\
         let upstream_port = upstream_listener.local_addr().unwrap().port();
 
         let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+
             let responses: [&[u8]; 2] = [
                 b"HTTP/1.1 200 OK\r\n\
 Content-Length: 5\r\n\
@@ -736,17 +739,13 @@ second",
             let targets: [&[u8]; 2] = [b"GET /first HTTP/1.1\r\n", b"GET /second HTTP/1.1\r\n"];
 
             for (expected_target, response) in targets.into_iter().zip(responses) {
-                let (mut stream, _) = upstream_listener.accept().unwrap();
-
                 let mut request = Vec::new();
                 let mut chunk = [0_u8; 512];
 
                 loop {
                     let bytes_read = stream.read(&mut chunk).unwrap();
 
-                    if bytes_read == 0 {
-                        break;
-                    }
+                    assert!(bytes_read > 0);
 
                     request.extend_from_slice(&chunk[..bytes_read]);
 
@@ -758,6 +757,7 @@ second",
                 assert!(request.starts_with(expected_target));
 
                 stream.write_all(response).unwrap();
+                stream.flush().unwrap();
             }
         });
 
@@ -821,6 +821,8 @@ second"
         let upstream_port = upstream_listener.local_addr().unwrap().port();
 
         let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+
             let expected_requests: [&[u8]; 2] =
                 [b"POST /first HTTP/1.1\r\n", b"GET /second HTTP/1.1\r\n"];
 
@@ -836,17 +838,13 @@ second",
             ];
 
             for (expected_request, response) in expected_requests.into_iter().zip(responses) {
-                let (mut stream, _) = upstream_listener.accept().unwrap();
-
                 let mut request = Vec::new();
                 let mut chunk = [0_u8; 512];
 
                 loop {
                     let bytes_read = stream.read(&mut chunk).unwrap();
 
-                    if bytes_read == 0 {
-                        break;
-                    }
+                    assert!(bytes_read > 0);
 
                     request.extend_from_slice(&chunk[..bytes_read]);
 
@@ -871,6 +869,7 @@ second",
                 }
 
                 stream.write_all(response).unwrap();
+                stream.flush().unwrap();
             }
         });
 
