@@ -89,6 +89,7 @@ fn start_proxy(config_path: &str) -> Result<(), AppError> {
     })?;
 
     println!("Loaded {} route(s)", config.routes().len());
+    println!("Max connections: {}", config.max_connections());
 
     for route in config.routes() {
         println!("Route: {route}");

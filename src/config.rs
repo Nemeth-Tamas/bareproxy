@@ -1,13 +1,20 @@
 use std::{collections::HashSet, error::Error, fmt, fs, net::IpAddr};
 
+const DEFAULT_MAX_CONNECTIONS: usize = 128;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     routes: Vec<Route>,
+    max_connections: usize,
 }
 
 impl Config {
     pub fn routes(&self) -> &[Route] {
         &self.routes
+    }
+
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
     }
 
     pub fn route_for_host(&self, host: &str) -> Result<&Route, RouteLookupError> {
@@ -108,12 +115,34 @@ pub fn load(path: &str) -> Result<Config, ConfigError> {
 pub fn parse(input: &str) -> Result<Config, ConfigError> {
     let mut routes = Vec::new();
     let mut hostnames = HashSet::new();
+    let mut max_connections = DEFAULT_MAX_CONNECTIONS;
+    let mut max_connections_set = false;
 
     for (index, raw_line) in input.lines().enumerate() {
         let line_number = index + 1;
         let line = strip_comment(raw_line).trim();
 
         if line.is_empty() {
+            continue;
+        }
+
+        if let Some((directive, value)) = line.split_once('=')
+            && directive.trim() == "max_connections"
+        {
+            if max_connections_set {
+                return Err(ConfigError::Line {
+                    line: line_number,
+                    message: "duplicate max_connections setting".to_owned(),
+                });
+            }
+
+            max_connections =
+                parse_max_connections(value.trim()).map_err(|message| ConfigError::Line {
+                    line: line_number,
+                    message,
+                })?;
+
+            max_connections_set = true;
             continue;
         }
 
@@ -149,7 +178,10 @@ pub fn parse(input: &str) -> Result<Config, ConfigError> {
         routes.push(Route { hostname, upstream });
     }
 
-    Ok(Config { routes })
+    Ok(Config {
+        routes,
+        max_connections,
+    })
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -291,9 +323,27 @@ fn parse_port(port: &str) -> Result<u16, String> {
     Ok(port)
 }
 
+fn parse_max_connections(value: &str) -> Result<usize, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("max_connections must be a positive integer".to_owned());
+    }
+
+    let value = value
+        .parse::<usize>()
+        .map_err(|_| "max_connections must be a positive integer".to_owned())?;
+
+    if value == 0 {
+        return Err("max_connections must be a positive integer".to_owned());
+    }
+
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigError, Route, RouteLookupError, Upstream, parse};
+    use super::{
+        Config, ConfigError, DEFAULT_MAX_CONNECTIONS, Route, RouteLookupError, Upstream, parse,
+    };
 
     #[test]
     fn parses_route() {
@@ -307,6 +357,54 @@ mod tests {
                         port: 3000,
                     },
                 }],
+                max_connections: DEFAULT_MAX_CONNECTIONS,
+            })
+        );
+    }
+
+    #[test]
+    fn uses_default_connection_limit() {
+        let config = parse("example.test -> 127.0.0.1:3000").unwrap();
+
+        assert_eq!(config.max_connections(), DEFAULT_MAX_CONNECTIONS);
+    }
+
+    #[test]
+    fn parses_connection_limit() {
+        let config = parse(
+            "max_connections = 42\n\
+example.test -> 127.0.0.1:3000",
+        )
+        .unwrap();
+
+        assert_eq!(config.max_connections(), 42);
+    }
+
+    #[test]
+    fn rejects_zero_connection_limit() {
+        assert_eq!(
+            parse(
+                "max_connections = 0\n\
+example.test -> 127.0.0.1:3000"
+            ),
+            Err(ConfigError::Line {
+                line: 1,
+                message: "max_connections must be a positive integer".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_connection_limit() {
+        assert_eq!(
+            parse(
+                "max_connections = 10\n\
+max_connections = 20\n\
+example.test -> 127.0.0.1:3000"
+            ),
+            Err(ConfigError::Line {
+                line: 2,
+                message: "duplicate max_connections setting".to_owned(),
             })
         );
     }

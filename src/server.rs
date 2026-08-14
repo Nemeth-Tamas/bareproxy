@@ -41,16 +41,34 @@ fn accept_and_spawn(
     listener: &TcpListener,
     configuration: &config::Config,
     active_connections: &Arc<AtomicUsize>,
-) -> io::Result<JoinHandle<()>> {
-    let (stream, peer_addr) = listener.accept()?;
+) -> io::Result<Option<JoinHandle<()>>> {
+    let (mut stream, peer_addr) = listener.accept()?;
+
+    let active = active_connections.load(Ordering::SeqCst);
+    let maximum = configuration.max_connections();
+
+    if active >= maximum {
+        println!("Rejecting connection from {peer_addr}; active connections: {active}/{maximum}");
+
+        if let Err(error) = write_text_response(
+            &mut stream,
+            http::StatusCode::ServiceUnavailable,
+            "Service Unavailable\n",
+        ) {
+            eprintln!("BareProxy failed to send overload response to {peer_addr}: {error}");
+        }
+
+        return Ok(None);
+    }
+
     let configuration = configuration.clone();
     let active_connections = Arc::clone(active_connections);
 
     let active = active_connections.fetch_add(1, Ordering::SeqCst) + 1;
 
-    println!("Accepted connection from {peer_addr}; active connections: {active}");
+    println!("Accepted connection from {peer_addr}; active connections: {active}/{maximum}");
 
-    Ok(thread::spawn(move || {
+    Ok(Some(thread::spawn(move || {
         let result = handle_accepted_connection(stream, peer_addr, &configuration);
 
         let active = active_connections.fetch_sub(1, Ordering::SeqCst) - 1;
@@ -59,8 +77,8 @@ fn accept_and_spawn(
             eprintln!("BareProxy connection error for {peer_addr}: {error}");
         }
 
-        println!("Connection {peer_addr} closed; active connections: {active}");
-    }))
+        println!("Connection {peer_addr} closed; active connections: {active}/{maximum}");
+    })))
 }
 
 fn handle_accepted_connection(
@@ -674,11 +692,13 @@ second works\n",
         let active_for_server = Arc::clone(&active_connections);
 
         let bare_thread = thread::spawn(move || {
-            let first =
-                accept_and_spawn(&bare_listener, &configuration, &active_for_server).unwrap();
+            let first = accept_and_spawn(&bare_listener, &configuration, &active_for_server)
+                .unwrap()
+                .unwrap();
 
-            let second =
-                accept_and_spawn(&bare_listener, &configuration, &active_for_server).unwrap();
+            let second = accept_and_spawn(&bare_listener, &configuration, &active_for_server)
+                .unwrap()
+                .unwrap();
 
             first.join().unwrap();
             second.join().unwrap();
@@ -916,5 +936,53 @@ Connection: close\r\n\
         );
 
         assert!(response.ends_with(b"second"));
+    }
+
+    #[test]
+    fn rejects_connection_when_limit_is_reached() {
+        let configuration = config::parse(
+            "max_connections = 1\n\
+localhost -> 127.0.0.1:3000",
+        )
+        .unwrap();
+
+        let bare_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bare_address = bare_listener.local_addr().unwrap();
+
+        let active_connections = Arc::new(AtomicUsize::new(0));
+        let active_for_server = Arc::clone(&active_connections);
+
+        let bare_thread = thread::spawn(move || {
+            let first = accept_and_spawn(&bare_listener, &configuration, &active_for_server)
+                .unwrap()
+                .unwrap();
+
+            let rejected =
+                accept_and_spawn(&bare_listener, &configuration, &active_for_server).unwrap();
+
+            assert!(rejected.is_none());
+
+            first.join().unwrap();
+        });
+
+        let mut slow_client = TcpStream::connect(bare_address).unwrap();
+
+        slow_client
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n")
+            .unwrap();
+
+        let mut rejected_client = TcpStream::connect(bare_address).unwrap();
+
+        let mut response = Vec::new();
+        rejected_client.read_to_end(&mut response).unwrap();
+
+        assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(response.ends_with(b"Service Unavailable\n"));
+
+        slow_client.shutdown(Shutdown::Both).unwrap();
+
+        bare_thread.join().unwrap();
+
+        assert_eq!(active_connections.load(Ordering::SeqCst), 0);
     }
 }
