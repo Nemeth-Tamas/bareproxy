@@ -1225,4 +1225,160 @@ PING",
 
         assert!(response.ends_with(b"PONG"));
     }
+
+    #[test]
+    fn tunnels_websocket_text_frames() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 512];
+
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let bytes_read = stream.read(&mut chunk).unwrap();
+
+                assert!(bytes_read > 0);
+
+                request.extend_from_slice(&chunk[..bytes_read]);
+            }
+
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+
+            let mut websocket_bytes = request[header_end..].to_vec();
+
+            assert!(
+                request[..header_end]
+                    .windows(b"Upgrade: websocket\r\n".len())
+                    .any(|window| window == b"Upgrade: websocket\r\n")
+            );
+
+            assert!(
+                request[..header_end]
+                    .windows(b"Connection: Upgrade\r\n".len())
+                    .any(|window| window == b"Connection: Upgrade\r\n")
+            );
+
+            assert!(
+                request[..header_end]
+                    .windows(b"Sec-WebSocket-Version: 13\r\n".len())
+                    .any(|window| window == b"Sec-WebSocket-Version: 13\r\n")
+            );
+
+            assert!(
+                request[..header_end]
+                    .windows(b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n".len())
+                    .any(|window| { window == b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" })
+            );
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\n\
+Connection: Upgrade\r\n\
+Upgrade: websocket\r\n\
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+\r\n",
+                )
+                .unwrap();
+
+            stream.flush().unwrap();
+
+            while websocket_bytes.len() < 11 {
+                let bytes_read = stream.read(&mut chunk).unwrap();
+
+                assert!(bytes_read > 0);
+
+                websocket_bytes.extend_from_slice(&chunk[..bytes_read]);
+            }
+
+            assert_eq!(websocket_bytes[0], 0x81);
+            assert_eq!(websocket_bytes[1], 0x85);
+
+            let masking_key = &websocket_bytes[2..6];
+            let masked_payload = &websocket_bytes[6..11];
+
+            let payload: Vec<u8> = masked_payload
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ masking_key[index % 4])
+                .collect();
+
+            assert_eq!(payload, b"hello");
+
+            stream.write_all(b"\x81\x05world").unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let bare_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bare_address = bare_listener.local_addr().unwrap();
+
+        let bare_thread = thread::spawn(move || {
+            serve_one(&bare_listener, &configuration).unwrap();
+        });
+
+        let mut client = TcpStream::connect(bare_address).unwrap();
+
+        client
+            .write_all(
+                b"GET /socket HTTP/1.1\r\n\
+Host: localhost\r\n\
+Connection: Upgrade\r\n\
+Upgrade: websocket\r\n\
+Sec-WebSocket-Version: 13\r\n\
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+\r\n\
+\x81\x85\x01\x02\x03\x04igohn",
+            )
+            .unwrap();
+
+        client.shutdown(Shutdown::Write).unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        bare_thread.join().unwrap();
+        upstream_thread.join().unwrap();
+
+        let response_head_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+
+        let response_head = &response[..response_head_end];
+        let websocket_frame = &response[response_head_end..];
+
+        assert!(response_head.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"));
+
+        assert!(
+            response_head
+                .windows(b"Connection: Upgrade\r\n".len())
+                .any(|window| window == b"Connection: Upgrade\r\n")
+        );
+
+        assert!(
+            response_head
+                .windows(b"Upgrade: websocket\r\n".len())
+                .any(|window| window == b"Upgrade: websocket\r\n")
+        );
+
+        assert!(
+            response_head
+                .windows(b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n".len())
+                .any(|window| {
+                    window == b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
+                })
+        );
+
+        assert_eq!(websocket_frame, b"\x81\x05world");
+    }
 }
