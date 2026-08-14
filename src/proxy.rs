@@ -2,7 +2,8 @@ use std::{
     error::Error,
     fmt,
     io::{self, Read, Write},
-    net::{IpAddr, TcpStream, ToSocketAddrs},
+    net::{IpAddr, Shutdown, TcpStream, ToSocketAddrs},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -44,6 +45,9 @@ pub enum ProxyError {
         message: String,
     },
     ResponseStarted {
+        message: String,
+    },
+    Tunnel {
         message: String,
     },
 }
@@ -91,6 +95,9 @@ impl fmt::Display for ProxyError {
                     "upstream failed after response started: {message}"
                 )
             }
+            Self::Tunnel { message } => {
+                write!(formatter, "upgraded connection tunnel failed: {message}")
+            }
         }
     }
 }
@@ -125,10 +132,17 @@ enum ContinueOutcome {
     FinalResponseForwarded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardResponseOutcome {
+    Http { client_reusable: bool },
+    Upgraded,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct ExchangeResult {
     pub buffered_client_bytes: Vec<u8>,
     pub client_reusable: bool,
+    pub upgraded: bool,
 }
 
 fn connect_upstream(address: &str, timeout: Duration) -> Result<TcpStream, ProxyError> {
@@ -212,6 +226,7 @@ struct UpstreamConnection {
 
 pub struct Session {
     upstream: Option<UpstreamConnection>,
+    upgraded_upstream: Option<TcpStream>,
     upstream_timeout: Duration,
 }
 
@@ -219,6 +234,7 @@ impl Session {
     pub fn new(upstream_timeout_seconds: u64) -> Self {
         Self {
             upstream: None,
+            upgraded_upstream: None,
             upstream_timeout: Duration::from_secs(upstream_timeout_seconds),
         }
     }
@@ -279,6 +295,7 @@ impl Session {
                     return Ok(ExchangeResult {
                         buffered_client_bytes: Vec::new(),
                         client_reusable: false,
+                        upgraded: false,
                     });
                 }
             }
@@ -299,7 +316,7 @@ impl Session {
             message: source.to_string(),
         })?;
 
-        let client_reusable = forward_response(
+        let response_outcome = forward_response(
             upstream,
             client,
             &request.method,
@@ -307,15 +324,111 @@ impl Session {
             requested_upgrade_protocols.as_deref(),
         )?;
 
-        if client_reusable {
-            self.upstream = Some(upstream_connection);
+        match response_outcome {
+            ForwardResponseOutcome::Http { client_reusable } => {
+                if client_reusable {
+                    self.upstream = Some(upstream_connection);
+                }
+
+                Ok(ExchangeResult {
+                    buffered_client_bytes,
+                    client_reusable,
+                    upgraded: false,
+                })
+            }
+            ForwardResponseOutcome::Upgraded => {
+                self.upgraded_upstream = Some(upstream_connection.stream);
+
+                Ok(ExchangeResult {
+                    buffered_client_bytes,
+                    client_reusable: false,
+                    upgraded: true,
+                })
+            }
+        }
+    }
+
+    pub fn tunnel_upgraded(
+        &mut self,
+        client: &mut TcpStream,
+        buffered_client_bytes: Vec<u8>,
+    ) -> Result<(), ProxyError> {
+        let mut upstream = self
+            .upgraded_upstream
+            .take()
+            .ok_or_else(|| ProxyError::Tunnel {
+                message: "no upgraded upstream connection is available".to_owned(),
+            })?;
+
+        client
+            .set_read_timeout(None)
+            .and_then(|()| client.set_write_timeout(None))
+            .map_err(|source| ProxyError::Tunnel {
+                message: source.to_string(),
+            })?;
+
+        upstream
+            .set_read_timeout(None)
+            .and_then(|()| upstream.set_write_timeout(None))
+            .map_err(|source| ProxyError::Tunnel {
+                message: source.to_string(),
+            })?;
+
+        if !buffered_client_bytes.is_empty() {
+            upstream
+                .write_all(&buffered_client_bytes)
+                .map_err(|source| ProxyError::Tunnel {
+                    message: source.to_string(),
+                })?;
+
+            upstream.flush().map_err(|source| ProxyError::Tunnel {
+                message: source.to_string(),
+            })?;
         }
 
-        Ok(ExchangeResult {
-            buffered_client_bytes,
-            client_reusable,
-        })
+        let client_reader = client.try_clone().map_err(|source| ProxyError::Tunnel {
+            message: source.to_string(),
+        })?;
+
+        let client_writer = client.try_clone().map_err(|source| ProxyError::Tunnel {
+            message: source.to_string(),
+        })?;
+
+        let upstream_reader = upstream.try_clone().map_err(|source| ProxyError::Tunnel {
+            message: source.to_string(),
+        })?;
+
+        let client_to_upstream =
+            thread::spawn(move || copy_tunnel_direction(client_reader, upstream));
+
+        let upstream_to_client = copy_tunnel_direction(upstream_reader, client_writer);
+
+        if upstream_to_client.is_err() {
+            let _ = client.shutdown(Shutdown::Both);
+        }
+
+        let client_to_upstream = client_to_upstream.join().map_err(|_| ProxyError::Tunnel {
+            message: "client-to-upstream tunnel thread panicked".to_owned(),
+        })?;
+
+        upstream_to_client.map_err(|source| ProxyError::Tunnel {
+            message: source.to_string(),
+        })?;
+
+        client_to_upstream.map_err(|source| ProxyError::Tunnel {
+            message: source.to_string(),
+        })?;
+
+        Ok(())
     }
+}
+
+fn copy_tunnel_direction(mut reader: TcpStream, mut writer: TcpStream) -> io::Result<u64> {
+    let result = io::copy(&mut reader, &mut writer);
+
+    let _ = writer.shutdown(Shutdown::Write);
+
+    result
 }
 
 #[cfg(test)]
@@ -813,7 +926,7 @@ fn forward_response(
     request_method: &str,
     buffered_prefix: &[u8],
     requested_upgrade_protocols: Option<&[Vec<u8>]>,
-) -> Result<bool, ProxyError> {
+) -> Result<ForwardResponseOutcome, ProxyError> {
     let mut buffered = buffered_prefix.to_vec();
 
     loop {
@@ -846,7 +959,7 @@ fn forward_response(
                     message: source.to_string(),
                 })?;
 
-            return Ok(false);
+            return Ok(ForwardResponseOutcome::Upgraded);
         }
 
         if is_interim_response(status) {
@@ -887,7 +1000,7 @@ fn forward_response(
                     message: source.to_string(),
                 })?;
 
-            return Ok(client_reusable);
+            return Ok(ForwardResponseOutcome::Http { client_reusable });
         }
 
         let header_bytes = &response_head[..response_head.len() - 4];
@@ -942,7 +1055,7 @@ fn forward_response(
                 message: source.to_string(),
             })?;
 
-        return Ok(client_reusable);
+        return Ok(ForwardResponseOutcome::Http { client_reusable });
     }
 }
 

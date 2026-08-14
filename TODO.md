@@ -260,15 +260,15 @@ Goal: handle the annoying corners needed for a trustworthy HTTP reverse proxy.
 * [x] Handle `TE`.
 * [x] Handle `Trailer`.
 * [x] Handle `Upgrade`.
-* [ ] Support HTTP protocol upgrade tunnelling.
+* [x] Support HTTP protocol upgrade tunnelling.
 * [ ] Support WebSocket upgrade traffic.
-* [ ] Switch upgraded connections into bidirectional byte tunnelling.
-* [ ] Correctly handle half-closed TCP streams where possible.
+* [x] Switch upgraded connections into bidirectional byte tunnelling.
+* [x] Correctly handle half-closed TCP streams where possible.
 * [ ] Prevent request smuggling through ambiguous framing.
 * [ ] Prevent header injection using CR/LF validation.
 * [ ] Reject malformed authority/host syntax.
 * [ ] Add request-smuggling regression tests.
-* [ ] Add upgrade tests.
+* [x] Add upgrade tests.
 * [ ] Add WebSocket smoke testing.
 
 **Milestone complete when:** BareProxy behaves predictably with ordinary applications and common HTTP/1.1 upgrade traffic.

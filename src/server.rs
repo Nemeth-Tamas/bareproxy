@@ -172,6 +172,22 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
         let client_ip = stream.peer_addr()?.ip();
 
         match proxy_session.exchange(route, &request, stream, &buffered_body, client_ip) {
+            Ok(result) if result.upgraded => {
+                println!("Switching upgraded connection to bidirectional tunnel");
+
+                match proxy_session.tunnel_upgraded(stream, result.buffered_client_bytes) {
+                    Ok(()) => {
+                        println!("Upgrade tunnel closed");
+                    }
+                    Err(error) => {
+                        eprintln!("BareProxy upgrade tunnel error: {error}");
+                    }
+                }
+
+                let _ = stream.shutdown(Shutdown::Both);
+
+                return Ok(());
+            }
             Ok(result) if request.keep_alive && result.client_reusable => {
                 buffered = result.buffered_client_bytes;
 
@@ -1109,5 +1125,104 @@ Connection: close\r\n\
 
         assert!(response.starts_with(b"HTTP/1.1 504 Gateway Timeout\r\n"));
         assert!(response.ends_with(b"Gateway Timeout\n"));
+    }
+
+    #[test]
+    fn tunnels_upgraded_connection_with_half_close() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 512];
+
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let bytes_read = stream.read(&mut chunk).unwrap();
+
+                assert!(bytes_read > 0);
+
+                request.extend_from_slice(&chunk[..bytes_read]);
+            }
+
+            assert!(
+                request
+                    .windows(b"Upgrade: websocket\r\n".len())
+                    .any(|window| window == b"Upgrade: websocket\r\n")
+            );
+
+            assert!(
+                request
+                    .windows(b"Connection: Upgrade\r\n".len())
+                    .any(|window| window == b"Connection: Upgrade\r\n")
+            );
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\n\
+Connection: Upgrade\r\n\
+Upgrade: websocket\r\n\
+\r\n",
+                )
+                .unwrap();
+
+            stream.flush().unwrap();
+
+            let mut tunneled = Vec::new();
+            stream.read_to_end(&mut tunneled).unwrap();
+
+            assert_eq!(tunneled, b"PING");
+
+            stream.write_all(b"PONG").unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let bare_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bare_address = bare_listener.local_addr().unwrap();
+
+        let bare_thread = thread::spawn(move || {
+            serve_one(&bare_listener, &configuration).unwrap();
+        });
+
+        let mut client = TcpStream::connect(bare_address).unwrap();
+
+        client
+            .write_all(
+                b"GET /socket HTTP/1.1\r\n\
+Host: localhost\r\n\
+Connection: Upgrade\r\n\
+Upgrade: websocket\r\n\
+\r\n\
+PING",
+            )
+            .unwrap();
+
+        client.shutdown(Shutdown::Write).unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        bare_thread.join().unwrap();
+        upstream_thread.join().unwrap();
+
+        assert!(response.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"));
+
+        assert!(
+            response
+                .windows(b"Connection: Upgrade\r\n".len())
+                .any(|window| window == b"Connection: Upgrade\r\n")
+        );
+
+        assert!(
+            response
+                .windows(b"Upgrade: websocket\r\n".len())
+                .any(|window| window == b"Upgrade: websocket\r\n")
+        );
+
+        assert!(response.ends_with(b"PONG"));
     }
 }
