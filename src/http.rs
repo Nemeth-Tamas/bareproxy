@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, net::Ipv6Addr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpVersion {
@@ -188,9 +188,101 @@ impl Request {
     }
 
     pub fn host(&self) -> Option<&str> {
-        self.header("host")
-            .and_then(|value| std::str::from_utf8(value).ok())
+        let mut hosts = self
+            .headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case("host"));
+
+        let host = hosts.next()?;
+
+        if hosts.next().is_some() {
+            return None;
+        }
+
+        let host = std::str::from_utf8(&host.value).ok()?;
+
+        is_valid_host_authority(host).then_some(host)
     }
+}
+
+fn is_valid_host_authority(authority: &str) -> bool {
+    if authority.is_empty() || !authority.is_ascii() {
+        return false;
+    }
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some(closing) = rest.find(']') else {
+            return false;
+        };
+
+        let address = &rest[..closing];
+        let remainder = &rest[closing + 1..];
+
+        if address.parse::<Ipv6Addr>().is_err() {
+            return false;
+        }
+
+        return remainder.is_empty()
+            || remainder
+                .strip_prefix(':')
+                .is_some_and(is_valid_authority_port);
+    }
+
+    if authority
+        .bytes()
+        .any(|byte| matches!(byte, b'[' | b']' | b'@' | b'/' | b'?' | b'#'))
+    {
+        return false;
+    }
+
+    let (hostname, port) = match authority.rsplit_once(':') {
+        Some((hostname, port)) => {
+            if hostname.contains(':') {
+                return false;
+            }
+
+            (hostname, Some(port))
+        }
+        None => (authority, None),
+    };
+
+    if !is_valid_authority_hostname(hostname) {
+        return false;
+    }
+
+    port.is_none_or(is_valid_authority_port)
+}
+
+fn is_valid_authority_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
+}
+
+fn is_valid_authority_hostname(hostname: &str) -> bool {
+    let hostname = hostname.strip_suffix('.').unwrap_or(hostname);
+
+    if hostname.is_empty() || hostname.len() > 253 {
+        return false;
+    }
+
+    hostname.split('.').all(is_valid_authority_hostname_label)
+}
+
+fn is_valid_authority_hostname_label(label: &str) -> bool {
+    if label.is_empty() || label.len() > 63 {
+        return false;
+    }
+
+    let bytes = label.as_bytes();
+
+    if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+        return false;
+    }
+
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -583,6 +675,63 @@ mod tests {
     }
 
     #[test]
+    fn accepts_valid_host_authorities() {
+        let cases = [
+            "localhost",
+            "LOCALHOST:8080",
+            "example.test.",
+            "127.0.0.1:80",
+            "[2001:db8::1]",
+            "[2001:db8::1]:443",
+        ];
+
+        for host in cases {
+            let request =
+                parse_request(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+                    .unwrap();
+
+            assert_eq!(request.host(), Some(host));
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_malformed_host_authorities() {
+        let cases = [
+            "localhost:",
+            "localhost:70000",
+            "user@localhost",
+            "localhost/path",
+            "localhost?query",
+            "localhost#fragment",
+            "bad..host",
+            "-bad.test",
+            "bad-.test",
+            "::1",
+            "[127.0.0.1]",
+            "[2001:db8::1",
+            "[2001:db8::1]garbage",
+        ];
+
+        for host in cases {
+            let request =
+                parse_request(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+                    .unwrap();
+
+            assert_eq!(request.host(), None, "accepted malformed Host: {host}");
+        }
+
+        let duplicate = parse_request(
+            b"GET / HTTP/1.1\r\n\
+Host: localhost\r\n\
+Host: attacker.test\r\n\
+\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(duplicate.host(), None);
+    }
+
+    #[test]
     fn trims_optional_header_whitespace() {
         let request = parse_request(b"GET / HTTP/1.1\r\nHost:\t  example.test \t\r\n\r\n").unwrap();
 
@@ -643,6 +792,24 @@ mod tests {
             parse_request(b"GET / HTTP/1.1\r\nHost: local\x01host\r\n\r\n"),
             Err(ParseError::InvalidHeader)
         );
+    }
+
+    #[test]
+    fn rejects_cr_lf_header_injection() {
+        let cases: [&[u8]; 2] = [
+            b"GET / HTTP/1.1\r\n\
+Host: localhost\r\n\
+X-Test: safe\nInjected: nope\r\n\
+\r\n",
+            b"GET / HTTP/1.1\r\n\
+Host: localhost\r\n\
+X-Test: safe\rInjected: nope\r\n\
+\r\n",
+        ];
+
+        for request in cases {
+            assert_eq!(parse_request(request), Err(ParseError::InvalidHeader));
+        }
     }
 
     #[test]

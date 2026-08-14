@@ -1073,6 +1073,8 @@ fn read_response_head(
 
             buffer.truncate(body_start);
 
+            validate_response_head_syntax(&buffer)?;
+
             return Ok((buffer, buffered_body));
         }
 
@@ -1101,6 +1103,95 @@ fn read_response_head(
 
         buffer.extend_from_slice(&chunk[..bytes_read]);
     }
+}
+
+fn validate_response_head_syntax(response_head: &[u8]) -> Result<(), ProxyError> {
+    if !response_head.ends_with(b"\r\n\r\n") {
+        return Err(ProxyError::InvalidUpstreamResponse {
+            message: "response head does not end with CRLF CRLF".to_owned(),
+        });
+    }
+
+    for (index, byte) in response_head.iter().copied().enumerate() {
+        if byte == b'\n' && (index == 0 || response_head[index - 1] != b'\r') {
+            return Err(ProxyError::InvalidUpstreamResponse {
+                message: "response contains bare LF".to_owned(),
+            });
+        }
+
+        if byte == b'\r' && response_head.get(index + 1) != Some(&b'\n') {
+            return Err(ProxyError::InvalidUpstreamResponse {
+                message: "response contains bare CR".to_owned(),
+            });
+        }
+    }
+
+    response_status_code(response_head)?;
+
+    let mut lines = response_head.split(|byte| *byte == b'\n');
+
+    let status_line = lines
+        .next()
+        .ok_or_else(|| ProxyError::InvalidUpstreamResponse {
+            message: "response has no status line".to_owned(),
+        })?
+        .strip_suffix(b"\r")
+        .unwrap();
+
+    if !status_line
+        .iter()
+        .copied()
+        .all(is_valid_response_field_value_byte)
+    {
+        return Err(ProxyError::InvalidUpstreamResponse {
+            message: "response status line contains invalid bytes".to_owned(),
+        });
+    }
+
+    for line in lines {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+
+        if line.is_empty() {
+            continue;
+        }
+
+        if matches!(line.first(), Some(b' ' | b'\t')) {
+            return Err(ProxyError::InvalidUpstreamResponse {
+                message: "obsolete folded response header is not accepted".to_owned(),
+            });
+        }
+
+        let separator = line.iter().position(|byte| *byte == b':').ok_or_else(|| {
+            ProxyError::InvalidUpstreamResponse {
+                message: "malformed response header".to_owned(),
+            }
+        })?;
+
+        let name = &line[..separator];
+        let value = trim_optional_whitespace(&line[separator + 1..]);
+
+        if name.is_empty() || !name.iter().copied().all(is_token_byte) {
+            return Err(ProxyError::InvalidUpstreamResponse {
+                message: "invalid response header name".to_owned(),
+            });
+        }
+
+        if !value
+            .iter()
+            .copied()
+            .all(is_valid_response_field_value_byte)
+        {
+            return Err(ProxyError::InvalidUpstreamResponse {
+                message: "invalid response header value".to_owned(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn is_valid_response_field_value_byte(byte: u8) -> bool {
+    matches!(byte, b'\t' | b' '..=b'~' | 0x80..=0xff)
 }
 
 fn sanitize_response_head(

@@ -511,6 +511,43 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_host_is_bad_request() {
+        let request = http::parse_request_with_consumed(
+            b"GET / HTTP/1.1\r\n\
+Host: localhost\r\n\
+Host: attacker.test\r\n\
+\r\n",
+        )
+        .unwrap()
+        .0;
+
+        let configuration = config::parse("localhost -> 127.0.0.1:3000").unwrap();
+
+        assert_eq!(
+            select_route(&request, &configuration),
+            Err(http::StatusCode::BadRequest)
+        );
+    }
+
+    #[test]
+    fn malformed_host_is_bad_request() {
+        let request = http::parse_request_with_consumed(
+            b"GET / HTTP/1.1\r\n\
+Host: user@localhost\r\n\
+\r\n",
+        )
+        .unwrap()
+        .0;
+
+        let configuration = config::parse("localhost -> 127.0.0.1:3000").unwrap();
+
+        assert_eq!(
+            select_route(&request, &configuration),
+            Err(http::StatusCode::BadRequest)
+        );
+    }
+
+    #[test]
     fn unknown_host_is_not_found() {
         let request =
             http::parse_request_with_consumed(b"GET / HTTP/1.1\r\nHost: missing.test\r\n\r\n")
@@ -1431,5 +1468,78 @@ Transfer-Encoding: chunked\r\n\
             Ok(_) => panic!("ambiguous request reached the upstream"),
             Err(error) => panic!("unexpected upstream accept error: {error}"),
         }
+    }
+
+    #[test]
+    fn rejects_upstream_header_injection() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 512];
+
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let bytes_read = stream.read(&mut chunk).unwrap();
+
+                assert!(bytes_read > 0);
+
+                request.extend_from_slice(&chunk[..bytes_read]);
+            }
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+Content-Length: 2\r\n\
+X-Safe: yes\nX-Injected: nope\r\n\
+\r\n\
+OK",
+                )
+                .unwrap();
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let bare_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bare_address = bare_listener.local_addr().unwrap();
+
+        let bare_thread = thread::spawn(move || {
+            serve_one(&bare_listener, &configuration).unwrap();
+        });
+
+        let mut client = TcpStream::connect(bare_address).unwrap();
+
+        client
+            .write_all(
+                b"GET /injection HTTP/1.1\r\n\
+Host: localhost\r\n\
+Connection: close\r\n\
+\r\n",
+            )
+            .unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        bare_thread.join().unwrap();
+        upstream_thread.join().unwrap();
+
+        assert!(response.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+        assert!(response.ends_with(b"Bad Gateway\n"));
+
+        assert!(
+            !response
+                .windows(b"X-Injected: nope\r\n".len())
+                .any(|window| window == b"X-Injected: nope\r\n")
+        );
+
+        assert!(
+            !response
+                .windows(b"X-Safe: yes\r\n".len())
+                .any(|window| window == b"X-Safe: yes\r\n")
+        );
     }
 }
