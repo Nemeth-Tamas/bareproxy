@@ -767,6 +767,45 @@ mod tests {
     }
 
     #[test]
+    fn request_smuggling_framing_regressions_are_rejected() {
+        let cases: [&[u8]; 6] = [
+            b"POST / HTTP/1.1\r\n\
+Host: localhost\r\n\
+Content-Length: 5\r\n\
+Content-Length: 6\r\n\
+\r\n",
+            b"POST / HTTP/1.1\r\n\
+Host: localhost\r\n\
+Content-Length: 5, 6\r\n\
+\r\n",
+            b"POST / HTTP/1.1\r\n\
+Host: localhost\r\n\
+Content-Length: 5\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n",
+            b"POST / HTTP/1.1\r\n\
+Host: localhost\r\n\
+Transfer-Encoding: chunked, chunked\r\n\
+\r\n",
+            b"POST / HTTP/1.1\r\n\
+Host: localhost\r\n\
+Transfer-Encoding: chunked,\r\n\
+\r\n",
+            b"POST / HTTP/1.1\r\n\
+Host: localhost\r\n\
+Transfer-Encoding : chunked\r\n\
+\r\n",
+        ];
+
+        for request in cases {
+            assert!(
+                parse_request(request).is_err(),
+                "smuggling-style framing unexpectedly parsed"
+            );
+        }
+    }
+
+    #[test]
     fn http_11_is_persistent_by_default() {
         let request = parse_request(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
 

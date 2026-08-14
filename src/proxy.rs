@@ -1005,7 +1005,7 @@ fn forward_response(
 
         let header_bytes = &response_head[..response_head.len() - 4];
         let transfer_framing = response_transfer_framing(header_bytes)?;
-        let content_length = response_content_length(header_bytes);
+        let content_length = response_content_length(header_bytes)?;
 
         if transfer_framing != ResponseTransferFraming::None && content_length.is_some() {
             return Err(ProxyError::InvalidUpstreamResponse {
@@ -1664,10 +1664,17 @@ fn response_transfer_framing(headers: &[u8]) -> Result<ResponseTransferFraming, 
     }
 }
 
-fn response_content_length(headers: &[u8]) -> Option<u64> {
+fn response_content_length(headers: &[u8]) -> Result<Option<u64>, ProxyError> {
+    let mut content_length = None;
+
     for line in headers.split(|byte| *byte == b'\n').skip(1) {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let separator = line.iter().position(|byte| *byte == b':')?;
+
+        let separator = line.iter().position(|byte| *byte == b':').ok_or_else(|| {
+            ProxyError::InvalidUpstreamResponse {
+                message: "malformed response header".to_owned(),
+            }
+        })?;
 
         let name = &line[..separator];
 
@@ -1675,13 +1682,38 @@ fn response_content_length(headers: &[u8]) -> Option<u64> {
             continue;
         }
 
-        let value = trim_optional_whitespace(&line[separator + 1..]);
-        let value = std::str::from_utf8(value).ok()?;
+        if content_length.is_some() {
+            return Err(ProxyError::InvalidUpstreamResponse {
+                message: "response contains multiple Content-Length fields".to_owned(),
+            });
+        }
 
-        return value.parse::<u64>().ok();
+        let value = trim_optional_whitespace(&line[separator + 1..]);
+
+        if value.is_empty()
+            || value.contains(&b',')
+            || !value.iter().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(ProxyError::InvalidUpstreamResponse {
+                message: "response contains invalid Content-Length".to_owned(),
+            });
+        }
+
+        let value =
+            std::str::from_utf8(value).map_err(|_| ProxyError::InvalidUpstreamResponse {
+                message: "response contains invalid Content-Length".to_owned(),
+            })?;
+
+        let parsed = value
+            .parse::<u64>()
+            .map_err(|_| ProxyError::InvalidUpstreamResponse {
+                message: "response contains invalid Content-Length".to_owned(),
+            })?;
+
+        content_length = Some(parsed);
     }
 
-    None
+    Ok(content_length)
 }
 
 fn serialize_request_head(
@@ -2031,8 +2063,8 @@ mod tests {
     use crate::{config, http};
 
     use super::{
-        ProxyError, exchange, sanitize_response_head, serialize_request_head,
-        stream_chunked_request_body, stream_chunked_response_body,
+        ProxyError, exchange, response_content_length, sanitize_response_head,
+        serialize_request_head, stream_chunked_request_body, stream_chunked_response_body,
         stream_close_delimited_response_body,
     };
 
@@ -2148,6 +2180,65 @@ X-Forwarded-For: spoofed\r\n\
         assert!(!serialized.contains("X-Forwarded-For: spoofed"));
         assert!(!serialized.contains("Connection: keep-alive"));
         assert!(!serialized.contains("Connection: close"));
+    }
+
+    #[test]
+    fn canonicalizes_duplicate_client_content_length() {
+        let requests: [&[u8]; 2] = [
+            b"POST / HTTP/1.1\r\n\
+Host: example.test\r\n\
+Content-Length: 5\r\n\
+Content-Length: 5\r\n\
+\r\n",
+            b"POST / HTTP/1.1\r\n\
+Host: example.test\r\n\
+Content-Length: 5, 5\r\n\
+\r\n",
+        ];
+
+        for input in requests {
+            let request = http::parse_request_with_consumed(input).unwrap().0;
+
+            let serialized =
+                serialize_request_head(&request, IpAddr::from([127, 0, 0, 1])).unwrap();
+
+            assert_eq!(
+                serialized
+                    .windows(b"Content-Length: 5\r\n".len())
+                    .filter(|window| { *window == b"Content-Length: 5\r\n" })
+                    .count(),
+                1
+            );
+
+            assert!(
+                !serialized
+                    .windows(b"Content-Length: 5, 5\r\n".len())
+                    .any(|window| { window == b"Content-Length: 5, 5\r\n" })
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_upstream_content_length() {
+        let cases: [&[u8]; 4] = [
+            b"HTTP/1.1 200 OK\r\n\
+Content-Length: 5\r\n\
+Content-Length: 5",
+            b"HTTP/1.1 200 OK\r\n\
+Content-Length: 5\r\n\
+Content-Length: 6",
+            b"HTTP/1.1 200 OK\r\n\
+Content-Length: 5, 5",
+            b"HTTP/1.1 200 OK\r\n\
+Content-Length: potato",
+        ];
+
+        for headers in cases {
+            assert!(matches!(
+                response_content_length(headers),
+                Err(ProxyError::InvalidUpstreamResponse { .. })
+            ));
+        }
     }
 
     #[test]

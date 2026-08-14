@@ -264,10 +264,10 @@ Goal: handle the annoying corners needed for a trustworthy HTTP reverse proxy.
 * [x] Support WebSocket upgrade traffic.
 * [x] Switch upgraded connections into bidirectional byte tunnelling.
 * [x] Correctly handle half-closed TCP streams where possible.
-* [ ] Prevent request smuggling through ambiguous framing.
+* [x] Prevent request smuggling through ambiguous framing.
 * [ ] Prevent header injection using CR/LF validation.
 * [ ] Reject malformed authority/host syntax.
-* [ ] Add request-smuggling regression tests.
+* [x] Add request-smuggling regression tests.
 * [x] Add upgrade tests.
 * [x] Add WebSocket smoke testing.
 

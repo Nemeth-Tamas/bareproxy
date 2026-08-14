@@ -103,6 +103,11 @@ fn handle_accepted_connection(
 
             Ok(())
         }
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            eprintln!("BareProxy rejected invalid request from {peer_addr}: {error}");
+
+            write_text_response(&mut stream, http::StatusCode::BadRequest, "Bad Request\n")
+        }
         Err(error) if is_client_disconnect(&error) => {
             println!("Client {peer_addr} disconnected: {error}");
             Ok(())
@@ -1380,5 +1385,51 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         );
 
         assert_eq!(websocket_frame, b"\x81\x05world");
+    }
+
+    #[test]
+    fn rejects_ambiguous_framing_before_contacting_upstream() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        upstream_listener.set_nonblocking(true).unwrap();
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let bare_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bare_address = bare_listener.local_addr().unwrap();
+
+        let bare_thread = thread::spawn(move || {
+            serve_one(&bare_listener, &configuration).unwrap();
+        });
+
+        let mut client = TcpStream::connect(bare_address).unwrap();
+
+        client
+            .write_all(
+                b"POST /smuggle HTTP/1.1\r\n\
+Host: localhost\r\n\
+Content-Length: 4\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+0\r\n\
+\r\n",
+            )
+            .unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        bare_thread.join().unwrap();
+
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.ends_with(b"Bad Request\n"));
+
+        match upstream_listener.accept() {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Ok(_) => panic!("ambiguous request reached the upstream"),
+            Err(error) => panic!("unexpected upstream accept error: {error}"),
+        }
     }
 }
