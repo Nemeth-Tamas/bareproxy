@@ -255,11 +255,11 @@ impl Session {
 
         let mut upstream_connection = match self.upstream.take() {
             Some(connection) if connection.address == address => {
-                println!("Reusing upstream connection to {address}");
+                println!("INFO event=upstream_connection action=reuse address={address}");
                 connection
             }
             Some(_) | None => {
-                println!("Opening upstream connection to {address}");
+                println!("INFO event=upstream_connection action=open address={address}");
 
                 let stream = connect_upstream(&address, self.upstream_timeout)?;
 

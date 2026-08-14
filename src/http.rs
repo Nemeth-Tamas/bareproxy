@@ -180,6 +180,7 @@ pub struct Request {
 }
 
 impl Request {
+    #[cfg(test)]
     pub fn header(&self, name: &str) -> Option<&[u8]> {
         self.headers
             .iter()

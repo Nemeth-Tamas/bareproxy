@@ -279,12 +279,12 @@ Goal: handle the annoying corners needed for a trustworthy HTTP reverse proxy.
 
 Goal: make BareProxy something that can stay running.
 
-* [ ] Add structured human-readable log messages without a logging crate.
-* [ ] Log listener startup.
-* [ ] Log accepted requests.
-* [ ] Log selected upstreams.
-* [ ] Log upstream failures.
-* [ ] Log protocol errors without dumping sensitive body data.
+* [x] Add structured human-readable log messages without a logging crate.
+* [x] Log listener startup.
+* [x] Log accepted requests.
+* [x] Log selected upstreams.
+* [x] Log upstream failures.
+* [x] Log protocol errors without dumping sensitive body data.
 * [ ] Add graceful Ctrl+C/SIGINT handling where possible.
 * [ ] Add graceful listener shutdown.
 * [ ] Allow active requests to finish during shutdown.

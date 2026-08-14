@@ -105,7 +105,10 @@ fn start_proxy(config_path: &str) -> Result<(), AppError> {
         message: source.to_string(),
     })?;
 
-    println!("Listening on http://{}", server::DEV_LISTEN_ADDR);
+    println!(
+        "INFO event=listener_start address=http://{}",
+        server::DEV_LISTEN_ADDR
+    );
 
     server::serve(&listener, &config).map_err(|source| AppError::Server {
         message: source.to_string(),

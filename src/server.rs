@@ -33,7 +33,7 @@ pub fn serve(listener: &TcpListener, configuration: &config::Config) -> io::Resu
 #[cfg(test)]
 pub fn serve_one(listener: &TcpListener, configuration: &config::Config) -> io::Result<()> {
     let (stream, peer_addr) = listener.accept()?;
-    println!("Accepted connection from {peer_addr}");
+    println!("INFO event=connection_accept peer={peer_addr}");
 
     handle_accepted_connection(stream, peer_addr, configuration)
 }
@@ -49,14 +49,18 @@ fn accept_and_spawn(
     let maximum = configuration.max_connections();
 
     if active >= maximum {
-        println!("Rejecting connection from {peer_addr}; active connections: {active}/{maximum}");
+        println!(
+            "WARN event=connection_reject peer={peer_addr} reason=connection_limit active={active} maximum={maximum}"
+        );
 
         if let Err(error) = write_text_response(
             &mut stream,
             http::StatusCode::ServiceUnavailable,
             "Service Unavailable\n",
         ) {
-            eprintln!("BareProxy failed to send overload response to {peer_addr}: {error}");
+            eprintln!(
+                "ERROR event=response_failure peer={peer_addr} context=overload error={error}"
+            );
         }
 
         return Ok(None);
@@ -67,7 +71,7 @@ fn accept_and_spawn(
 
     let active = active_connections.fetch_add(1, Ordering::SeqCst) + 1;
 
-    println!("Accepted connection from {peer_addr}; active connections: {active}/{maximum}");
+    println!("INFO event=connection_accept peer={peer_addr} active={active} maximum={maximum}");
 
     Ok(Some(thread::spawn(move || {
         let result = handle_accepted_connection(stream, peer_addr, &configuration);
@@ -75,10 +79,10 @@ fn accept_and_spawn(
         let active = active_connections.fetch_sub(1, Ordering::SeqCst) - 1;
 
         if let Err(error) = result {
-            eprintln!("BareProxy connection error for {peer_addr}: {error}");
+            eprintln!("ERROR event=connection_failure peer={peer_addr} error={error}");
         }
 
-        println!("Connection {peer_addr} closed; active connections: {active}/{maximum}");
+        println!("INFO event=connection_close peer={peer_addr} active={active} maximum={maximum}");
     })))
 }
 
@@ -95,7 +99,7 @@ fn handle_accepted_connection(
         Ok(()) => Ok(()),
         Err(error) if is_client_idle_timeout(&error) => {
             println!(
-                "Client {peer_addr} idle timeout after {}s",
+                "WARN event=client_idle_timeout peer={peer_addr} timeout_seconds={}",
                 configuration.client_idle_timeout_seconds()
             );
 
@@ -104,12 +108,14 @@ fn handle_accepted_connection(
             Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-            eprintln!("BareProxy rejected invalid request from {peer_addr}: {error}");
+            eprintln!(
+                "WARN event=protocol_error peer={peer_addr} phase=request_head error={error}"
+            );
 
             write_text_response(&mut stream, http::StatusCode::BadRequest, "Bad Request\n")
         }
         Err(error) if is_client_disconnect(&error) => {
-            println!("Client {peer_addr} disconnected: {error}");
+            println!("INFO event=client_disconnect peer={peer_addr} error={error}");
             Ok(())
         }
         Err(error) => Err(error),
@@ -117,12 +123,13 @@ fn handle_accepted_connection(
 }
 
 fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> io::Result<()> {
+    let peer_addr = stream.peer_addr()?;
     let mut buffered = Vec::new();
     let mut proxy_session = proxy::Session::new(configuration.upstream_timeout_seconds());
 
     loop {
         let Some(received) = read_request_head(stream, &buffered)? else {
-            println!("Client disconnected before sending a request");
+            println!("INFO event=client_disconnect peer={peer_addr} phase=before_request");
             return Ok(());
         };
 
@@ -132,60 +139,53 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
             bytes_read,
         } = received;
 
-        println!("Read {bytes_read} bytes while receiving request headers");
-
-        if !buffered_body.is_empty() {
-            println!("Buffered body prefix: {} bytes", buffered_body.len());
-        }
-
         println!(
-            "Request: {} {} {}",
-            request.method, request.target, request.version
-        );
-
-        if let Some(host) = request.host() {
-            println!("Host: {host}");
-        }
-
-        if let Some(content_length) = request.content_length {
-            println!("Content-Length: {content_length}");
-        }
-
-        if request.has_transfer_encoding {
-            println!("Transfer-Encoding: present");
-        }
-
-        println!(
-            "Connection persistence: {}",
+            "INFO event=request peer={peer_addr} method={} target={} version={} host={} content_length={:?} transfer_encoding={} persistence={} head_bytes={} buffered_bytes={}",
+            request.method,
+            request.target,
+            request.version,
+            request.host().unwrap_or("-"),
+            request.content_length,
+            request.has_transfer_encoding,
             if request.keep_alive {
                 "keep-alive"
             } else {
                 "close"
-            }
+            },
+            bytes_read,
+            buffered_body.len()
         );
 
         let route = match select_route(&request, configuration) {
             Ok(route) => route,
             Err(status) => {
+                eprintln!(
+                    "WARN event=protocol_error peer={peer_addr} phase=route status={} reason={}",
+                    status.code(),
+                    status.reason_phrase()
+                );
+
                 let body = format!("{}\n", status.reason_phrase());
                 return write_text_response(stream, status, &body);
             }
         };
 
-        println!("Matched route: {route}");
+        println!("INFO event=route_selected peer={peer_addr} route=\"{route}\"");
 
-        let client_ip = stream.peer_addr()?.ip();
+        let client_ip = peer_addr.ip();
 
         match proxy_session.exchange(route, &request, stream, &buffered_body, client_ip) {
             Ok(result) if result.upgraded => {
-                println!("Switching upgraded connection to bidirectional tunnel");
+                println!("INFO event=upgrade_tunnel_start peer={peer_addr}");
 
                 match proxy_session.tunnel_upgraded(stream, result.buffered_client_bytes) {
                     Ok(()) => {
-                        println!("Upgrade tunnel closed");
+                        println!("INFO event=upgrade_tunnel_close peer={peer_addr}");
                     }
                     Err(error) => {
-                        eprintln!("BareProxy upgrade tunnel error: {error}");
+                        eprintln!(
+                            "ERROR event=upgrade_tunnel_failure peer={peer_addr} error={error}"
+                        );
                     }
                 }
 
@@ -198,18 +198,18 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
 
                 if !buffered.is_empty() {
                     println!(
-                        "Preserved {} buffered byte(s) for the next request",
+                        "INFO event=request_buffer_preserved peer={peer_addr} bytes={}",
                         buffered.len()
                     );
                 }
 
-                println!("Keeping client connection alive");
+                println!("INFO event=connection_keep_alive peer={peer_addr}");
                 continue;
             }
             Ok(result) => {
                 if request.keep_alive && !result.client_reusable {
                     println!(
-                        "Closing client connection because the upstream response is not reusable"
+                        "INFO event=connection_close_required peer={peer_addr} reason=upstream_not_reusable"
                     );
                 }
 
@@ -217,7 +217,9 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
                 return Ok(());
             }
             Err(proxy::ProxyError::InvalidClientBody { message }) => {
-                eprintln!("BareProxy request framing error: {message}");
+                eprintln!(
+                    "WARN event=protocol_error peer={peer_addr} phase=request_body error={message}"
+                );
 
                 return write_text_response(stream, http::StatusCode::BadRequest, "Bad Request\n");
             }
@@ -225,14 +227,18 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
                 return Err(io::Error::new(kind, message));
             }
             Err(proxy::ProxyError::ResponseStarted { message }) => {
-                eprintln!("BareProxy upstream streaming error: {message}");
+                eprintln!(
+                    "ERROR event=upstream_failure peer={peer_addr} phase=response_stream error={message}"
+                );
 
                 let _ = stream.shutdown(Shutdown::Both);
 
                 return Ok(());
             }
             Err(error) if error.is_upstream_timeout() => {
-                eprintln!("BareProxy upstream timeout: {error}");
+                eprintln!(
+                    "ERROR event=upstream_failure peer={peer_addr} kind=timeout error={error}"
+                );
 
                 return write_text_response(
                     stream,
@@ -241,7 +247,7 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
                 );
             }
             Err(error) => {
-                eprintln!("BareProxy upstream error: {error}");
+                eprintln!("ERROR event=upstream_failure peer={peer_addr} error={error}");
 
                 return write_text_response(stream, http::StatusCode::BadGateway, "Bad Gateway\n");
             }
