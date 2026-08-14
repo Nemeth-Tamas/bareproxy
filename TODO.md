@@ -255,8 +255,8 @@ Goal: stop behaving like a single-request toy server.
 
 Goal: handle the annoying corners needed for a trustworthy HTTP reverse proxy.
 
-* [ ] Implement hop-by-hop header removal.
-* [ ] Correctly process the `Connection` header's named hop-by-hop headers.
+* [x] Implement hop-by-hop header removal.
+* [x] Correctly process the `Connection` header's named hop-by-hop headers.
 * [ ] Handle `TE`.
 * [ ] Handle `Trailer`.
 * [ ] Handle `Upgrade`.

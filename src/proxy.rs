@@ -744,6 +744,8 @@ fn await_continue_or_final_response(
         }
 
         if status == 100 {
+            let response_head = sanitize_response_head(&response_head, None)?;
+
             client
                 .write_all(&response_head)
                 .map_err(|source| ProxyError::ResponseStarted {
@@ -760,6 +762,8 @@ fn await_continue_or_final_response(
         }
 
         if is_interim_response(status) {
+            let response_head = sanitize_response_head(&response_head, None)?;
+
             client
                 .write_all(&response_head)
                 .map_err(|source| ProxyError::ResponseStarted {
@@ -805,6 +809,8 @@ fn forward_response(
         }
 
         if is_interim_response(status) {
+            let response_head = sanitize_response_head(&response_head, None)?;
+
             client
                 .write_all(&response_head)
                 .map_err(|source| ProxyError::ResponseStarted {
@@ -823,6 +829,9 @@ fn forward_response(
 
         if response_has_no_body(request_method, status) {
             let client_reusable = response_allows_client_reuse(&response_head, false);
+            let connection_header = downstream_connection_header(&response_head, client_reusable);
+
+            let response_head = sanitize_response_head(&response_head, connection_header)?;
 
             client
                 .write_all(&response_head)
@@ -853,6 +862,9 @@ fn forward_response(
             content_length.is_none() && transfer_framing != ResponseTransferFraming::Chunked;
 
         let client_reusable = response_allows_client_reuse(&response_head, close_delimited);
+        let connection_header = downstream_connection_header(&response_head, client_reusable);
+
+        let response_head = sanitize_response_head(&response_head, connection_header)?;
 
         client
             .write_all(&response_head)
@@ -928,6 +940,131 @@ fn read_response_head(
         }
 
         buffer.extend_from_slice(&chunk[..bytes_read]);
+    }
+}
+
+fn sanitize_response_head(
+    response_head: &[u8],
+    connection_header: Option<&[u8]>,
+) -> Result<Vec<u8>, ProxyError> {
+    let connection_tokens = response_connection_tokens(response_head)?;
+
+    let mut lines = response_head.split(|byte| *byte == b'\n');
+
+    let status_line = lines
+        .next()
+        .ok_or_else(|| ProxyError::InvalidUpstreamResponse {
+            message: "response has no status line".to_owned(),
+        })?;
+
+    let status_line = status_line.strip_suffix(b"\r").unwrap_or(status_line);
+
+    let mut output = Vec::new();
+
+    output.extend_from_slice(status_line);
+    output.extend_from_slice(b"\r\n");
+
+    for line in response_head.split(|byte| *byte == b'\n').skip(1) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+
+        if line.is_empty() {
+            continue;
+        }
+
+        let separator = line.iter().position(|byte| *byte == b':').ok_or_else(|| {
+            ProxyError::InvalidUpstreamResponse {
+                message: "malformed response header".to_owned(),
+            }
+        })?;
+
+        let name = &line[..separator];
+
+        if should_remove_response_header(name, &connection_tokens) {
+            continue;
+        }
+
+        output.extend_from_slice(line);
+        output.extend_from_slice(b"\r\n");
+    }
+
+    if let Some(connection_header) = connection_header {
+        output.extend_from_slice(b"Connection: ");
+        output.extend_from_slice(connection_header);
+        output.extend_from_slice(b"\r\n");
+    }
+
+    output.extend_from_slice(b"\r\n");
+
+    Ok(output)
+}
+
+fn response_connection_tokens(response_head: &[u8]) -> Result<Vec<Vec<u8>>, ProxyError> {
+    let mut tokens = Vec::new();
+
+    for line in response_head.split(|byte| *byte == b'\n').skip(1) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+
+        if line.is_empty() {
+            continue;
+        }
+
+        let separator = line.iter().position(|byte| *byte == b':').ok_or_else(|| {
+            ProxyError::InvalidUpstreamResponse {
+                message: "malformed response header".to_owned(),
+            }
+        })?;
+
+        let name = &line[..separator];
+
+        if !name.eq_ignore_ascii_case(b"connection") {
+            continue;
+        }
+
+        for token in line[separator + 1..].split(|byte| *byte == b',') {
+            let token = trim_optional_whitespace(token);
+
+            if token.is_empty() || !token.iter().copied().all(is_token_byte) {
+                return Err(ProxyError::InvalidUpstreamResponse {
+                    message: "invalid Connection header token".to_owned(),
+                });
+            }
+
+            if token.eq_ignore_ascii_case(b"content-length")
+                || token.eq_ignore_ascii_case(b"transfer-encoding")
+            {
+                return Err(ProxyError::InvalidUpstreamResponse {
+                    message: "Connection header names a response framing field".to_owned(),
+                });
+            }
+
+            tokens.push(token.to_ascii_lowercase());
+        }
+    }
+
+    Ok(tokens)
+}
+
+fn should_remove_response_header(name: &[u8], connection_tokens: &[Vec<u8>]) -> bool {
+    name.eq_ignore_ascii_case(b"connection")
+        || name.eq_ignore_ascii_case(b"keep-alive")
+        || name.eq_ignore_ascii_case(b"proxy-connection")
+        || connection_tokens
+            .iter()
+            .any(|token| name.eq_ignore_ascii_case(token))
+}
+
+fn downstream_connection_header(
+    response_head: &[u8],
+    client_reusable: bool,
+) -> Option<&'static [u8]> {
+    if !client_reusable {
+        return Some(b"close");
+    }
+
+    if response_head.starts_with(b"HTTP/1.0 ") {
+        Some(b"keep-alive")
+    } else {
+        None
     }
 }
 
@@ -1474,8 +1611,9 @@ mod tests {
     use crate::{config, http};
 
     use super::{
-        ProxyError, exchange, serialize_request_head, stream_chunked_request_body,
-        stream_chunked_response_body, stream_close_delimited_response_body,
+        ProxyError, exchange, sanitize_response_head, serialize_request_head,
+        stream_chunked_request_body, stream_chunked_response_body,
+        stream_close_delimited_response_body,
     };
 
     struct FragmentedReader {
@@ -1593,6 +1731,32 @@ X-Forwarded-For: spoofed\r\n\
     }
 
     #[test]
+    fn sanitizes_response_connection_headers() {
+        let response = sanitize_response_head(
+            b"HTTP/1.1 200 OK\r\n\
+Content-Length: 2\r\n\
+Connection: keep-alive, X-Hop\r\n\
+Keep-Alive: timeout=5\r\n\
+X-Hop: remove-me\r\n\
+X-End-To-End: keep-me\r\n\
+\r\n",
+            Some(b"close"),
+        )
+        .unwrap();
+
+        let response = String::from_utf8(response).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Length: 2\r\n"));
+        assert!(response.contains("X-End-To-End: keep-me\r\n"));
+        assert!(response.contains("Connection: close\r\n"));
+
+        assert!(!response.contains("Connection: keep-alive"));
+        assert!(!response.contains("Keep-Alive:"));
+        assert!(!response.contains("X-Hop:"));
+    }
+
+    #[test]
     fn serializes_chunked_request_for_upstream() {
         let request = http::parse_request_with_consumed(
             b"POST /chunked HTTP/1.1\r\n\
@@ -1697,7 +1861,10 @@ Trailer: X-End\r\n\
                 .write_all(
                     b"HTTP/1.1 200 OK\r\n\
 Content-Length: 15\r\n\
-Connection: close\r\n\
+Connection: close, X-Upstream-Hop\r\n\
+Keep-Alive: timeout=5\r\n\
+X-Upstream-Hop: remove-me\r\n\
+X-End-To-End: keep-me\r\n\
 \r\n\
 upstream works\n",
                 )
@@ -1732,6 +1899,31 @@ upstream works\n",
         let response = client.into_inner();
 
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+
+        assert!(
+            response
+                .windows(b"Connection: close\r\n".len())
+                .any(|window| window == b"Connection: close\r\n")
+        );
+
+        assert!(
+            response
+                .windows(b"X-End-To-End: keep-me\r\n".len())
+                .any(|window| window == b"X-End-To-End: keep-me\r\n")
+        );
+
+        assert!(
+            !response
+                .windows(b"Keep-Alive: timeout=5\r\n".len())
+                .any(|window| window == b"Keep-Alive: timeout=5\r\n")
+        );
+
+        assert!(
+            !response
+                .windows(b"X-Upstream-Hop: remove-me\r\n".len())
+                .any(|window| window == b"X-Upstream-Hop: remove-me\r\n")
+        );
+
         assert!(response.ends_with(b"upstream works\n"));
     }
 
