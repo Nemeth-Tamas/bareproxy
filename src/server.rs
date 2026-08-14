@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use crate::{config, http, proxy};
@@ -86,8 +87,22 @@ fn handle_accepted_connection(
     peer_addr: SocketAddr,
     configuration: &config::Config,
 ) -> io::Result<()> {
+    let idle_timeout = Duration::from_secs(configuration.client_idle_timeout_seconds());
+
+    stream.set_read_timeout(Some(idle_timeout))?;
+
     match handle_connection(&mut stream, configuration) {
         Ok(()) => Ok(()),
+        Err(error) if is_client_idle_timeout(&error) => {
+            println!(
+                "Client {peer_addr} idle timeout after {}s",
+                configuration.client_idle_timeout_seconds()
+            );
+
+            let _ = stream.shutdown(Shutdown::Both);
+
+            Ok(())
+        }
         Err(error) if is_client_disconnect(&error) => {
             println!("Client {peer_addr} disconnected: {error}");
             Ok(())
@@ -185,8 +200,8 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
 
                 return write_text_response(stream, http::StatusCode::BadRequest, "Bad Request\n");
             }
-            Err(proxy::ProxyError::ClientRead { message }) => {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, message));
+            Err(proxy::ProxyError::ClientRead { kind, message }) => {
+                return Err(io::Error::new(kind, message));
             }
             Err(proxy::ProxyError::ResponseStarted { message }) => {
                 eprintln!("BareProxy upstream streaming error: {message}");
@@ -311,6 +326,13 @@ fn build_response() -> Result<Vec<u8>, http::ResponseError> {
     build_text_response(http::StatusCode::Ok, RESPONSE_BODY)
 }
 
+fn is_client_idle_timeout(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
+}
+
 fn is_client_disconnect(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -332,6 +354,7 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         },
         thread,
+        time::Duration,
     };
 
     use crate::{config, http};
@@ -984,5 +1007,38 @@ localhost -> 127.0.0.1:3000",
         bare_thread.join().unwrap();
 
         assert_eq!(active_connections.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn closes_idle_client_after_configured_timeout() {
+        let configuration = config::parse(
+            "client_idle_timeout_seconds = 1\n\
+localhost -> 127.0.0.1:3000",
+        )
+        .unwrap();
+
+        let bare_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bare_address = bare_listener.local_addr().unwrap();
+
+        let bare_thread = thread::spawn(move || {
+            serve_one(&bare_listener, &configuration).unwrap();
+        });
+
+        let mut client = TcpStream::connect(bare_address).unwrap();
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        client
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n")
+            .unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        bare_thread.join().unwrap();
+
+        assert!(response.is_empty());
     }
 }

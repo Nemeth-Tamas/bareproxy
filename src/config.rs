@@ -1,11 +1,13 @@
 use std::{collections::HashSet, error::Error, fmt, fs, net::IpAddr};
 
 const DEFAULT_MAX_CONNECTIONS: usize = 128;
+const DEFAULT_CLIENT_IDLE_TIMEOUT_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     routes: Vec<Route>,
     max_connections: usize,
+    client_idle_timeout_seconds: u64,
 }
 
 impl Config {
@@ -15,6 +17,10 @@ impl Config {
 
     pub fn max_connections(&self) -> usize {
         self.max_connections
+    }
+
+    pub fn client_idle_timeout_seconds(&self) -> u64 {
+        self.client_idle_timeout_seconds
     }
 
     pub fn route_for_host(&self, host: &str) -> Result<&Route, RouteLookupError> {
@@ -117,6 +123,8 @@ pub fn parse(input: &str) -> Result<Config, ConfigError> {
     let mut hostnames = HashSet::new();
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
     let mut max_connections_set = false;
+    let mut client_idle_timeout_seconds = DEFAULT_CLIENT_IDLE_TIMEOUT_SECONDS;
+    let mut client_idle_timeout_set = false;
 
     for (index, raw_line) in input.lines().enumerate() {
         let line_number = index + 1;
@@ -143,6 +151,28 @@ pub fn parse(input: &str) -> Result<Config, ConfigError> {
                 })?;
 
             max_connections_set = true;
+            continue;
+        }
+
+        if let Some((directive, value)) = line.split_once('=')
+            && directive.trim() == "client_idle_timeout_seconds"
+        {
+            if client_idle_timeout_set {
+                return Err(ConfigError::Line {
+                    line: line_number,
+                    message: "duplicate client_idle_timeout_seconds setting".to_owned(),
+                });
+            }
+
+            client_idle_timeout_seconds =
+                parse_client_idle_timeout_seconds(value.trim()).map_err(|message| {
+                    ConfigError::Line {
+                        line: line_number,
+                        message,
+                    }
+                })?;
+
+            client_idle_timeout_set = true;
             continue;
         }
 
@@ -181,6 +211,7 @@ pub fn parse(input: &str) -> Result<Config, ConfigError> {
     Ok(Config {
         routes,
         max_connections,
+        client_idle_timeout_seconds,
     })
 }
 
@@ -339,10 +370,27 @@ fn parse_max_connections(value: &str) -> Result<usize, String> {
     Ok(value)
 }
 
+fn parse_client_idle_timeout_seconds(value: &str) -> Result<u64, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("client_idle_timeout_seconds must be a positive integer".to_owned());
+    }
+
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| "client_idle_timeout_seconds must be a positive integer".to_owned())?;
+
+    if value == 0 {
+        return Err("client_idle_timeout_seconds must be a positive integer".to_owned());
+    }
+
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ConfigError, DEFAULT_MAX_CONNECTIONS, Route, RouteLookupError, Upstream, parse,
+        Config, ConfigError, DEFAULT_CLIENT_IDLE_TIMEOUT_SECONDS, DEFAULT_MAX_CONNECTIONS, Route,
+        RouteLookupError, Upstream, parse,
     };
 
     #[test]
@@ -358,6 +406,7 @@ mod tests {
                     },
                 }],
                 max_connections: DEFAULT_MAX_CONNECTIONS,
+                client_idle_timeout_seconds: DEFAULT_CLIENT_IDLE_TIMEOUT_SECONDS,
             })
         );
     }
@@ -378,6 +427,56 @@ example.test -> 127.0.0.1:3000",
         .unwrap();
 
         assert_eq!(config.max_connections(), 42);
+    }
+
+    #[test]
+    fn uses_default_client_idle_timeout() {
+        let config = parse("example.test -> 127.0.0.1:3000").unwrap();
+
+        assert_eq!(
+            config.client_idle_timeout_seconds(),
+            DEFAULT_CLIENT_IDLE_TIMEOUT_SECONDS
+        );
+    }
+
+    #[test]
+    fn parses_client_idle_timeout() {
+        let config = parse(
+            "client_idle_timeout_seconds = 12\n\
+example.test -> 127.0.0.1:3000",
+        )
+        .unwrap();
+
+        assert_eq!(config.client_idle_timeout_seconds(), 12);
+    }
+
+    #[test]
+    fn rejects_zero_client_idle_timeout() {
+        assert_eq!(
+            parse(
+                "client_idle_timeout_seconds = 0\n\
+example.test -> 127.0.0.1:3000"
+            ),
+            Err(ConfigError::Line {
+                line: 1,
+                message: "client_idle_timeout_seconds must be a positive integer".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_client_idle_timeout() {
+        assert_eq!(
+            parse(
+                "client_idle_timeout_seconds = 10\n\
+client_idle_timeout_seconds = 20\n\
+example.test -> 127.0.0.1:3000"
+            ),
+            Err(ConfigError::Line {
+                line: 2,
+                message: "duplicate client_idle_timeout_seconds setting".to_owned(),
+            })
+        );
     }
 
     #[test]

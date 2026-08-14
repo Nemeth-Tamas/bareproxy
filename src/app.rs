@@ -90,6 +90,10 @@ fn start_proxy(config_path: &str) -> Result<(), AppError> {
 
     println!("Loaded {} route(s)", config.routes().len());
     println!("Max connections: {}", config.max_connections());
+    println!(
+        "Client idle timeout: {}s",
+        config.client_idle_timeout_seconds()
+    );
 
     for route in config.routes() {
         println!("Route: {route}");

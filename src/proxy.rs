@@ -17,15 +17,31 @@ const MAX_TRAILER_COUNT: usize = 100;
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProxyError {
     MissingHost,
-    Connect { address: String, message: String },
-    Write { message: String },
-    Read { message: String },
-    ClientRead { message: String },
-    InvalidClientBody { message: String },
+    Connect {
+        address: String,
+        message: String,
+    },
+    Write {
+        message: String,
+    },
+    Read {
+        message: String,
+    },
+    ClientRead {
+        kind: io::ErrorKind,
+        message: String,
+    },
+    InvalidClientBody {
+        message: String,
+    },
     EmptyResponse,
     IncompleteResponse,
-    InvalidUpstreamResponse { message: String },
-    ResponseStarted { message: String },
+    InvalidUpstreamResponse {
+        message: String,
+    },
+    ResponseStarted {
+        message: String,
+    },
 }
 
 impl fmt::Display for ProxyError {
@@ -47,7 +63,7 @@ impl fmt::Display for ProxyError {
                     "failed to read response from upstream: {message}"
                 )
             }
-            Self::ClientRead { message } => {
+            Self::ClientRead { message, .. } => {
                 write!(
                     formatter,
                     "failed to read request body from client: {message}"
@@ -278,6 +294,7 @@ fn stream_chunked_request_body(
         reader
             .read_exact(&mut ending)
             .map_err(|source| ProxyError::ClientRead {
+                kind: source.kind(),
                 message: source.to_string(),
             })?;
 
@@ -309,11 +326,13 @@ fn stream_chunk_data(
             reader
                 .read(&mut buffer[..read_limit])
                 .map_err(|source| ProxyError::ClientRead {
+                    kind: source.kind(),
                     message: source.to_string(),
                 })?;
 
         if bytes_read == 0 {
             return Err(ProxyError::ClientRead {
+                kind: io::ErrorKind::UnexpectedEof,
                 message: "client disconnected during chunk data".to_owned(),
             });
         }
@@ -388,6 +407,7 @@ fn read_chunk_line(reader: &mut impl Read, maximum_size: usize) -> Result<Vec<u8
         reader
             .read_exact(&mut byte)
             .map_err(|source| ProxyError::ClientRead {
+                kind: source.kind(),
                 message: source.to_string(),
             })?;
 
@@ -396,6 +416,7 @@ fn read_chunk_line(reader: &mut impl Read, maximum_size: usize) -> Result<Vec<u8
                 reader
                     .read_exact(&mut byte)
                     .map_err(|source| ProxyError::ClientRead {
+                        kind: source.kind(),
                         message: source.to_string(),
                     })?;
 
@@ -557,11 +578,13 @@ fn stream_request_body(
             client
                 .read(&mut buffer[..read_limit])
                 .map_err(|source| ProxyError::ClientRead {
+                    kind: source.kind(),
                     message: source.to_string(),
                 })?;
 
         if bytes_read == 0 {
             return Err(ProxyError::ClientRead {
+                kind: io::ErrorKind::UnexpectedEof,
                 message: "client disconnected before completing request body".to_owned(),
             });
         }
@@ -1070,7 +1093,7 @@ fn read_response_chunk_line(
 ) -> Result<Vec<u8>, ProxyError> {
     match read_chunk_line(reader, maximum_size) {
         Ok(line) => Ok(line),
-        Err(ProxyError::ClientRead { message })
+        Err(ProxyError::ClientRead { message, .. })
         | Err(ProxyError::InvalidClientBody { message }) => Err(ProxyError::ResponseStarted {
             message: format!("invalid chunked upstream response: {message}"),
         }),
