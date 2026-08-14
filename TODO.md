@@ -257,8 +257,8 @@ Goal: handle the annoying corners needed for a trustworthy HTTP reverse proxy.
 
 * [x] Implement hop-by-hop header removal.
 * [x] Correctly process the `Connection` header's named hop-by-hop headers.
-* [ ] Handle `TE`.
-* [ ] Handle `Trailer`.
+* [x] Handle `TE`.
+* [x] Handle `Trailer`.
 * [ ] Handle `Upgrade`.
 * [ ] Support HTTP protocol upgrade tunnelling.
 * [ ] Support WebSocket upgrade traffic.

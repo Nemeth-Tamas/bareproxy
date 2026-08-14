@@ -744,7 +744,7 @@ fn await_continue_or_final_response(
         }
 
         if status == 100 {
-            let response_head = sanitize_response_head(&response_head, None)?;
+            let response_head = sanitize_response_head(&response_head, None, false)?;
 
             client
                 .write_all(&response_head)
@@ -762,7 +762,7 @@ fn await_continue_or_final_response(
         }
 
         if is_interim_response(status) {
-            let response_head = sanitize_response_head(&response_head, None)?;
+            let response_head = sanitize_response_head(&response_head, None, false)?;
 
             client
                 .write_all(&response_head)
@@ -809,7 +809,7 @@ fn forward_response(
         }
 
         if is_interim_response(status) {
-            let response_head = sanitize_response_head(&response_head, None)?;
+            let response_head = sanitize_response_head(&response_head, None, false)?;
 
             client
                 .write_all(&response_head)
@@ -831,7 +831,7 @@ fn forward_response(
             let client_reusable = response_allows_client_reuse(&response_head, false);
             let connection_header = downstream_connection_header(&response_head, client_reusable);
 
-            let response_head = sanitize_response_head(&response_head, connection_header)?;
+            let response_head = sanitize_response_head(&response_head, connection_header, false)?;
 
             client
                 .write_all(&response_head)
@@ -864,7 +864,11 @@ fn forward_response(
         let client_reusable = response_allows_client_reuse(&response_head, close_delimited);
         let connection_header = downstream_connection_header(&response_head, client_reusable);
 
-        let response_head = sanitize_response_head(&response_head, connection_header)?;
+        let response_head = sanitize_response_head(
+            &response_head,
+            connection_header,
+            transfer_framing == ResponseTransferFraming::Chunked,
+        )?;
 
         client
             .write_all(&response_head)
@@ -946,6 +950,7 @@ fn read_response_head(
 fn sanitize_response_head(
     response_head: &[u8],
     connection_header: Option<&[u8]>,
+    preserve_trailer_header: bool,
 ) -> Result<Vec<u8>, ProxyError> {
     let connection_tokens = response_connection_tokens(response_head)?;
 
@@ -979,8 +984,16 @@ fn sanitize_response_head(
 
         let name = &line[..separator];
 
-        if should_remove_response_header(name, &connection_tokens) {
+        if should_remove_response_header(name, &connection_tokens, preserve_trailer_header) {
             continue;
+        }
+
+        if name.eq_ignore_ascii_case(b"trailer") {
+            validate_trailer_header_value(&line[separator + 1..]).map_err(|message| {
+                ProxyError::InvalidUpstreamResponse {
+                    message: message.to_owned(),
+                }
+            })?;
         }
 
         output.extend_from_slice(line);
@@ -1044,10 +1057,16 @@ fn response_connection_tokens(response_head: &[u8]) -> Result<Vec<Vec<u8>>, Prox
     Ok(tokens)
 }
 
-fn should_remove_response_header(name: &[u8], connection_tokens: &[Vec<u8>]) -> bool {
+fn should_remove_response_header(
+    name: &[u8],
+    connection_tokens: &[Vec<u8>],
+    preserve_trailer_header: bool,
+) -> bool {
     name.eq_ignore_ascii_case(b"connection")
         || name.eq_ignore_ascii_case(b"keep-alive")
         || name.eq_ignore_ascii_case(b"proxy-connection")
+        || name.eq_ignore_ascii_case(b"te")
+        || (name.eq_ignore_ascii_case(b"trailer") && !preserve_trailer_header)
         || connection_tokens
             .iter()
             .any(|token| name.eq_ignore_ascii_case(token))
@@ -1533,15 +1552,28 @@ fn serialize_request_head(
     if request.has_transfer_encoding {
         output.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
 
-        for header in request
-            .headers
-            .iter()
-            .filter(|header| header.name.eq_ignore_ascii_case("trailer"))
-        {
-            output.extend_from_slice(b"Trailer: ");
-            output.extend_from_slice(&header.value);
-            output.extend_from_slice(b"\r\n");
+        if !named_by_connection_header(request, "trailer") {
+            for header in request
+                .headers
+                .iter()
+                .filter(|header| header.name.eq_ignore_ascii_case("trailer"))
+            {
+                validate_trailer_header_value(&header.value).map_err(|message| {
+                    ProxyError::InvalidClientBody {
+                        message: message.to_owned(),
+                    }
+                })?;
+
+                output.extend_from_slice(b"Trailer: ");
+                output.extend_from_slice(&header.value);
+                output.extend_from_slice(b"\r\n");
+            }
         }
+    }
+
+    if request_accepts_trailers(request) {
+        output.extend_from_slice(b"TE: trailers\r\n");
+        output.extend_from_slice(b"Connection: TE\r\n");
     }
 
     output.extend_from_slice(b"X-Forwarded-For: ");
@@ -1586,6 +1618,48 @@ fn named_by_connection_header(request: &http::Request, name: &str) -> bool {
                 .map(trim_optional_whitespace)
                 .any(|token| token.eq_ignore_ascii_case(name.as_bytes()))
         })
+}
+
+fn request_accepts_trailers(request: &http::Request) -> bool {
+    if !named_by_connection_header(request, "te") {
+        return false;
+    }
+
+    request
+        .headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("te"))
+        .any(|header| {
+            header
+                .value
+                .split(|byte| *byte == b',')
+                .map(trim_optional_whitespace)
+                .any(|coding| coding.eq_ignore_ascii_case(b"trailers"))
+        })
+}
+
+fn validate_trailer_header_value(value: &[u8]) -> Result<(), &'static str> {
+    let mut field_count = 0;
+
+    for field_name in value.split(|byte| *byte == b',') {
+        let field_name = trim_optional_whitespace(field_name);
+
+        if field_name.is_empty() || !field_name.iter().copied().all(is_token_byte) {
+            return Err("Trailer header contains invalid field name");
+        }
+
+        if is_forbidden_trailer_name(field_name) {
+            return Err("Trailer header contains forbidden field name");
+        }
+
+        field_count += 1;
+    }
+
+    if field_count == 0 {
+        return Err("Trailer header contains no field names");
+    }
+
+    Ok(())
 }
 
 fn trim_optional_whitespace(mut value: &[u8]) -> &[u8] {
@@ -1741,6 +1815,7 @@ X-Hop: remove-me\r\n\
 X-End-To-End: keep-me\r\n\
 \r\n",
             Some(b"close"),
+            false,
         )
         .unwrap();
 
@@ -1763,6 +1838,8 @@ X-End-To-End: keep-me\r\n\
 Host: example.test\r\n\
 Transfer-Encoding: chunked\r\n\
 Trailer: X-End\r\n\
+Connection: TE\r\n\
+TE: trailers, gzip;q=0.5\r\n\
 \r\n",
         )
         .unwrap()
@@ -1774,7 +1851,28 @@ Trailer: X-End\r\n\
 
         assert!(serialized.contains("Transfer-Encoding: chunked\r\n"));
         assert!(serialized.contains("Trailer: X-End\r\n"));
+        assert!(serialized.contains("TE: trailers\r\n"));
+        assert!(serialized.contains("Connection: TE\r\n"));
+
+        assert!(!serialized.contains("gzip"));
         assert!(!serialized.contains("Content-Length:"));
+    }
+
+    #[test]
+    fn rejects_forbidden_request_trailer_declaration() {
+        let request = http::parse_request_with_consumed(
+            b"POST /chunked HTTP/1.1\r\n\
+Host: example.test\r\n\
+Transfer-Encoding: chunked\r\n\
+Trailer: Content-Length\r\n\
+\r\n",
+        )
+        .unwrap()
+        .0;
+
+        let result = serialize_request_head(&request, IpAddr::from([127, 0, 0, 1]));
+
+        assert!(matches!(result, Err(ProxyError::InvalidClientBody { .. })));
     }
 
     #[test]
@@ -1815,6 +1913,23 @@ Trailer: X-End\r\n\
         stream_chunked_response_body(&mut upstream, &mut client, buffered).unwrap();
 
         assert_eq!(client, body);
+    }
+
+    #[test]
+    fn rejects_forbidden_response_trailer_declaration() {
+        let result = sanitize_response_head(
+            b"HTTP/1.1 200 OK\r\n\
+Transfer-Encoding: chunked\r\n\
+Trailer: Content-Length\r\n\
+\r\n",
+            None,
+            true,
+        );
+
+        assert!(matches!(
+            result,
+            Err(ProxyError::InvalidUpstreamResponse { .. })
+        ));
     }
 
     #[test]
@@ -1990,6 +2105,7 @@ tiny",
                     b"HTTP/1.1 200 OK\r\n\
 Transfer-Encoding: chunked\r\n\
 Trailer: X-End\r\n\
+TE: trailers\r\n\
 Connection: close\r\n\
 \r\n\
 4\r\nWiki\r\n\
@@ -2030,6 +2146,18 @@ X-End: yes\r\n\
             response
                 .windows(b"Transfer-Encoding: chunked\r\n".len())
                 .any(|window| window == b"Transfer-Encoding: chunked\r\n")
+        );
+
+        assert!(
+            response
+                .windows(b"Trailer: X-End\r\n".len())
+                .any(|window| window == b"Trailer: X-End\r\n")
+        );
+
+        assert!(
+            !response
+                .windows(b"TE: trailers\r\n".len())
+                .any(|window| window == b"TE: trailers\r\n")
         );
 
         assert!(response.ends_with(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\nX-End: yes\r\n\r\n"));
