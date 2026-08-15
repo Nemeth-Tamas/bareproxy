@@ -11,6 +11,9 @@ const BASE64_URL_ALPHABET: &[u8; 64] =
 const SHA256_BLOCK_SIZE: usize = 64;
 const SHA256_LENGTH_OFFSET: usize = 56;
 
+const HMAC_INNER_PAD_BYTE: u8 = 0x36;
+const HMAC_OUTER_PAD_BYTE: u8 = 0x5c;
+
 const SHA256_INITIAL_STATE: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
@@ -242,12 +245,14 @@ impl Sha256 {
             self.buffer_len += bytes_to_copy;
             input = &input[bytes_to_copy..];
 
-            if self.buffer_len == SHA256_BLOCK_SIZE {
-                let block = self.buffer;
-
-                self.compress_block(&block);
-                self.buffer_len = 0;
+            if self.buffer_len != SHA256_BLOCK_SIZE {
+                return;
             }
+
+            let block = self.buffer;
+
+            self.compress_block(&block);
+            self.buffer_len = 0;
         }
 
         let mut chunks = input.chunks_exact(SHA256_BLOCK_SIZE);
@@ -371,6 +376,52 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
     hasher.finalize()
 }
 
+/// Computes HMAC-SHA256 following RFC 2104.
+///
+/// Keys longer than SHA-256's 64-byte block size are hashed first.
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut key_block = [0_u8; SHA256_BLOCK_SIZE];
+
+    if key.len() > SHA256_BLOCK_SIZE {
+        let mut hashed_key = sha256(key);
+
+        key_block[..hashed_key.len()].copy_from_slice(&hashed_key);
+        hashed_key.fill(0);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut inner_pad = key_block;
+    let mut outer_pad = key_block;
+
+    for byte in &mut inner_pad {
+        *byte ^= HMAC_INNER_PAD_BYTE;
+    }
+
+    for byte in &mut outer_pad {
+        *byte ^= HMAC_OUTER_PAD_BYTE;
+    }
+
+    let mut inner = Sha256::new();
+
+    inner.update(&inner_pad);
+    inner.update(data);
+
+    let mut inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+
+    outer.update(&outer_pad);
+    outer.update(&inner_digest);
+
+    inner_digest.fill(0);
+    key_block.fill(0);
+    inner_pad.fill(0);
+    outer_pad.fill(0);
+
+    outer.finalize()
+}
+
 fn choice(x: u32, y: u32, z: u32) -> u32 {
     (x & y) ^ (!x & z)
 }
@@ -431,7 +482,7 @@ mod platform {
 mod tests {
     use super::{
         HexError, Sha256, constant_time_eq, decode_hex, encode_base64, encode_base64_url_no_pad,
-        encode_hex, fill_random, sha256,
+        encode_hex, fill_random, hmac_sha256, sha256,
     };
 
     #[test]
@@ -651,6 +702,64 @@ a33ce45964ff2167f6ecedd419db06c1"
             encode_hex(&hasher.finalize()),
             "cdc76e5c9914fb9281a1c7e284d73e67\
 f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231_case_1() {
+        let key = [0x0b_u8; 20];
+
+        assert_eq!(
+            encode_hex(&hmac_sha256(&key, b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b\
+881dc200c9833da726e9376c2e32cff7"
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231_case_2() {
+        assert_eq!(
+            encode_hex(&hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c7\
+5a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231_case_3() {
+        let key = [0xaa_u8; 20];
+        let data = [0xdd_u8; 50];
+
+        assert_eq!(
+            encode_hex(&hmac_sha256(&key, &data)),
+            "773ea91e36800e46854db8ebd09181a7\
+2959098b3ef8c122d9635514ced565fe"
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231_case_4() {
+        let key: Vec<u8> = (1..=25).collect();
+        let data = [0xcd_u8; 50];
+
+        assert_eq!(
+            encode_hex(&hmac_sha256(&key, &data)),
+            "82558a389a443c0ea4cc819899f2083a\
+85f0faa3e578f8077a2e3ff46729665b"
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_hashes_oversized_key_per_rfc_4231_case_6() {
+        let key = [0xaa_u8; 131];
+
+        assert_eq!(
+            encode_hex(&hmac_sha256(
+                &key,
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "60e431591ee0b67f0d8a26aacbf5b77f\
+8e0bc6213728c5140546040f0ee37f54"
         );
     }
 }

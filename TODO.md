@@ -316,8 +316,8 @@ This is where BareProxy stops being a reasonable weekend project.
 * [x] Add RFC/test-vector coverage for Base64.
 * [x] Implement SHA-256.
 * [x] Test SHA-256 against published vectors.
-* [ ] Implement HMAC-SHA256.
-* [ ] Test HMAC-SHA256 against published vectors.
+* [x] Implement HMAC-SHA256.
+* [x] Test HMAC-SHA256 against published vectors.
 * [ ] Implement HKDF-Extract with SHA-256.
 * [ ] Implement HKDF-Expand with SHA-256.
 * [ ] Implement TLS 1.3 HKDF label expansion.
