@@ -438,14 +438,14 @@ Goal: implement TLS framing before attempting the entire handshake.
 * [x] Support application-data record types.
 * [x] Handle fragmented TLS records.
 * [x] Handle multiple messages inside one record.
-* [ ] Implement encrypted TLS 1.3 record construction.
-* [ ] Implement encrypted record decryption.
-* [ ] Implement per-direction sequence numbers.
-* [ ] Construct TLS 1.3 AEAD nonces correctly.
-* [ ] Authenticate record headers as additional data.
-* [ ] Handle TLS inner content types.
-* [ ] Reject bad AEAD tags.
-* [ ] Reject sequence-number overflow.
+* [x] Implement encrypted TLS 1.3 record construction.
+* [x] Implement encrypted record decryption.
+* [x] Implement per-direction sequence numbers.
+* [x] Construct TLS 1.3 AEAD nonces correctly.
+* [x] Authenticate record headers as additional data.
+* [x] Handle TLS inner content types.
+* [x] Reject bad AEAD tags.
+* [x] Reject sequence-number overflow.
 * [x] Add record-layer unit tests.
 
 **Milestone complete when:** encrypted and plaintext TLS records round-trip correctly through our parser.
