@@ -1,4 +1,5 @@
 mod app;
+pub mod asn1;
 mod config;
 pub mod crypto;
 mod http;

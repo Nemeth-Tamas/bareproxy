@@ -396,18 +396,18 @@ Goal: obtain the key-exchange and signing primitives needed for TLS, certificate
 
 Goal: speak enough ASN.1/X.509 machinery to request and store real certificates.
 
-* [ ] Implement minimal ASN.1 DER length encoding.
-* [ ] Implement minimal ASN.1 DER integer encoding.
-* [ ] Implement sequence encoding.
-* [ ] Implement set encoding where needed.
-* [ ] Implement object identifier encoding.
-* [ ] Implement bit-string encoding.
-* [ ] Implement octet-string encoding.
-* [ ] Implement context-specific tagged values needed by our structures.
-* [ ] Implement the corresponding bounded DER parser.
-* [ ] Reject non-canonical or malformed DER where relevant.
-* [ ] Implement PEM encoding.
-* [ ] Implement PEM decoding.
+* [x] Implement minimal ASN.1 DER length encoding.
+* [x] Implement minimal ASN.1 DER integer encoding.
+* [x] Implement sequence encoding.
+* [x] Implement set encoding where needed.
+* [x] Implement object identifier encoding.
+* [x] Implement bit-string encoding.
+* [x] Implement octet-string encoding.
+* [x] Implement context-specific tagged values needed by our structures.
+* [x] Implement the corresponding bounded DER parser.
+* [x] Reject non-canonical or malformed DER where relevant.
+* [x] Implement PEM encoding.
+* [x] Implement PEM decoding.
 * [ ] Encode a P-256 private key.
 * [ ] Encode a P-256 public key/SPKI structure.
 * [ ] Persist private keys with restrictive filesystem permissions.
