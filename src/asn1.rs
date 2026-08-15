@@ -13,10 +13,13 @@ use crate::{
 
 use std::{error::Error, fmt, io, path::Path};
 
+const DER_TAG_BOOLEAN: u8 = 0x01;
 const DER_TAG_INTEGER: u8 = 0x02;
 const DER_TAG_BIT_STRING: u8 = 0x03;
 const DER_TAG_OCTET_STRING: u8 = 0x04;
 const DER_TAG_OBJECT_IDENTIFIER: u8 = 0x06;
+const DER_TAG_UTC_TIME: u8 = 0x17;
+const DER_TAG_GENERALIZED_TIME: u8 = 0x18;
 const DER_TAG_SEQUENCE: u8 = 0x30;
 const DER_TAG_SET: u8 = 0x31;
 
@@ -46,6 +49,8 @@ pub enum DerError {
     InvalidP256PrivateKey,
     InvalidP256PublicKey,
     InvalidDnsName,
+    InvalidCertificate,
+    InvalidTime,
 }
 
 impl fmt::Display for DerError {
@@ -105,6 +110,10 @@ impl fmt::Display for DerError {
                 formatter.write_str("P-256 public key cannot be the identity point")
             }
             Self::InvalidDnsName => formatter.write_str("invalid DNS name for subjectAltName"),
+            Self::InvalidCertificate => {
+                formatter.write_str("invalid or unsupported X.509 certificate structure")
+            }
+            Self::InvalidTime => formatter.write_str("invalid X.509 certificate validity time"),
         }
     }
 }
@@ -695,6 +704,437 @@ pub fn encode_p256_csr_pem(private_key: Scalar, dns_names: &[&str]) -> Result<St
     pem_encode("CERTIFICATE REQUEST", &der)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct X509Time {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct X509Validity {
+    pub not_before: X509Time,
+    pub not_after: X509Time,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct X509PublicKeyInfo {
+    pub algorithm_oid: Vec<u8>,
+    pub subject_public_key: Vec<u8>,
+    pub p256_public_key: Option<P256Point>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct X509CertificateInfo {
+    pub validity: X509Validity,
+    pub dns_names: Vec<String>,
+    pub public_key: X509PublicKeyInfo,
+}
+
+const OID_EC_PUBLIC_KEY_CONTENT: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+
+const OID_SECP256R1_CONTENT: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+
+const OID_SUBJECT_ALT_NAME_CONTENT: &[u8] = &[0x55, 0x1d, 0x11];
+
+/// Parses the portions of an RFC 5280 certificate currently needed by
+/// BareProxy: validity, SubjectAltName DNS entries, and public-key data.
+pub fn parse_x509_certificate_der(der: &[u8]) -> Result<X509CertificateInfo, DerError> {
+    let mut outer = DerReader::new(der);
+
+    let certificate = outer.read_expected(DER_TAG_SEQUENCE)?;
+
+    outer.finish()?;
+
+    let mut certificate = certificate.reader();
+
+    let tbs_certificate = certificate.read_expected(DER_TAG_SEQUENCE)?;
+
+    certificate.read_expected(DER_TAG_SEQUENCE)?;
+
+    let signature = certificate.read_expected(DER_TAG_BIT_STRING)?;
+
+    if signature.content.is_empty() || signature.content[0] != 0 {
+        return Err(DerError::InvalidCertificate);
+    }
+
+    certificate.finish()?;
+
+    let mut tbs = tbs_certificate.reader();
+
+    let first = tbs.read_tlv()?;
+
+    let version = if first.tag == 0xa0 {
+        let mut version = first.reader();
+
+        let version_value = version.read_integer_unsigned()?;
+
+        version.finish()?;
+
+        if version_value.len() != 1 || version_value[0] > 2 {
+            return Err(DerError::InvalidCertificate);
+        }
+
+        let version_value = version_value[0];
+
+        let serial_number = tbs.read_expected(DER_TAG_INTEGER)?;
+
+        if serial_number.content.is_empty() {
+            return Err(DerError::InvalidCertificate);
+        }
+
+        version_value
+    } else {
+        if first.tag != DER_TAG_INTEGER || first.content.is_empty() {
+            return Err(DerError::InvalidCertificate);
+        }
+
+        0
+    };
+
+    tbs.read_expected(DER_TAG_SEQUENCE)?;
+    tbs.read_expected(DER_TAG_SEQUENCE)?;
+
+    let validity = parse_x509_validity(tbs.read_expected(DER_TAG_SEQUENCE)?)?;
+
+    tbs.read_expected(DER_TAG_SEQUENCE)?;
+
+    let public_key = parse_x509_public_key_info(tbs.read_expected(DER_TAG_SEQUENCE)?)?;
+
+    let mut dns_names = Vec::new();
+
+    let mut extensions_seen = false;
+
+    while !tbs.is_empty() {
+        let optional = tbs.read_tlv()?;
+
+        match optional.tag {
+            0x81 | 0x82 => {}
+            0xa3 => {
+                if extensions_seen || version != 2 {
+                    return Err(DerError::InvalidCertificate);
+                }
+
+                extensions_seen = true;
+
+                dns_names = parse_x509_extensions(optional.content)?;
+            }
+            _ => {
+                return Err(DerError::InvalidCertificate);
+            }
+        }
+    }
+
+    Ok(X509CertificateInfo {
+        validity,
+        dns_names,
+        public_key,
+    })
+}
+
+/// Parses every RFC 7468 `CERTIFICATE` instance in a PEM certificate chain.
+pub fn parse_x509_certificate_chain_pem(input: &str) -> Result<Vec<X509CertificateInfo>, DerError> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+
+    const END: &str = "-----END CERTIFICATE-----";
+
+    let mut certificates = Vec::new();
+
+    let mut inside_certificate = false;
+    let mut base64 = Vec::new();
+
+    for raw_line in input.lines() {
+        let line = raw_line.trim_end_matches([' ', '\t']);
+
+        if !inside_certificate {
+            if line == BEGIN {
+                inside_certificate = true;
+                base64.clear();
+            }
+
+            continue;
+        }
+
+        if line == END {
+            let der = decode_base64(&base64)?;
+
+            certificates.push(parse_x509_certificate_der(&der)?);
+
+            inside_certificate = false;
+            base64.clear();
+
+            continue;
+        }
+
+        if line.starts_with("-----BEGIN ") || line.starts_with("-----END ") {
+            return Err(DerError::PemLabelMismatch);
+        }
+
+        for byte in line.bytes() {
+            if !byte.is_ascii_whitespace() {
+                base64.push(byte);
+            }
+        }
+    }
+
+    if inside_certificate {
+        return Err(DerError::PemEndMissing);
+    }
+
+    if certificates.is_empty() {
+        return Err(DerError::PemBeginMissing);
+    }
+
+    Ok(certificates)
+}
+
+fn parse_x509_validity(validity: DerValue<'_>) -> Result<X509Validity, DerError> {
+    let mut validity = validity.reader();
+
+    let not_before = parse_x509_time(validity.read_tlv()?)?;
+
+    let not_after = parse_x509_time(validity.read_tlv()?)?;
+
+    validity.finish()?;
+
+    Ok(X509Validity {
+        not_before,
+        not_after,
+    })
+}
+
+fn parse_x509_time(value: DerValue<'_>) -> Result<X509Time, DerError> {
+    let bytes = value.content;
+
+    let (year, offset) = match value.tag {
+        DER_TAG_UTC_TIME => {
+            if bytes.len() != 13 || bytes[12] != b'Z' {
+                return Err(DerError::InvalidTime);
+            }
+
+            let short_year = u16::from(parse_two_digits(&bytes[0..2])?);
+
+            let year = if short_year >= 50 {
+                1900 + short_year
+            } else {
+                2000 + short_year
+            };
+
+            (year, 2)
+        }
+        DER_TAG_GENERALIZED_TIME => {
+            if bytes.len() != 15 || bytes[14] != b'Z' {
+                return Err(DerError::InvalidTime);
+            }
+
+            (parse_four_digits(&bytes[0..4])?, 4)
+        }
+        _ => {
+            return Err(DerError::InvalidTime);
+        }
+    };
+
+    let month = parse_two_digits(&bytes[offset..offset + 2])?;
+
+    let day = parse_two_digits(&bytes[offset + 2..offset + 4])?;
+
+    let hour = parse_two_digits(&bytes[offset + 4..offset + 6])?;
+
+    let minute = parse_two_digits(&bytes[offset + 6..offset + 8])?;
+
+    let second = parse_two_digits(&bytes[offset + 8..offset + 10])?;
+
+    if !(1..=12).contains(&month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+        || day == 0
+        || day > days_in_month(year, month)
+    {
+        return Err(DerError::InvalidTime);
+    }
+
+    Ok(X509Time {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+    })
+}
+
+fn parse_two_digits(bytes: &[u8]) -> Result<u8, DerError> {
+    if bytes.len() != 2 || !bytes.iter().all(u8::is_ascii_digit) {
+        return Err(DerError::InvalidTime);
+    }
+
+    Ok((bytes[0] - b'0') * 10 + (bytes[1] - b'0'))
+}
+
+fn parse_four_digits(bytes: &[u8]) -> Result<u16, DerError> {
+    if bytes.len() != 4 || !bytes.iter().all(u8::is_ascii_digit) {
+        return Err(DerError::InvalidTime);
+    }
+
+    let mut value = 0_u16;
+
+    for &byte in bytes {
+        value = value * 10 + u16::from(byte - b'0');
+    }
+
+    Ok(value)
+}
+
+fn days_in_month(year: u16, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: u16) -> bool {
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+}
+
+fn parse_x509_public_key_info(spki: DerValue<'_>) -> Result<X509PublicKeyInfo, DerError> {
+    let mut spki = spki.reader();
+
+    let algorithm = spki.read_expected(DER_TAG_SEQUENCE)?;
+
+    let subject_public_key = spki.read_expected(DER_TAG_BIT_STRING)?;
+
+    spki.finish()?;
+
+    if subject_public_key.content.is_empty() || subject_public_key.content[0] != 0 {
+        return Err(DerError::InvalidCertificate);
+    }
+
+    let mut algorithm = algorithm.reader();
+
+    let algorithm_oid = algorithm.read_expected(DER_TAG_OBJECT_IDENTIFIER)?;
+
+    let parameters = if algorithm.is_empty() {
+        None
+    } else {
+        Some(algorithm.read_tlv()?)
+    };
+
+    algorithm.finish()?;
+
+    let encoded_key = &subject_public_key.content[1..];
+
+    let is_p256 = algorithm_oid.content == OID_EC_PUBLIC_KEY_CONTENT
+        && parameters.is_some_and(|parameter| {
+            parameter.tag == DER_TAG_OBJECT_IDENTIFIER && parameter.content == OID_SECP256R1_CONTENT
+        });
+
+    let p256_public_key = if is_p256 {
+        Some(
+            P256Point::from_sec1_uncompressed(encoded_key)
+                .map_err(|_| DerError::InvalidP256PublicKey)?,
+        )
+    } else {
+        None
+    };
+
+    Ok(X509PublicKeyInfo {
+        algorithm_oid: algorithm_oid.content.to_vec(),
+        subject_public_key: encoded_key.to_vec(),
+        p256_public_key,
+    })
+}
+
+fn parse_x509_extensions(content: &[u8]) -> Result<Vec<String>, DerError> {
+    let mut explicit = DerReader::new(content);
+
+    let extensions = explicit.read_expected(DER_TAG_SEQUENCE)?;
+
+    explicit.finish()?;
+
+    let mut extensions = extensions.reader();
+
+    let mut dns_names = Vec::new();
+
+    let mut san_seen = false;
+
+    while !extensions.is_empty() {
+        let extension = extensions.read_expected(DER_TAG_SEQUENCE)?;
+
+        let mut extension = extension.reader();
+
+        let oid = extension.read_expected(DER_TAG_OBJECT_IDENTIFIER)?;
+
+        let next = extension.read_tlv()?;
+
+        let extension_value = if next.tag == DER_TAG_BOOLEAN {
+            if next.content.len() != 1 || (next.content[0] != 0x00 && next.content[0] != 0xff) {
+                return Err(DerError::InvalidCertificate);
+            }
+
+            extension.read_expected(DER_TAG_OCTET_STRING)?
+        } else {
+            if next.tag != DER_TAG_OCTET_STRING {
+                return Err(DerError::InvalidCertificate);
+            }
+
+            next
+        };
+
+        extension.finish()?;
+
+        if oid.content == OID_SUBJECT_ALT_NAME_CONTENT {
+            if san_seen {
+                return Err(DerError::InvalidCertificate);
+            }
+
+            san_seen = true;
+
+            dns_names = parse_x509_subject_alt_name(extension_value.content)?;
+        }
+    }
+
+    Ok(dns_names)
+}
+
+fn parse_x509_subject_alt_name(encoded: &[u8]) -> Result<Vec<String>, DerError> {
+    let mut outer = DerReader::new(encoded);
+
+    let names = outer.read_expected(DER_TAG_SEQUENCE)?;
+
+    outer.finish()?;
+
+    let mut names = names.reader();
+
+    let mut dns_names = Vec::new();
+
+    while !names.is_empty() {
+        let name = names.read_tlv()?;
+
+        if name.tag != 0x82 {
+            continue;
+        }
+
+        if !name.content.is_ascii() {
+            return Err(DerError::InvalidDnsName);
+        }
+
+        let dns_name = std::str::from_utf8(name.content).map_err(|_| DerError::InvalidDnsName)?;
+
+        validate_dns_name(dns_name)?;
+
+        dns_names.push(dns_name.to_owned());
+    }
+
+    Ok(dns_names)
+}
+
 /// Persists an RFC 5915 P-256 private key with restrictive filesystem
 /// permissions.
 ///
@@ -909,12 +1349,14 @@ fn decode_base64_character(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DER_TAG_BIT_STRING, DER_TAG_INTEGER, DER_TAG_OBJECT_IDENTIFIER, DER_TAG_OCTET_STRING,
-        DER_TAG_SEQUENCE, DER_TAG_SET, DerError, DerReader, der_bit_string, der_context_specific,
-        der_integer_unsigned, der_object_identifier, der_octet_string, der_sequence, der_set,
-        der_wrap, encode_p256_csr_der, encode_p256_csr_pem, encode_p256_sec1_private_key_der,
-        encode_p256_sec1_private_key_pem, encode_p256_spki_der, encode_p256_spki_pem,
-        encode_subject_alt_name_dns, pem_decode, pem_encode, persist_p256_private_key_pem,
+        DER_TAG_BIT_STRING, DER_TAG_GENERALIZED_TIME, DER_TAG_INTEGER, DER_TAG_OBJECT_IDENTIFIER,
+        DER_TAG_OCTET_STRING, DER_TAG_SEQUENCE, DER_TAG_SET, DER_TAG_UTC_TIME, DerError, DerReader,
+        OID_SUBJECT_ALT_NAME, X509Time, der_bit_string, der_context_specific, der_integer_unsigned,
+        der_object_identifier, der_octet_string, der_sequence, der_set, der_wrap,
+        ecdsa_sha256_algorithm_identifier, encode_p256_csr_der, encode_p256_csr_pem,
+        encode_p256_sec1_private_key_der, encode_p256_sec1_private_key_pem, encode_p256_spki_der,
+        encode_p256_spki_pem, encode_subject_alt_name_dns, parse_x509_certificate_chain_pem,
+        parse_x509_certificate_der, pem_decode, pem_encode, persist_p256_private_key_pem,
     };
 
     use crate::p256::{
@@ -930,6 +1372,41 @@ mod tests {
         padded[32 - bytes.len()..].copy_from_slice(bytes);
 
         Uint256::from_be_bytes(padded)
+    }
+
+    fn test_x509_certificate_der(serial: u8, dns_name: &str) -> Vec<u8> {
+        let validity = der_sequence(&[
+            der_wrap(DER_TAG_UTC_TIME, b"260815190000Z"),
+            der_wrap(DER_TAG_GENERALIZED_TIME, b"20500815200000Z"),
+        ]);
+
+        let subject_alt_name = encode_subject_alt_name_dns(&[dns_name]).unwrap();
+
+        let subject_alt_name_extension = der_sequence(&[
+            der_object_identifier(OID_SUBJECT_ALT_NAME).unwrap(),
+            der_octet_string(&subject_alt_name),
+        ]);
+
+        let extensions = der_sequence(&[subject_alt_name_extension]);
+
+        let version = der_context_specific(0, true, &der_integer_unsigned(&[2])).unwrap();
+
+        let tbs_certificate = der_sequence(&[
+            version,
+            der_integer_unsigned(&[serial]),
+            ecdsa_sha256_algorithm_identifier(),
+            der_sequence(&[]),
+            validity,
+            der_sequence(&[]),
+            encode_p256_spki_der(P256Point::generator()).unwrap(),
+            der_context_specific(3, true, &extensions).unwrap(),
+        ]);
+
+        der_sequence(&[
+            tbs_certificate,
+            ecdsa_sha256_algorithm_identifier(),
+            der_bit_string(&der_sequence(&[])),
+        ])
     }
 
     #[test]
@@ -1519,8 +1996,6 @@ mod tests {
 
         let general_names = general_names.read_expected(DER_TAG_SEQUENCE).unwrap();
 
-        general_names.reader().finish().unwrap_err();
-
         let mut names = general_names.reader();
 
         assert_eq!(names.read_expected(0x82).unwrap().content, b"example.com");
@@ -1633,6 +2108,113 @@ mod tests {
         assert!(
             combined.contains("DNS:example.com"),
             "OpenSSL did not decode the requested SAN:\n{combined}"
+        );
+    }
+
+    #[test]
+    fn x509_certificate_inspection_extracts_required_fields() {
+        let der = test_x509_certificate_der(1, "example.com");
+
+        let certificate = parse_x509_certificate_der(&der).unwrap();
+
+        assert_eq!(
+            certificate.validity.not_before,
+            X509Time {
+                year: 2026,
+                month: 8,
+                day: 15,
+                hour: 19,
+                minute: 0,
+                second: 0,
+            }
+        );
+
+        assert_eq!(
+            certificate.validity.not_after,
+            X509Time {
+                year: 2050,
+                month: 8,
+                day: 15,
+                hour: 20,
+                minute: 0,
+                second: 0,
+            }
+        );
+
+        assert_eq!(certificate.dns_names, vec!["example.com"]);
+
+        assert_eq!(
+            certificate.public_key.algorithm_oid,
+            vec![0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,]
+        );
+
+        assert_eq!(certificate.public_key.subject_public_key[0], 0x04);
+
+        assert_eq!(
+            certificate.public_key.p256_public_key,
+            Some(P256Point::generator())
+        );
+    }
+
+    #[test]
+    fn x509_certificate_chain_parses_multiple_pem_certificates() {
+        let first = pem_encode(
+            "CERTIFICATE",
+            &test_x509_certificate_der(1, "leaf.example.com"),
+        )
+        .unwrap();
+
+        let second = pem_encode(
+            "CERTIFICATE",
+            &test_x509_certificate_der(2, "issuer.example.com"),
+        )
+        .unwrap();
+
+        let chain = format!("certificate chain\n{first}\n{second}");
+
+        let certificates = parse_x509_certificate_chain_pem(&chain).unwrap();
+
+        assert_eq!(certificates.len(), 2);
+
+        assert_eq!(certificates[0].dns_names, vec!["leaf.example.com"]);
+
+        assert_eq!(certificates[1].dns_names, vec!["issuer.example.com"]);
+    }
+
+    #[test]
+    fn x509_certificate_chain_rejects_unterminated_pem() {
+        assert_eq!(
+            parse_x509_certificate_chain_pem(concat!("-----BEGIN CERTIFICATE-----\n", "QQ==\n",),),
+            Err(DerError::PemEndMissing)
+        );
+    }
+
+    #[test]
+    fn x509_certificate_parser_rejects_invalid_validity_time() {
+        let invalid_validity = der_sequence(&[
+            der_wrap(DER_TAG_UTC_TIME, b"261315190000Z"),
+            der_wrap(DER_TAG_UTC_TIME, b"270815190000Z"),
+        ]);
+
+        let tbs_certificate = der_sequence(&[
+            der_context_specific(0, true, &der_integer_unsigned(&[2])).unwrap(),
+            der_integer_unsigned(&[1]),
+            ecdsa_sha256_algorithm_identifier(),
+            der_sequence(&[]),
+            invalid_validity,
+            der_sequence(&[]),
+            encode_p256_spki_der(P256Point::generator()).unwrap(),
+        ]);
+
+        let certificate = der_sequence(&[
+            tbs_certificate,
+            ecdsa_sha256_algorithm_identifier(),
+            der_bit_string(&der_sequence(&[])),
+        ]);
+
+        assert_eq!(
+            parse_x509_certificate_der(&certificate,),
+            Err(DerError::InvalidTime)
         );
     }
 }
