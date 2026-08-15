@@ -2,11 +2,15 @@
 //!
 //! Curve parameters are defined by NIST SP 800-186 section 3.2.1.3.
 //!
-//! Fixed-width integer, field, scalar, and elliptic-curve point arithmetic
-//! are implemented here. ECDH and ECDSA are layered on top in later slices.
+//! Fixed-width integer, field, scalar, elliptic-curve point, ECDH, and ECDSA
+//! operations are implemented here.
 //!
 //! Uncompressed public-point encoding follows SEC 1 as profiled by
 //! RFC 5480 section 2.2.
+//!
+//! ECDSA uses SHA-256 and deterministic nonce generation from RFC 6979.
+
+use crate::crypto::{hmac_sha256, sha256, wipe_bytes};
 
 use std::{cmp::Ordering, error::Error, fmt};
 
@@ -628,6 +632,213 @@ pub fn p256_ecdh(
     Ok(shared_x.to_be_bytes())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum P256EcdsaError {
+    ZeroPrivateScalar,
+    InvalidR,
+    InvalidS,
+}
+
+impl fmt::Display for P256EcdsaError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroPrivateScalar => {
+                formatter.write_str("P-256 ECDSA private scalar cannot be zero")
+            }
+            Self::InvalidR => formatter.write_str("P-256 ECDSA r must be in the range [1, n-1]"),
+            Self::InvalidS => formatter.write_str("P-256 ECDSA s must be in the range [1, n-1]"),
+        }
+    }
+}
+
+impl Error for P256EcdsaError {}
+
+/// Canonical P-256 ECDSA signature components.
+///
+/// DER encoding is intentionally left for the later ASN.1/DER milestone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct P256Signature {
+    r: Scalar,
+    s: Scalar,
+}
+
+impl P256Signature {
+    pub fn from_components(r: Uint256, s: Uint256) -> Result<Self, P256EcdsaError> {
+        if r == Uint256::ZERO || r >= P256_GROUP_ORDER {
+            return Err(P256EcdsaError::InvalidR);
+        }
+
+        if s == Uint256::ZERO || s >= P256_GROUP_ORDER {
+            return Err(P256EcdsaError::InvalidS);
+        }
+
+        Ok(Self {
+            r: Scalar(r),
+            s: Scalar(s),
+        })
+    }
+
+    pub const fn components(self) -> (Uint256, Uint256) {
+        (self.r.value(), self.s.value())
+    }
+}
+
+struct Rfc6979P256Sha256 {
+    k: [u8; 32],
+    v: [u8; 32],
+}
+
+impl Rfc6979P256Sha256 {
+    fn new(private_scalar: Scalar, message_hash: [u8; 32]) -> Self {
+        debug_assert_ne!(private_scalar, Scalar::ZERO);
+
+        let mut k = [0_u8; 32];
+        let mut v = [0x01_u8; 32];
+
+        let mut private_octets = private_scalar.value().to_be_bytes();
+
+        let mut hash_octets = ecdsa_hash_scalar(message_hash).value().to_be_bytes();
+
+        let mut input = [0_u8; 97];
+
+        input[..32].copy_from_slice(&v);
+        input[32] = 0x00;
+        input[33..65].copy_from_slice(&private_octets);
+        input[65..].copy_from_slice(&hash_octets);
+
+        k = hmac_sha256(&k, &input);
+        v = hmac_sha256(&k, &v);
+
+        input[..32].copy_from_slice(&v);
+        input[32] = 0x01;
+
+        k = hmac_sha256(&k, &input);
+        v = hmac_sha256(&k, &v);
+
+        wipe_bytes(&mut private_octets);
+        wipe_bytes(&mut hash_octets);
+        wipe_bytes(&mut input);
+
+        Self { k, v }
+    }
+
+    fn next_scalar(&mut self) -> Scalar {
+        loop {
+            self.v = hmac_sha256(&self.k, &self.v);
+
+            let candidate = Uint256::from_be_bytes(self.v);
+
+            if candidate != Uint256::ZERO && candidate < P256_GROUP_ORDER {
+                return Scalar(candidate);
+            }
+
+            self.reject_candidate();
+        }
+    }
+
+    fn reject_candidate(&mut self) {
+        let mut input = [0_u8; 33];
+
+        input[..32].copy_from_slice(&self.v);
+        input[32] = 0x00;
+
+        self.k = hmac_sha256(&self.k, &input);
+        self.v = hmac_sha256(&self.k, &self.v);
+
+        wipe_bytes(&mut input);
+    }
+}
+
+impl Drop for Rfc6979P256Sha256 {
+    fn drop(&mut self) {
+        wipe_bytes(&mut self.k);
+        wipe_bytes(&mut self.v);
+    }
+}
+
+fn ecdsa_hash_scalar(message_hash: [u8; 32]) -> Scalar {
+    Scalar::new(Uint256::from_be_bytes(message_hash))
+}
+
+/// Signs a message using deterministic P-256 ECDSA with SHA-256.
+///
+/// The nonce is generated according to RFC 6979 using HMAC-SHA256.
+pub fn p256_ecdsa_sign_sha256(
+    private_scalar: Scalar,
+    message: &[u8],
+) -> Result<P256Signature, P256EcdsaError> {
+    if private_scalar == Scalar::ZERO {
+        return Err(P256EcdsaError::ZeroPrivateScalar);
+    }
+
+    let message_hash = sha256(message);
+    let hash_scalar = ecdsa_hash_scalar(message_hash);
+
+    let mut nonce_generator = Rfc6979P256Sha256::new(private_scalar, message_hash);
+
+    loop {
+        let nonce = nonce_generator.next_scalar();
+
+        let nonce_point = p256_generator_multiply(nonce);
+
+        let Some((nonce_x, _)) = nonce_point.coordinates() else {
+            nonce_generator.reject_candidate();
+            continue;
+        };
+
+        let r = Scalar::new(nonce_x);
+
+        if r == Scalar::ZERO {
+            nonce_generator.reject_candidate();
+            continue;
+        }
+
+        let nonce_inverse = nonce
+            .invert()
+            .expect("nonzero ECDSA nonce must be invertible");
+
+        let s = nonce_inverse
+            .modular_multiply(hash_scalar.modular_add(private_scalar.modular_multiply(r)));
+
+        if s == Scalar::ZERO {
+            nonce_generator.reject_candidate();
+            continue;
+        }
+
+        return Ok(P256Signature { r, s });
+    }
+}
+
+/// Verifies a P-256 ECDSA/SHA-256 signature.
+pub fn p256_ecdsa_verify_sha256(
+    public_key: P256Point,
+    message: &[u8],
+    signature: P256Signature,
+) -> bool {
+    if public_key.is_identity() {
+        return false;
+    }
+
+    let s_inverse = signature
+        .s
+        .invert()
+        .expect("validated nonzero ECDSA s must be invertible");
+
+    let hash_scalar = ecdsa_hash_scalar(sha256(message));
+
+    let u1 = hash_scalar.modular_multiply(s_inverse);
+
+    let u2 = signature.r.modular_multiply(s_inverse);
+
+    let verification_point = p256_generator_multiply(u1).add_point(public_key.multiply(u2));
+
+    let Some((verification_x, _)) = verification_point.coordinates() else {
+        return false;
+    };
+
+    Scalar::new(verification_x) == signature.r
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct JacobianPoint {
     x: FieldElement,
@@ -794,7 +1005,8 @@ fn field_triple(value: FieldElement) -> FieldElement {
 mod tests {
     use super::{
         FieldElement, P256_FIELD_MODULUS, P256_GENERATOR_X, P256_GENERATOR_Y, P256_GROUP_ORDER,
-        P256EcdhError, P256Point, P256PointError, Scalar, Uint256, p256_ecdh,
+        P256EcdhError, P256EcdsaError, P256Point, P256PointError, P256Signature, Rfc6979P256Sha256,
+        Scalar, Uint256, p256_ecdh, p256_ecdsa_sign_sha256, p256_ecdsa_verify_sha256,
         p256_generator_multiply,
     };
 
@@ -1185,5 +1397,126 @@ ac23f046ada30f8353e74f33039872ab",
             p256_ecdh(Scalar::ONE, P256Point::IDENTITY,),
             Err(P256EcdhError::IdentityPeerPublicKey)
         );
+    }
+
+    #[test]
+    fn p256_rfc6979_nonce_matches_sha256_sample_vector() {
+        let private_scalar = Scalar::new(uint256_from_hex(
+            "c9afa9d845ba75166b5c215767b1d693\
+4e50c3db36e89b127b8a622b120f6721",
+        ));
+
+        let message_hash = crate::crypto::sha256(b"sample");
+
+        let mut generator = Rfc6979P256Sha256::new(private_scalar, message_hash);
+
+        assert_eq!(
+            generator.next_scalar().value(),
+            uint256_from_hex(
+                "a6e3c57dd01abe90086538398355dd4c\
+3b17aa873382b0f24d6129493d8aad60",
+            )
+        );
+    }
+
+    #[test]
+    fn p256_ecdsa_signing_matches_rfc6979_sha256_vector() {
+        let private_scalar = Scalar::new(uint256_from_hex(
+            "c9afa9d845ba75166b5c215767b1d693\
+4e50c3db36e89b127b8a622b120f6721",
+        ));
+
+        let signature = p256_ecdsa_sign_sha256(private_scalar, b"sample").unwrap();
+
+        assert_eq!(
+            signature.components(),
+            (
+                uint256_from_hex(
+                    "efd48b2aacb6a8fd1140dd9cd45e81d6\
+9d2c877b56aaf991c34d0ea84eaf3716",
+                ),
+                uint256_from_hex(
+                    "f7cb1c942d657c41d436c7a1b6e29f65\
+f3e900dbb9aff4064dc4ab2f843acda8",
+                ),
+            )
+        );
+    }
+
+    #[test]
+    fn p256_ecdsa_verification_matches_rfc6979_sha256_vector() {
+        let public_key = P256Point::from_coordinates(
+            uint256_from_hex(
+                "60fed4ba255a9d31c961eb74c6356d68\
+c049b8923b61fa6ce669622e60f29fb6",
+            ),
+            uint256_from_hex(
+                "7903fe1008b8bc99a41ae9e95628bc64\
+f2f1b20c2d7e9f5177a3c294d4462299",
+            ),
+        )
+        .unwrap();
+
+        let signature = P256Signature::from_components(
+            uint256_from_hex(
+                "efd48b2aacb6a8fd1140dd9cd45e81d6\
+9d2c877b56aaf991c34d0ea84eaf3716",
+            ),
+            uint256_from_hex(
+                "f7cb1c942d657c41d436c7a1b6e29f65\
+f3e900dbb9aff4064dc4ab2f843acda8",
+            ),
+        )
+        .unwrap();
+
+        assert!(p256_ecdsa_verify_sha256(public_key, b"sample", signature,));
+
+        assert!(!p256_ecdsa_verify_sha256(
+            public_key,
+            b"tampered",
+            signature,
+        ));
+    }
+
+    #[test]
+    fn p256_ecdsa_rejects_invalid_signature_components() {
+        assert_eq!(
+            P256Signature::from_components(Uint256::ZERO, Uint256::ONE,),
+            Err(P256EcdsaError::InvalidR)
+        );
+
+        assert_eq!(
+            P256Signature::from_components(P256_GROUP_ORDER, Uint256::ONE,),
+            Err(P256EcdsaError::InvalidR)
+        );
+
+        assert_eq!(
+            P256Signature::from_components(Uint256::ONE, Uint256::ZERO,),
+            Err(P256EcdsaError::InvalidS)
+        );
+
+        assert_eq!(
+            P256Signature::from_components(Uint256::ONE, P256_GROUP_ORDER,),
+            Err(P256EcdsaError::InvalidS)
+        );
+    }
+
+    #[test]
+    fn p256_ecdsa_rejects_zero_private_scalar() {
+        assert_eq!(
+            p256_ecdsa_sign_sha256(Scalar::ZERO, b"sample",),
+            Err(P256EcdsaError::ZeroPrivateScalar)
+        );
+    }
+
+    #[test]
+    fn p256_ecdsa_verifier_rejects_identity_public_key() {
+        let signature = P256Signature::from_components(Uint256::ONE, Uint256::ONE).unwrap();
+
+        assert!(!p256_ecdsa_verify_sha256(
+            P256Point::IDENTITY,
+            b"sample",
+            signature,
+        ));
     }
 }

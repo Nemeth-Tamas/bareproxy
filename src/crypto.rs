@@ -193,7 +193,7 @@ impl From<ChaCha20Error> for ChaCha20Poly1305Error {
     }
 }
 
-fn wipe_bytes(bytes: &mut [u8]) {
+pub(crate) fn wipe_bytes(bytes: &mut [u8]) {
     for byte in bytes {
         unsafe {
             std::ptr::write_volatile(byte, 0);

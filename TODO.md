@@ -380,13 +380,13 @@ Goal: obtain the key-exchange and signing primitives needed for TLS, certificate
 * [x] Implement SEC1 point decoding.
 * [x] Reject invalid points.
 * [x] Implement P-256 ECDH.
-* [ ] Implement ECDSA signing with SHA-256.
-* [ ] Implement ECDSA verification with SHA-256.
-* [ ] Use deterministic or securely randomized ECDSA nonces.
-* [ ] Prevent zero/invalid signature components.
+* [x] Implement ECDSA signing with SHA-256.
+* [x] Implement ECDSA verification with SHA-256.
+* [x] Use deterministic or securely randomized ECDSA nonces.
+* [x] Prevent zero/invalid signature components.
 * [x] Add published P-256 arithmetic test vectors.
 * [x] Add published ECDH test vectors.
-* [ ] Add published ECDSA test vectors.
+* [x] Add published ECDSA test vectors.
 
 **Milestone complete when:** P-256 key agreement and signatures interoperate with independently generated test vectors.
 
