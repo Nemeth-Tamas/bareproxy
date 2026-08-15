@@ -346,13 +346,13 @@ TLS_CHACHA20_POLY1305_SHA256
 * [x] Implement Poly1305 field arithmetic.
 * [x] Implement Poly1305 authentication.
 * [x] Verify Poly1305 against RFC test vectors.
-* [ ] Implement ChaCha20-Poly1305 AEAD.
-* [ ] Implement additional authenticated data handling.
-* [ ] Implement nonce construction.
-* [ ] Verify AEAD against RFC test vectors.
-* [ ] Reject modified authentication tags.
-* [ ] Ensure decryption never releases unauthenticated plaintext.
-* [ ] Add boundary-length tests.
+* [x] Implement ChaCha20-Poly1305 AEAD.
+* [x] Implement additional authenticated data handling.
+* [x] Implement nonce construction.
+* [x] Verify AEAD against RFC test vectors.
+* [x] Reject modified authentication tags.
+* [x] Ensure decryption never releases unauthenticated plaintext.
+* [x] Add boundary-length tests.
 
 **Milestone complete when:** our AEAD implementation exactly matches published ChaCha20-Poly1305 vectors.
 

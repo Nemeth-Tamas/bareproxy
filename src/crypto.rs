@@ -18,6 +18,8 @@
 //!   RFC 8439 sections 2.1 through 2.4.
 //! - Poly1305:
 //!   RFC 8439 section 2.5.
+//! - ChaCha20-Poly1305 AEAD:
+//!   RFC 8439 sections 2.6 and 2.8.
 //!
 //! Secret-handling policy:
 //!
@@ -156,6 +158,40 @@ impl fmt::Display for ChaCha20Error {
 }
 
 impl Error for ChaCha20Error {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChaCha20Poly1305Error {
+    ChaCha20(ChaCha20Error),
+    AuthenticationFailed,
+}
+
+impl fmt::Display for ChaCha20Poly1305Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ChaCha20(error) => {
+                write!(formatter, "ChaCha20-Poly1305 cipher failure: {error}")
+            }
+            Self::AuthenticationFailed => {
+                formatter.write_str("ChaCha20-Poly1305 authentication failed")
+            }
+        }
+    }
+}
+
+impl Error for ChaCha20Poly1305Error {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ChaCha20(error) => Some(error),
+            Self::AuthenticationFailed => None,
+        }
+    }
+}
+
+impl From<ChaCha20Error> for ChaCha20Poly1305Error {
+    fn from(error: ChaCha20Error) -> Self {
+        Self::ChaCha20(error)
+    }
+}
 
 fn wipe_bytes(bytes: &mut [u8]) {
     for byte in bytes {
@@ -1025,6 +1061,117 @@ pub fn poly1305_authenticate(key: &[u8; 32], message: &[u8]) -> [u8; 16] {
     tag
 }
 
+/// Composes the 96-bit nonce form used by the RFC 8439 AEAD example.
+///
+/// Protocols with their own nonce construction, including TLS 1.3, may
+/// construct the required 12-byte nonce differently.
+pub fn compose_chacha20_poly1305_nonce(fixed_common: &[u8; 4], invocation: &[u8; 8]) -> [u8; 12] {
+    let mut nonce = [0_u8; 12];
+
+    nonce[..4].copy_from_slice(fixed_common);
+    nonce[4..].copy_from_slice(invocation);
+
+    nonce
+}
+
+fn chacha20_poly1305_one_time_key(key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
+    let mut block = chacha20_block(key, 0, nonce);
+    let mut one_time_key = [0_u8; 32];
+
+    one_time_key.copy_from_slice(&block[..32]);
+
+    wipe_bytes(&mut block);
+
+    one_time_key
+}
+
+fn append_pad16(output: &mut Vec<u8>, input_len: usize) {
+    let remainder = input_len % POLY1305_BLOCK_SIZE;
+
+    if remainder != 0 {
+        output.resize(output.len() + (POLY1305_BLOCK_SIZE - remainder), 0);
+    }
+}
+
+fn chacha20_poly1305_mac_data(aad: &[u8], ciphertext: &[u8]) -> Vec<u8> {
+    let aad_len = u64::try_from(aad.len()).expect("AEAD AAD length must fit in u64");
+
+    let ciphertext_len =
+        u64::try_from(ciphertext.len()).expect("AEAD ciphertext length must fit in u64");
+
+    let mut mac_data = Vec::new();
+
+    mac_data.extend_from_slice(aad);
+    append_pad16(&mut mac_data, aad.len());
+
+    mac_data.extend_from_slice(ciphertext);
+    append_pad16(&mut mac_data, ciphertext.len());
+
+    mac_data.extend_from_slice(&aad_len.to_le_bytes());
+    mac_data.extend_from_slice(&ciphertext_len.to_le_bytes());
+
+    mac_data
+}
+
+/// Encrypts and authenticates using AEAD_CHACHA20_POLY1305 from RFC 8439.
+///
+/// The 96-bit nonce must be unique for every invocation under the same key.
+pub fn chacha20_poly1305_encrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, [u8; 16]), ChaCha20Poly1305Error> {
+    let mut one_time_key = chacha20_poly1305_one_time_key(key, nonce);
+
+    let ciphertext = match chacha20_xor(key, 1, nonce, plaintext) {
+        Ok(ciphertext) => ciphertext,
+        Err(error) => {
+            wipe_bytes(&mut one_time_key);
+
+            return Err(error.into());
+        }
+    };
+
+    let mac_data = chacha20_poly1305_mac_data(aad, &ciphertext);
+
+    let tag = poly1305_authenticate(&one_time_key, &mac_data);
+
+    wipe_bytes(&mut one_time_key);
+
+    Ok((ciphertext, tag))
+}
+
+/// Authenticates and decrypts AEAD_CHACHA20_POLY1305 ciphertext.
+///
+/// Authentication is completed before ChaCha20 is applied, so plaintext is
+/// never returned when the Poly1305 tag is invalid.
+pub fn chacha20_poly1305_decrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8; 16],
+) -> Result<Vec<u8>, ChaCha20Poly1305Error> {
+    let mut one_time_key = chacha20_poly1305_one_time_key(key, nonce);
+
+    let mac_data = chacha20_poly1305_mac_data(aad, ciphertext);
+
+    let mut expected_tag = poly1305_authenticate(&one_time_key, &mac_data);
+
+    wipe_bytes(&mut one_time_key);
+
+    let authenticated = constant_time_eq(&expected_tag, tag);
+
+    wipe_bytes(&mut expected_tag);
+
+    if !authenticated {
+        return Err(ChaCha20Poly1305Error::AuthenticationFailed);
+    }
+
+    chacha20_xor(key, 1, nonce, ciphertext).map_err(ChaCha20Poly1305Error::from)
+}
+
 fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(
         bytes
@@ -1068,8 +1215,10 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::{
-        HexError, HkdfError, Sha256, build_tls13_hkdf_label, chacha20_block,
-        chacha20_quarter_round, chacha20_xor, constant_time_eq, decode_hex, encode_base64,
+        ChaCha20Error, ChaCha20Poly1305Error, HexError, HkdfError, Sha256, build_tls13_hkdf_label,
+        chacha20_block, chacha20_poly1305_decrypt, chacha20_poly1305_encrypt,
+        chacha20_poly1305_one_time_key, chacha20_quarter_round, chacha20_xor,
+        compose_chacha20_poly1305_nonce, constant_time_eq, decode_hex, encode_base64,
         encode_base64_url_no_pad, encode_hex, fill_random, hkdf_expand_sha256, hkdf_extract_sha256,
         hmac_sha256, poly1305_authenticate, sha256, tls13_hkdf_expand_label_sha256, wipe_bytes,
         wipe_words,
@@ -1644,6 +1793,178 @@ f91b65c5524733ab8f593dabcd62b357\
         assert_eq!(
             encode_hex(&poly1305_authenticate(&key, b"")),
             "0102030405060708090a0b0c0d0e0f10"
+        );
+    }
+
+    #[test]
+    fn chacha20_poly1305_nonce_matches_rfc_8439_example() {
+        let fixed_common = [0x07, 0x00, 0x00, 0x00];
+        let invocation = [0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47];
+
+        let nonce = compose_chacha20_poly1305_nonce(&fixed_common, &invocation);
+
+        assert_eq!(encode_hex(&nonce), "070000004041424344454647");
+    }
+
+    #[test]
+    fn chacha20_poly1305_one_time_key_matches_rfc_8439_vector() {
+        let key: [u8; 32] = decode_hex(
+            "808182838485868788898a8b8c8d8e8f\
+909192939495969798999a9b9c9d9e9f",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        let fixed_common = [0x07, 0x00, 0x00, 0x00];
+        let invocation = [0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47];
+
+        let nonce = compose_chacha20_poly1305_nonce(&fixed_common, &invocation);
+
+        let mut one_time_key = chacha20_poly1305_one_time_key(&key, &nonce);
+
+        assert_eq!(
+            encode_hex(&one_time_key),
+            "7bac2b252db447af09b67a55a4e95584\
+0ae1d6731075d9eb2a9375783ed553ff"
+        );
+
+        wipe_bytes(&mut one_time_key);
+    }
+
+    #[test]
+    fn chacha20_poly1305_matches_rfc_8439_aead_vector() {
+        let key: [u8; 32] = decode_hex(
+            "808182838485868788898a8b8c8d8e8f\
+909192939495969798999a9b9c9d9e9f",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        let fixed_common = [0x07, 0x00, 0x00, 0x00];
+        let invocation = [0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47];
+
+        let nonce = compose_chacha20_poly1305_nonce(&fixed_common, &invocation);
+
+        let aad = decode_hex("50515253c0c1c2c3c4c5c6c7").unwrap();
+
+        let plaintext = b"Ladies and Gentlemen of the class of '99: \
+If I could offer you only one tip for the future, \
+sunscreen would be it.";
+
+        let (ciphertext, tag) = chacha20_poly1305_encrypt(&key, &nonce, &aad, plaintext).unwrap();
+
+        assert_eq!(
+            encode_hex(&ciphertext),
+            "d31a8d34648e60db7b86afbc53ef7ec2\
+a4aded51296e08fea9e2b5a736ee62d6\
+3dbea45e8ca9671282fafb69da92728b\
+1a71de0a9e060b2905d6a5b67ecd3b36\
+92ddbd7f2d778b8c9803aee328091b58\
+fab324e4fad675945585808b4831d7bc\
+3ff4def08e4b7a9de576d26586cec64b\
+6116"
+        );
+
+        assert_eq!(encode_hex(&tag), "1ae10b594f09e26a7e902ecbd0600691");
+
+        let decrypted = chacha20_poly1305_decrypt(&key, &nonce, &aad, &ciphertext, &tag).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn chacha20_poly1305_rejects_modified_tag_without_plaintext() {
+        let key = [0x11_u8; 32];
+        let nonce = [0x22_u8; 12];
+        let aad = b"BareProxy authenticated metadata";
+        let plaintext = b"this plaintext must remain secret";
+
+        let (ciphertext, mut tag) =
+            chacha20_poly1305_encrypt(&key, &nonce, aad, plaintext).unwrap();
+
+        tag[0] ^= 0x80;
+
+        assert_eq!(
+            chacha20_poly1305_decrypt(&key, &nonce, aad, &ciphertext, &tag,),
+            Err(ChaCha20Poly1305Error::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn chacha20_poly1305_authenticates_ciphertext_and_aad() {
+        let key = [0x33_u8; 32];
+        let nonce = [0x44_u8; 12];
+        let aad = b"metadata";
+        let plaintext = b"authenticated message";
+
+        let (ciphertext, tag) = chacha20_poly1305_encrypt(&key, &nonce, aad, plaintext).unwrap();
+
+        let mut modified_ciphertext = ciphertext.clone();
+        modified_ciphertext[0] ^= 1;
+
+        assert_eq!(
+            chacha20_poly1305_decrypt(&key, &nonce, aad, &modified_ciphertext, &tag,),
+            Err(ChaCha20Poly1305Error::AuthenticationFailed)
+        );
+
+        let mut modified_aad = aad.to_vec();
+        modified_aad[0] ^= 1;
+
+        assert_eq!(
+            chacha20_poly1305_decrypt(&key, &nonce, &modified_aad, &ciphertext, &tag,),
+            Err(ChaCha20Poly1305Error::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn chacha20_poly1305_round_trips_boundary_lengths() {
+        let key = [0x55_u8; 32];
+
+        let cases = [
+            (0_usize, 0_usize),
+            (1, 15),
+            (15, 16),
+            (16, 17),
+            (17, 63),
+            (63, 64),
+            (64, 65),
+            (65, 1),
+        ];
+
+        for (case_index, (aad_len, plaintext_len)) in cases.into_iter().enumerate() {
+            let mut nonce = [0_u8; 12];
+
+            nonce[11] = u8::try_from(case_index).unwrap();
+
+            let aad = vec![0xa5_u8; aad_len];
+            let plaintext = vec![0x5a_u8; plaintext_len];
+
+            let (ciphertext, tag) =
+                chacha20_poly1305_encrypt(&key, &nonce, &aad, &plaintext).unwrap();
+
+            assert_eq!(ciphertext.len(), plaintext.len());
+
+            let decrypted =
+                chacha20_poly1305_decrypt(&key, &nonce, &aad, &ciphertext, &tag).unwrap();
+
+            assert_eq!(decrypted, plaintext);
+        }
+    }
+
+    #[test]
+    fn chacha20_rejects_counter_exhaustion_at_block_boundary() {
+        let key = [0_u8; 32];
+        let nonce = [0_u8; 12];
+        let input = [0_u8; 65];
+
+        assert_eq!(
+            chacha20_xor(&key, u32::MAX, &nonce, &input,),
+            Err(ChaCha20Error::CounterExhausted {
+                counter: u32::MAX,
+                blocks: 2,
+            })
         );
     }
 }
