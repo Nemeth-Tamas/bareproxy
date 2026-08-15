@@ -17,6 +17,10 @@ const READ_CHUNK_SIZE: usize = 4096;
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+const SIGHUP: i32 = 1;
 
 #[cfg(unix)]
 const SIGINT: i32 = 2;
@@ -49,7 +53,12 @@ impl ServerCounters {
 
 #[cfg(unix)]
 unsafe extern "C" {
-    fn signal(signal: i32, handler: usize) -> usize;
+    fn signal(signal: i32, handler: *const ()) -> *const ();
+}
+
+#[cfg(unix)]
+extern "C" fn handle_sighup(_: i32) {
+    RELOAD_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 #[cfg(unix)]
@@ -58,33 +67,48 @@ extern "C" fn handle_sigint(_: i32) {
 }
 
 #[cfg(unix)]
-fn install_shutdown_handler() {
+fn install_signal_handlers() {
     SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    RELOAD_REQUESTED.store(false, Ordering::SeqCst);
 
     unsafe {
-        let _ = signal(SIGINT, handle_sigint as usize);
+        let _ = signal(SIGHUP, handle_sighup as *const ());
+        let _ = signal(SIGINT, handle_sigint as *const ());
     }
 }
 
 #[cfg(not(unix))]
-fn install_shutdown_handler() {
+fn install_signal_handlers() {
     SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    RELOAD_REQUESTED.store(false, Ordering::SeqCst);
 }
 
 pub fn bind_listener() -> io::Result<TcpListener> {
     TcpListener::bind(DEV_LISTEN_ADDR)
 }
 
-pub fn serve(listener: TcpListener, configuration: &config::Config) -> io::Result<()> {
-    install_shutdown_handler();
+pub fn serve(
+    listener: TcpListener,
+    configuration: config::Config,
+    config_path: &str,
+) -> io::Result<()> {
+    install_signal_handlers();
 
-    serve_until(listener, configuration, &SHUTDOWN_REQUESTED)
+    serve_until(
+        listener,
+        configuration,
+        Some(config_path),
+        &SHUTDOWN_REQUESTED,
+        &RELOAD_REQUESTED,
+    )
 }
 
 fn serve_until(
     listener: TcpListener,
-    configuration: &config::Config,
+    mut configuration: config::Config,
+    config_path: Option<&str>,
     shutdown_requested: &AtomicBool,
+    reload_requested: &AtomicBool,
 ) -> io::Result<()> {
     listener.set_nonblocking(true)?;
 
@@ -93,7 +117,18 @@ fn serve_until(
     let mut workers = Vec::new();
 
     while !shutdown_requested.load(Ordering::Acquire) {
-        match accept_and_spawn(&listener, configuration, &active_connections, &counters) {
+        if reload_requested.swap(false, Ordering::AcqRel) {
+            match config_path {
+                Some(config_path) => {
+                    let _ = reload_configuration(config_path, &mut configuration);
+                }
+                None => {
+                    println!("WARN event=config_reload_ignored reason=no_config_path");
+                }
+            }
+        }
+
+        match accept_and_spawn(&listener, &configuration, &active_connections, &counters) {
             Ok(Some(worker)) => workers.push(worker),
             Ok(None) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -138,6 +173,30 @@ fn serve_until(
     );
 
     Ok(())
+}
+
+fn reload_configuration(config_path: &str, configuration: &mut config::Config) -> bool {
+    let replacement = match config::load(config_path) {
+        Ok(replacement) => replacement,
+        Err(error) => {
+            eprintln!("WARN event=config_reload_rejected path=\"{config_path}\" error={error}");
+
+            return false;
+        }
+    };
+
+    let route_count = replacement.routes().len();
+    let max_connections = replacement.max_connections();
+    let client_idle_timeout_seconds = replacement.client_idle_timeout_seconds();
+    let upstream_timeout_seconds = replacement.upstream_timeout_seconds();
+
+    *configuration = replacement;
+
+    println!(
+        "INFO event=config_reload path=\"{config_path}\" routes={route_count} max_connections={max_connections} client_idle_timeout_seconds={client_idle_timeout_seconds} upstream_timeout_seconds={upstream_timeout_seconds}"
+    );
+
+    true
 }
 
 fn reap_finished_workers(workers: &mut Vec<JoinHandle<()>>) {
@@ -548,7 +607,7 @@ mod tests {
 
     use super::{
         RESPONSE_BODY, ServerCounters, accept_and_spawn, build_response, read_request_head,
-        select_route, serve_one, serve_until,
+        reload_configuration, select_route, serve_one, serve_until,
     };
 
     struct FragmentedReader {
@@ -1880,11 +1939,20 @@ DRAINED\n",
 
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let shutdown_for_server = Arc::clone(&shutdown_requested);
+        let reload_requested = Arc::new(AtomicBool::new(false));
+        let reload_for_server = Arc::clone(&reload_requested);
 
         let (server_done_tx, server_done_rx) = mpsc::channel();
 
         let bare_thread = thread::spawn(move || {
-            serve_until(bare_listener, &configuration, &shutdown_for_server).unwrap();
+            serve_until(
+                bare_listener,
+                configuration,
+                None,
+                &shutdown_for_server,
+                &reload_for_server,
+            )
+            .unwrap();
 
             server_done_tx.send(()).unwrap();
         });
@@ -1938,5 +2006,201 @@ Connection: close\r\n\
 
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert!(response.ends_with(b"DRAINED\n"));
+    }
+
+    #[test]
+    fn reload_validates_before_swap_and_preserves_active_configuration() {
+        let old_upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let old_upstream_port = old_upstream_listener.local_addr().unwrap().port();
+
+        let new_upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let new_upstream_port = new_upstream_listener.local_addr().unwrap().port();
+
+        let (old_request_seen_tx, old_request_seen_rx) = mpsc::channel();
+        let (release_old_tx, release_old_rx) = mpsc::channel();
+
+        let old_upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = old_upstream_listener.accept().unwrap();
+
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 512];
+
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let bytes_read = stream.read(&mut chunk).unwrap();
+
+                assert!(bytes_read > 0);
+
+                request.extend_from_slice(&chunk[..bytes_read]);
+            }
+
+            assert!(request.starts_with(b"GET /old HTTP/1.1\r\n"));
+
+            old_request_seen_tx.send(()).unwrap();
+
+            release_old_rx.recv().unwrap();
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+Content-Length: 4\r\n\
+Connection: close\r\n\
+\r\n\
+OLD\n",
+                )
+                .unwrap();
+        });
+
+        let new_upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = new_upstream_listener.accept().unwrap();
+
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 512];
+
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let bytes_read = stream.read(&mut chunk).unwrap();
+
+                assert!(bytes_read > 0);
+
+                request.extend_from_slice(&chunk[..bytes_read]);
+            }
+
+            assert!(request.starts_with(b"GET /new HTTP/1.1\r\n"));
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+Content-Length: 4\r\n\
+Connection: close\r\n\
+\r\n\
+NEW\n",
+                )
+                .unwrap();
+        });
+
+        let config_path =
+            std::env::temp_dir().join(format!("bareproxy-reload-{}.conf", std::process::id()));
+
+        let config_path = config_path.to_string_lossy().into_owned();
+
+        std::fs::write(
+            &config_path,
+            format!("localhost -> 127.0.0.1:{old_upstream_port}\n"),
+        )
+        .unwrap();
+
+        let mut configuration = config::load(&config_path).unwrap();
+
+        std::fs::write(&config_path, "localhost -> definitely-not-an-upstream\n").unwrap();
+
+        assert!(!reload_configuration(&config_path, &mut configuration));
+
+        assert_eq!(
+            configuration
+                .route_for_host("localhost")
+                .unwrap()
+                .upstream()
+                .address(),
+            format!("127.0.0.1:{old_upstream_port}")
+        );
+
+        let bare_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bare_address = bare_listener.local_addr().unwrap();
+
+        let active_connections = Arc::new(AtomicUsize::new(0));
+        let counters = Arc::new(ServerCounters::default());
+
+        let active_for_server = Arc::clone(&active_connections);
+        let counters_for_server = Arc::clone(&counters);
+
+        let (reload_tx, reload_rx) = mpsc::channel();
+
+        let config_path_for_server = config_path.clone();
+
+        let bare_thread = thread::spawn(move || {
+            let old_worker = accept_and_spawn(
+                &bare_listener,
+                &configuration,
+                &active_for_server,
+                &counters_for_server,
+            )
+            .unwrap()
+            .unwrap();
+
+            reload_rx.recv().unwrap();
+
+            assert!(reload_configuration(
+                &config_path_for_server,
+                &mut configuration
+            ));
+
+            let new_worker = accept_and_spawn(
+                &bare_listener,
+                &configuration,
+                &active_for_server,
+                &counters_for_server,
+            )
+            .unwrap()
+            .unwrap();
+
+            old_worker.join().unwrap();
+            new_worker.join().unwrap();
+        });
+
+        let mut old_client = TcpStream::connect(bare_address).unwrap();
+
+        old_client
+            .write_all(
+                b"GET /old HTTP/1.1\r\n\
+Host: localhost\r\n\
+Connection: close\r\n\
+\r\n",
+            )
+            .unwrap();
+
+        old_request_seen_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        std::fs::write(
+            &config_path,
+            format!("localhost -> 127.0.0.1:{new_upstream_port}\n"),
+        )
+        .unwrap();
+
+        reload_tx.send(()).unwrap();
+
+        let mut new_client = TcpStream::connect(bare_address).unwrap();
+
+        new_client
+            .write_all(
+                b"GET /new HTTP/1.1\r\n\
+Host: localhost\r\n\
+Connection: close\r\n\
+\r\n",
+            )
+            .unwrap();
+
+        let mut new_response = Vec::new();
+        new_client.read_to_end(&mut new_response).unwrap();
+
+        assert!(new_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(new_response.ends_with(b"NEW\n"));
+
+        release_old_tx.send(()).unwrap();
+
+        let mut old_response = Vec::new();
+        old_client.read_to_end(&mut old_response).unwrap();
+
+        bare_thread.join().unwrap();
+        old_upstream_thread.join().unwrap();
+        new_upstream_thread.join().unwrap();
+
+        assert!(old_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(old_response.ends_with(b"OLD\n"));
+
+        assert_eq!(counters.snapshot(), (2, 0));
+        assert_eq!(active_connections.load(Ordering::SeqCst), 0);
+
+        std::fs::remove_file(&config_path).unwrap();
     }
 }

@@ -288,9 +288,9 @@ Goal: make BareProxy something that can stay running.
 * [x] Add graceful Ctrl+C/SIGINT handling where possible.
 * [x] Add graceful listener shutdown.
 * [x] Allow active requests to finish during shutdown.
-* [ ] Add configuration reload support.
-* [ ] Validate replacement configuration before activating it.
-* [ ] Swap routing configuration without dropping active requests.
+* [x] Add configuration reload support.
+* [x] Validate replacement configuration before activating it.
+* [x] Swap routing configuration without dropping active requests.
 * [x] Ensure one failed request cannot terminate the server.
 * [x] Add basic counters for requests and errors.
 * [ ] Add long-running smoke testing.
