@@ -305,10 +305,10 @@ Goal: build the primitives required for TLS and ACME without crates.
 
 This is where BareProxy stops being a reasonable weekend project.
 
-* [ ] Create dedicated crypto modules with intentionally narrow APIs.
-* [ ] Obtain cryptographically secure random bytes on Linux/WSL.
-* [ ] Read entropy from the OS rather than creating a pseudo-random generator.
-* [ ] Define a future abstraction for Windows secure randomness.
+* [x] Create dedicated crypto modules with intentionally narrow APIs.
+* [x] Obtain cryptographically secure random bytes on Linux/WSL.
+* [x] Read entropy from the OS rather than creating a pseudo-random generator.
+* [x] Define a future abstraction for Windows secure randomness.
 * [ ] Implement constant-time byte comparison where secrets require it.
 * [ ] Implement hexadecimal encoding/decoding utilities.
 * [ ] Implement standard Base64 encoding.

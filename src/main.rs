@@ -1,5 +1,6 @@
 mod app;
 mod config;
+pub mod crypto;
 mod http;
 mod proxy;
 mod server;
