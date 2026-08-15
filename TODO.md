@@ -293,7 +293,7 @@ Goal: make BareProxy something that can stay running.
 * [x] Swap routing configuration without dropping active requests.
 * [x] Ensure one failed request cannot terminate the server.
 * [x] Add basic counters for requests and errors.
-* [ ] Add long-running smoke testing.
+* [x] Add long-running smoke testing.
 
 **Milestone complete when:** BareProxy can run for extended periods, reload configuration, and fail individual requests without failing the process.
 
