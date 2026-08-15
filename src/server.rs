@@ -3,7 +3,7 @@ use std::{
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -14,6 +14,12 @@ use crate::{config, http, proxy};
 pub const DEV_LISTEN_ADDR: &str = "127.0.0.1:8080";
 
 const READ_CHUNK_SIZE: usize = 4096;
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+const SIGINT: i32 = 2;
 
 #[cfg(test)]
 const RESPONSE_BODY: &str = "BareProxy is alive.\n";
@@ -41,16 +47,106 @@ impl ServerCounters {
     }
 }
 
+#[cfg(unix)]
+unsafe extern "C" {
+    fn signal(signal: i32, handler: usize) -> usize;
+}
+
+#[cfg(unix)]
+extern "C" fn handle_sigint(_: i32) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+fn install_shutdown_handler() {
+    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+
+    unsafe {
+        let _ = signal(SIGINT, handle_sigint as usize);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_shutdown_handler() {
+    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+}
+
 pub fn bind_listener() -> io::Result<TcpListener> {
     TcpListener::bind(DEV_LISTEN_ADDR)
 }
 
-pub fn serve(listener: &TcpListener, configuration: &config::Config) -> io::Result<()> {
+pub fn serve(listener: TcpListener, configuration: &config::Config) -> io::Result<()> {
+    install_shutdown_handler();
+
+    serve_until(listener, configuration, &SHUTDOWN_REQUESTED)
+}
+
+fn serve_until(
+    listener: TcpListener,
+    configuration: &config::Config,
+    shutdown_requested: &AtomicBool,
+) -> io::Result<()> {
+    listener.set_nonblocking(true)?;
+
     let active_connections = Arc::new(AtomicUsize::new(0));
     let counters = Arc::new(ServerCounters::default());
+    let mut workers = Vec::new();
 
-    loop {
-        let _ = accept_and_spawn(listener, configuration, &active_connections, &counters)?;
+    while !shutdown_requested.load(Ordering::Acquire) {
+        match accept_and_spawn(&listener, configuration, &active_connections, &counters) {
+            Ok(Some(worker)) => workers.push(worker),
+            Ok(None) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(SHUTDOWN_POLL_INTERVAL);
+            }
+            Err(error) => return Err(error),
+        }
+
+        reap_finished_workers(&mut workers);
+    }
+
+    println!(
+        "INFO event=shutdown_begin active={} workers={}",
+        active_connections.load(Ordering::SeqCst),
+        workers.len()
+    );
+
+    drop(listener);
+
+    println!("INFO event=listener_stop reason=shutdown");
+
+    reap_finished_workers(&mut workers);
+
+    if !workers.is_empty() {
+        println!(
+            "INFO event=shutdown_drain active={} workers={}",
+            active_connections.load(Ordering::SeqCst),
+            workers.len()
+        );
+    }
+
+    for worker in workers {
+        if worker.join().is_err() {
+            eprintln!("ERROR event=worker_panic phase=shutdown_drain");
+        }
+    }
+
+    let (requests_total, errors_total) = counters.snapshot();
+
+    println!(
+        "INFO event=shutdown_complete requests_total={requests_total} errors_total={errors_total}"
+    );
+
+    Ok(())
+}
+
+fn reap_finished_workers(workers: &mut Vec<JoinHandle<()>>) {
+    while let Some(index) = workers.iter().position(JoinHandle::is_finished) {
+        let worker = workers.swap_remove(index);
+
+        if worker.join().is_err() {
+            eprintln!("ERROR event=worker_panic phase=runtime_reap");
+        }
     }
 }
 
@@ -441,17 +537,18 @@ mod tests {
         net::{Shutdown, TcpListener, TcpStream},
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
         },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use crate::{config, http};
 
     use super::{
         RESPONSE_BODY, ServerCounters, accept_and_spawn, build_response, read_request_head,
-        select_route, serve_one,
+        select_route, serve_one, serve_until,
     };
 
     struct FragmentedReader {
@@ -1734,5 +1831,112 @@ Connection: close\r\n\
 
         assert_eq!(counters.snapshot(), (1, 1));
         assert_eq!(active_connections.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn graceful_shutdown_stops_listener_and_finishes_active_request() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let (request_seen_tx, request_seen_rx) = mpsc::channel();
+        let (release_upstream_tx, release_upstream_rx) = mpsc::channel();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 512];
+
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let bytes_read = stream.read(&mut chunk).unwrap();
+
+                assert!(bytes_read > 0);
+
+                request.extend_from_slice(&chunk[..bytes_read]);
+            }
+
+            assert!(request.starts_with(b"GET /drain HTTP/1.1\r\n"));
+
+            request_seen_tx.send(()).unwrap();
+
+            release_upstream_rx.recv().unwrap();
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+Content-Length: 8\r\n\
+Connection: close\r\n\
+\r\n\
+DRAINED\n",
+                )
+                .unwrap();
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let bare_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bare_address = bare_listener.local_addr().unwrap();
+
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let shutdown_for_server = Arc::clone(&shutdown_requested);
+
+        let (server_done_tx, server_done_rx) = mpsc::channel();
+
+        let bare_thread = thread::spawn(move || {
+            serve_until(bare_listener, &configuration, &shutdown_for_server).unwrap();
+
+            server_done_tx.send(()).unwrap();
+        });
+
+        let mut client = TcpStream::connect(bare_address).unwrap();
+
+        client
+            .write_all(
+                b"GET /drain HTTP/1.1\r\n\
+Host: localhost\r\n\
+Connection: close\r\n\
+\r\n",
+            )
+            .unwrap();
+
+        request_seen_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        shutdown_requested.store(true, Ordering::Release);
+
+        thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(server_done_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        loop {
+            match TcpStream::connect(bare_address) {
+                Err(_) => break,
+                Ok(stream) => drop(stream),
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "listener remained open during graceful shutdown"
+            );
+
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        release_upstream_tx.send(()).unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        server_done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        bare_thread.join().unwrap();
+        upstream_thread.join().unwrap();
+
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with(b"DRAINED\n"));
     }
 }

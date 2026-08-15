@@ -110,7 +110,7 @@ fn start_proxy(config_path: &str) -> Result<(), AppError> {
         server::DEV_LISTEN_ADDR
     );
 
-    server::serve(&listener, &config).map_err(|source| AppError::Server {
+    server::serve(listener, &config).map_err(|source| AppError::Server {
         message: source.to_string(),
     })
 }

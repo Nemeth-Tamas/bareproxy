@@ -285,9 +285,9 @@ Goal: make BareProxy something that can stay running.
 * [x] Log selected upstreams.
 * [x] Log upstream failures.
 * [x] Log protocol errors without dumping sensitive body data.
-* [ ] Add graceful Ctrl+C/SIGINT handling where possible.
-* [ ] Add graceful listener shutdown.
-* [ ] Allow active requests to finish during shutdown.
+* [x] Add graceful Ctrl+C/SIGINT handling where possible.
+* [x] Add graceful listener shutdown.
+* [x] Allow active requests to finish during shutdown.
 * [ ] Add configuration reload support.
 * [ ] Validate replacement configuration before activating it.
 * [ ] Swap routing configuration without dropping active requests.
