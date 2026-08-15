@@ -408,9 +408,9 @@ Goal: speak enough ASN.1/X.509 machinery to request and store real certificates.
 * [x] Reject non-canonical or malformed DER where relevant.
 * [x] Implement PEM encoding.
 * [x] Implement PEM decoding.
-* [ ] Encode a P-256 private key.
-* [ ] Encode a P-256 public key/SPKI structure.
-* [ ] Persist private keys with restrictive filesystem permissions.
+* [x] Encode a P-256 private key.
+* [x] Encode a P-256 public key/SPKI structure.
+* [x] Persist private keys with restrictive filesystem permissions.
 * [ ] Build PKCS#10 certificate signing requests.
 * [ ] Encode Subject Alternative Name DNS entries.
 * [ ] Sign CSRs using ECDSA/SHA-256.

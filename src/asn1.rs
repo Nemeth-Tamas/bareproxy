@@ -6,9 +6,12 @@
 //! for EC keys, PKCS#10 CSRs, X.509 certificates, and related structures.
 //! High-tag-number ASN.1 identifiers and indefinite lengths are rejected.
 
-use crate::crypto::encode_base64;
+use crate::{
+    crypto::{encode_base64, wipe_bytes},
+    p256::{P256Point, Scalar, p256_generator_multiply},
+};
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, io, path::Path};
 
 const DER_TAG_INTEGER: u8 = 0x02;
 const DER_TAG_BIT_STRING: u8 = 0x03;
@@ -40,6 +43,8 @@ pub enum DerError {
     PemEndMissing,
     PemLabelMismatch,
     InvalidPemBase64,
+    InvalidP256PrivateKey,
+    InvalidP256PublicKey,
 }
 
 impl fmt::Display for DerError {
@@ -93,6 +98,10 @@ impl fmt::Display for DerError {
             }
             Self::InvalidPemBase64 => {
                 formatter.write_str("invalid Base64 inside RFC 7468 textual encoding")
+            }
+            Self::InvalidP256PrivateKey => formatter.write_str("P-256 private key cannot be zero"),
+            Self::InvalidP256PublicKey => {
+                formatter.write_str("P-256 public key cannot be the identity point")
             }
         }
     }
@@ -434,7 +443,7 @@ pub fn pem_decode(label: &str, input: &str) -> Result<Vec<u8>, DerError> {
     let mut base64 = Vec::new();
 
     for raw_line in input.lines() {
-        let line = raw_line.trim_end_matches(|character| character == ' ' || character == '\t');
+        let line = raw_line.trim_end_matches([' ', '\t']);
 
         if !found_begin {
             if line == begin {
@@ -471,6 +480,129 @@ pub fn pem_decode(label: &str, input: &str) -> Result<Vec<u8>, DerError> {
     }
 
     decode_base64(&base64)
+}
+
+const OID_EC_PUBLIC_KEY: &[u64] = &[1, 2, 840, 10045, 2, 1];
+
+const OID_SECP256R1: &[u64] = &[1, 2, 840, 10045, 3, 1, 7];
+
+fn p256_algorithm_identifier() -> Vec<u8> {
+    der_sequence(&[
+        der_object_identifier(OID_EC_PUBLIC_KEY).expect("fixed id-ecPublicKey OID must encode"),
+        der_object_identifier(OID_SECP256R1).expect("fixed secp256r1 OID must encode"),
+    ])
+}
+
+/// Encodes an RFC 5915 ECPrivateKey for P-256.
+///
+/// The private scalar is encoded as exactly 32 big-endian octets. The
+/// secp256r1 parameters and matching uncompressed public key are included.
+pub fn encode_p256_sec1_private_key_der(private_key: Scalar) -> Result<Vec<u8>, DerError> {
+    if private_key == Scalar::ZERO {
+        return Err(DerError::InvalidP256PrivateKey);
+    }
+
+    let public_key = p256_generator_multiply(private_key)
+        .to_sec1_uncompressed()
+        .map_err(|_| DerError::InvalidP256PublicKey)?;
+
+    let parameters = der_object_identifier(OID_SECP256R1).expect("fixed secp256r1 OID must encode");
+
+    let public_key = der_bit_string(&public_key);
+
+    Ok(der_sequence(&[
+        der_integer_unsigned(&[1]),
+        der_octet_string(&private_key.value().to_be_bytes()),
+        der_context_specific(0, true, &parameters).expect("context-specific tag zero must encode"),
+        der_context_specific(1, true, &public_key).expect("context-specific tag one must encode"),
+    ]))
+}
+
+/// Encodes an RFC 5915 P-256 private key using the conventional
+/// `EC PRIVATE KEY` textual representation.
+pub fn encode_p256_sec1_private_key_pem(private_key: Scalar) -> Result<String, DerError> {
+    let mut der = encode_p256_sec1_private_key_der(private_key)?;
+
+    let result = pem_encode("EC PRIVATE KEY", &der);
+
+    wipe_bytes(&mut der);
+
+    result
+}
+
+/// Encodes a P-256 SubjectPublicKeyInfo structure following RFC 5480.
+pub fn encode_p256_spki_der(public_key: P256Point) -> Result<Vec<u8>, DerError> {
+    let encoded_point = public_key
+        .to_sec1_uncompressed()
+        .map_err(|_| DerError::InvalidP256PublicKey)?;
+
+    Ok(der_sequence(&[
+        p256_algorithm_identifier(),
+        der_bit_string(&encoded_point),
+    ]))
+}
+
+/// Encodes a P-256 SubjectPublicKeyInfo using the RFC 7468 `PUBLIC KEY` label.
+pub fn encode_p256_spki_pem(public_key: P256Point) -> Result<String, DerError> {
+    let der = encode_p256_spki_der(public_key)?;
+
+    pem_encode("PUBLIC KEY", &der)
+}
+
+/// Persists an RFC 5915 P-256 private key with restrictive filesystem
+/// permissions.
+///
+/// On platforms where BareProxy cannot currently guarantee restrictive
+/// permissions, this function fails closed instead of writing the key.
+pub fn persist_p256_private_key_pem(path: impl AsRef<Path>, private_key: Scalar) -> io::Result<()> {
+    let pem = encode_p256_sec1_private_key_pem(private_key)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+
+    let mut bytes = pem.into_bytes();
+
+    let result = private_key_storage::write(path.as_ref(), &bytes);
+
+    wipe_bytes(&mut bytes);
+
+    result
+}
+
+#[cfg(unix)]
+mod private_key_storage {
+    use std::{
+        fs::{self, OpenOptions},
+        io::{self, Write},
+        os::unix::fs::{OpenOptionsExt, PermissionsExt},
+        path::Path,
+    };
+
+    const PRIVATE_KEY_MODE: u32 = 0o600;
+
+    pub(super) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(PRIVATE_KEY_MODE)
+            .open(path)?;
+
+        file.set_permissions(fs::Permissions::from_mode(PRIVATE_KEY_MODE))?;
+
+        file.write_all(bytes)?;
+        file.sync_all()
+    }
+}
+
+#[cfg(not(unix))]
+mod private_key_storage {
+    use std::{io, path::Path};
+
+    pub(super) fn write(_: &Path, _: &[u8]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "restrictive private-key persistence is not implemented for this platform yet",
+        ))
+    }
 }
 
 fn der_wrap(tag: u8, content: &[u8]) -> Vec<u8> {
@@ -631,14 +763,18 @@ fn decode_base64_character(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DER_TAG_OCTET_STRING, DER_TAG_SEQUENCE, DerError, DerReader, der_bit_string,
-        der_context_specific, der_integer_unsigned, der_object_identifier, der_octet_string,
-        der_sequence, der_set, pem_decode, pem_encode,
+        DER_TAG_BIT_STRING, DER_TAG_INTEGER, DER_TAG_OBJECT_IDENTIFIER, DER_TAG_OCTET_STRING,
+        DER_TAG_SEQUENCE, DerError, DerReader, der_bit_string, der_context_specific,
+        der_integer_unsigned, der_object_identifier, der_octet_string, der_sequence, der_set,
+        encode_p256_sec1_private_key_der, encode_p256_sec1_private_key_pem, encode_p256_spki_der,
+        encode_p256_spki_pem, pem_decode, pem_encode, persist_p256_private_key_pem,
     };
+
+    use crate::p256::{P256Point, Scalar};
 
     #[test]
     fn der_length_uses_short_form_through_127() {
-        let encoded = der_octet_string(&vec![0_u8; 127]);
+        let encoded = der_octet_string(&[0_u8; 127]);
 
         assert_eq!(&encoded[..2], &[0x04, 0x7f]);
 
@@ -647,7 +783,7 @@ mod tests {
 
     #[test]
     fn der_length_uses_minimal_long_form_from_128() {
-        let encoded_128 = der_octet_string(&vec![0_u8; 128]);
+        let encoded_128 = der_octet_string(&[0_u8; 128]);
 
         assert_eq!(&encoded_128[..3], &[0x04, 0x81, 0x80]);
 
@@ -925,5 +1061,172 @@ mod tests {
             pem_encode("bad label", b"",),
             Err(DerError::InvalidPemLabel)
         );
+    }
+
+    #[test]
+    fn p256_sec1_private_key_has_rfc5915_structure() {
+        let der = encode_p256_sec1_private_key_der(Scalar::ONE).unwrap();
+
+        let mut outer = DerReader::new(&der);
+
+        let sequence = outer.read_expected(DER_TAG_SEQUENCE).unwrap();
+
+        outer.finish().unwrap();
+
+        let mut key = sequence.reader();
+
+        assert_eq!(key.read_expected(DER_TAG_INTEGER).unwrap().content, &[1]);
+
+        let private_key = key.read_expected(DER_TAG_OCTET_STRING).unwrap();
+
+        assert_eq!(private_key.content.len(), 32);
+
+        assert_eq!(private_key.content[31], 1);
+
+        assert!(private_key.content[..31].iter().all(|byte| *byte == 0));
+
+        let parameters = key.read_expected(0xa0).unwrap();
+
+        let mut parameters = parameters.reader();
+
+        let curve = parameters.read_expected(DER_TAG_OBJECT_IDENTIFIER).unwrap();
+
+        assert_eq!(
+            curve.content,
+            &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,]
+        );
+
+        parameters.finish().unwrap();
+
+        let public_key = key.read_expected(0xa1).unwrap();
+
+        let mut public_key = public_key.reader();
+
+        let public_key = public_key.read_expected(DER_TAG_BIT_STRING).unwrap();
+
+        assert_eq!(public_key.content[0], 0);
+
+        assert_eq!(public_key.content[1], 0x04);
+
+        assert_eq!(public_key.content.len(), 66);
+
+        key.finish().unwrap();
+    }
+
+    #[test]
+    fn p256_sec1_private_key_pem_round_trips() {
+        let pem = encode_p256_sec1_private_key_pem(Scalar::ONE).unwrap();
+
+        let decoded = pem_decode("EC PRIVATE KEY", &pem).unwrap();
+
+        assert_eq!(
+            decoded,
+            encode_p256_sec1_private_key_der(Scalar::ONE,).unwrap()
+        );
+    }
+
+    #[test]
+    fn p256_private_key_rejects_zero_scalar() {
+        assert_eq!(
+            encode_p256_sec1_private_key_der(Scalar::ZERO,),
+            Err(DerError::InvalidP256PrivateKey)
+        );
+    }
+
+    #[test]
+    fn p256_spki_has_rfc5480_structure() {
+        let der = encode_p256_spki_der(P256Point::generator()).unwrap();
+
+        assert_eq!(der.len(), 91);
+
+        let mut outer = DerReader::new(&der);
+
+        let sequence = outer.read_expected(DER_TAG_SEQUENCE).unwrap();
+
+        outer.finish().unwrap();
+
+        let mut spki = sequence.reader();
+
+        let algorithm = spki.read_expected(DER_TAG_SEQUENCE).unwrap();
+
+        let mut algorithm = algorithm.reader();
+
+        let algorithm_oid = algorithm.read_expected(DER_TAG_OBJECT_IDENTIFIER).unwrap();
+
+        assert_eq!(
+            algorithm_oid.content,
+            &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,]
+        );
+
+        let curve_oid = algorithm.read_expected(DER_TAG_OBJECT_IDENTIFIER).unwrap();
+
+        assert_eq!(
+            curve_oid.content,
+            &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,]
+        );
+
+        algorithm.finish().unwrap();
+
+        let public_key = spki.read_expected(DER_TAG_BIT_STRING).unwrap();
+
+        assert_eq!(public_key.content.len(), 66);
+
+        assert_eq!(public_key.content[0], 0);
+
+        assert_eq!(public_key.content[1], 0x04);
+
+        spki.finish().unwrap();
+    }
+
+    #[test]
+    fn p256_spki_pem_round_trips() {
+        let pem = encode_p256_spki_pem(P256Point::generator()).unwrap();
+
+        let decoded = pem_decode("PUBLIC KEY", &pem).unwrap();
+
+        assert_eq!(
+            decoded,
+            encode_p256_spki_der(P256Point::generator(),).unwrap()
+        );
+    }
+
+    #[test]
+    fn p256_spki_rejects_identity_point() {
+        assert_eq!(
+            encode_p256_spki_der(P256Point::IDENTITY,),
+            Err(DerError::InvalidP256PublicKey)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_key_persistence_uses_owner_only_permissions() {
+        use std::{
+            fs,
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let path = std::env::temp_dir().join(format!(
+            "bareproxy-p256-{}-{unique}.pem",
+            std::process::id(),
+        ));
+
+        persist_p256_private_key_pem(&path, Scalar::ONE).unwrap();
+
+        let metadata = fs::metadata(&path).unwrap();
+
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        let encoded = fs::read_to_string(&path).unwrap();
+
+        assert!(encoded.starts_with("-----BEGIN EC PRIVATE KEY-----\n"));
+
+        fs::remove_file(path).unwrap();
     }
 }
