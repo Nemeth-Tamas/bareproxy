@@ -411,16 +411,16 @@ Goal: speak enough ASN.1/X.509 machinery to request and store real certificates.
 * [x] Encode a P-256 private key.
 * [x] Encode a P-256 public key/SPKI structure.
 * [x] Persist private keys with restrictive filesystem permissions.
-* [ ] Build PKCS#10 certificate signing requests.
-* [ ] Encode Subject Alternative Name DNS entries.
-* [ ] Sign CSRs using ECDSA/SHA-256.
+* [x] Build PKCS#10 certificate signing requests.
+* [x] Encode Subject Alternative Name DNS entries.
+* [x] Sign CSRs using ECDSA/SHA-256.
 * [ ] Parse enough X.509 certificate structure to inspect issued certificates.
 * [ ] Extract certificate validity dates.
 * [ ] Extract DNS Subject Alternative Names.
 * [ ] Extract public-key information.
 * [ ] Parse certificate chains supplied as PEM.
-* [ ] Add DER malformed-input tests.
-* [ ] Compare generated CSRs against an independent parser such as OpenSSL during development.
+* [x] Add DER malformed-input tests.
+* [x] Compare generated CSRs against an independent parser such as OpenSSL during development.
 
 **Milestone complete when:** BareProxy can generate a standards-valid private key and CSR for a hostname.
 

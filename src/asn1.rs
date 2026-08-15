@@ -8,7 +8,7 @@
 
 use crate::{
     crypto::{encode_base64, wipe_bytes},
-    p256::{P256Point, Scalar, p256_generator_multiply},
+    p256::{P256Point, P256Signature, Scalar, p256_ecdsa_sign_sha256, p256_generator_multiply},
 };
 
 use std::{error::Error, fmt, io, path::Path};
@@ -45,6 +45,7 @@ pub enum DerError {
     InvalidPemBase64,
     InvalidP256PrivateKey,
     InvalidP256PublicKey,
+    InvalidDnsName,
 }
 
 impl fmt::Display for DerError {
@@ -103,6 +104,7 @@ impl fmt::Display for DerError {
             Self::InvalidP256PublicKey => {
                 formatter.write_str("P-256 public key cannot be the identity point")
             }
+            Self::InvalidDnsName => formatter.write_str("invalid DNS name for subjectAltName"),
         }
     }
 }
@@ -317,6 +319,10 @@ pub fn der_sequence(elements: &[Vec<u8>]) -> Vec<u8> {
 /// DER requires canonical ordering, so complete encoded child values are
 /// sorted lexicographically before being wrapped.
 pub fn der_set(elements: &[Vec<u8>]) -> Vec<u8> {
+    der_wrap(DER_TAG_SET, &der_set_content(elements))
+}
+
+fn der_set_content(elements: &[Vec<u8>]) -> Vec<u8> {
     let mut sorted = elements.to_vec();
 
     sorted.sort();
@@ -327,7 +333,7 @@ pub fn der_set(elements: &[Vec<u8>]) -> Vec<u8> {
         content.extend_from_slice(&element);
     }
 
-    der_wrap(DER_TAG_SET, &content)
+    content
 }
 
 pub fn der_object_identifier(arcs: &[u64]) -> Result<Vec<u8>, DerError> {
@@ -486,6 +492,12 @@ const OID_EC_PUBLIC_KEY: &[u64] = &[1, 2, 840, 10045, 2, 1];
 
 const OID_SECP256R1: &[u64] = &[1, 2, 840, 10045, 3, 1, 7];
 
+const OID_EXTENSION_REQUEST: &[u64] = &[1, 2, 840, 113549, 1, 9, 14];
+
+const OID_SUBJECT_ALT_NAME: &[u64] = &[2, 5, 29, 17];
+
+const OID_ECDSA_WITH_SHA256: &[u64] = &[1, 2, 840, 10045, 4, 3, 2];
+
 fn p256_algorithm_identifier() -> Vec<u8> {
     der_sequence(&[
         der_object_identifier(OID_EC_PUBLIC_KEY).expect("fixed id-ecPublicKey OID must encode"),
@@ -547,6 +559,140 @@ pub fn encode_p256_spki_pem(public_key: P256Point) -> Result<String, DerError> {
     let der = encode_p256_spki_der(public_key)?;
 
     pem_encode("PUBLIC KEY", &der)
+}
+
+/// Encodes one or more DNS identities as an RFC 5280 SubjectAltName value.
+///
+/// DNS names must already be ASCII. Internationalized names therefore need
+/// to be supplied in their A-label form.
+pub fn encode_subject_alt_name_dns(dns_names: &[&str]) -> Result<Vec<u8>, DerError> {
+    if dns_names.is_empty() {
+        return Err(DerError::InvalidDnsName);
+    }
+
+    let mut general_names = Vec::with_capacity(dns_names.len());
+
+    for dns_name in dns_names {
+        validate_dns_name(dns_name)?;
+
+        general_names.push(
+            der_context_specific(2, false, dns_name.as_bytes())
+                .expect("GeneralName dNSName tag must fit in low-tag-number form"),
+        );
+    }
+
+    Ok(der_sequence(&general_names))
+}
+
+fn validate_dns_name(dns_name: &str) -> Result<(), DerError> {
+    if dns_name.is_empty()
+        || !dns_name.is_ascii()
+        || dns_name.len() > 253
+        || dns_name.ends_with('.')
+    {
+        return Err(DerError::InvalidDnsName);
+    }
+
+    let hostname = if let Some(hostname) = dns_name.strip_prefix("*.") {
+        if hostname.is_empty() {
+            return Err(DerError::InvalidDnsName);
+        }
+
+        hostname
+    } else {
+        if dns_name.contains('*') {
+            return Err(DerError::InvalidDnsName);
+        }
+
+        dns_name
+    };
+
+    for label in hostname.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(DerError::InvalidDnsName);
+        }
+    }
+
+    Ok(())
+}
+
+fn ecdsa_sha256_algorithm_identifier() -> Vec<u8> {
+    der_sequence(&[der_object_identifier(OID_ECDSA_WITH_SHA256)
+        .expect("fixed ecdsa-with-SHA256 OID must encode")])
+}
+
+fn encode_p256_signature_der(signature: P256Signature) -> Vec<u8> {
+    let (r, s) = signature.components();
+
+    der_sequence(&[
+        der_integer_unsigned(&r.to_be_bytes()),
+        der_integer_unsigned(&s.to_be_bytes()),
+    ])
+}
+
+/// Builds and signs a PKCS#10 certification request for P-256.
+///
+/// DNS identities are requested through the PKCS#9 extensionRequest
+/// attribute containing an RFC 5280 SubjectAltName extension.
+pub fn encode_p256_csr_der(private_key: Scalar, dns_names: &[&str]) -> Result<Vec<u8>, DerError> {
+    if private_key == Scalar::ZERO {
+        return Err(DerError::InvalidP256PrivateKey);
+    }
+
+    let public_key = p256_generator_multiply(private_key);
+
+    let subject_public_key_info = encode_p256_spki_der(public_key)?;
+
+    let subject_alt_name = encode_subject_alt_name_dns(dns_names)?;
+
+    let subject_alt_name_extension = der_sequence(&[
+        der_object_identifier(OID_SUBJECT_ALT_NAME).expect("fixed subjectAltName OID must encode"),
+        der_octet_string(&subject_alt_name),
+    ]);
+
+    let extensions = der_sequence(&[subject_alt_name_extension]);
+
+    let extension_request = der_sequence(&[
+        der_object_identifier(OID_EXTENSION_REQUEST)
+            .expect("fixed extensionRequest OID must encode"),
+        der_set(&[extensions]),
+    ]);
+
+    let attributes = der_context_specific(0, true, &der_set_content(&[extension_request]))
+        .expect("PKCS#10 attributes tag must encode");
+
+    let certification_request_info = der_sequence(&[
+        der_integer_unsigned(&[0]),
+        der_sequence(&[]),
+        subject_public_key_info,
+        attributes,
+    ]);
+
+    let signature = p256_ecdsa_sign_sha256(private_key, &certification_request_info)
+        .map_err(|_| DerError::InvalidP256PrivateKey)?;
+
+    let signature = encode_p256_signature_der(signature);
+
+    Ok(der_sequence(&[
+        certification_request_info,
+        ecdsa_sha256_algorithm_identifier(),
+        der_bit_string(&signature),
+    ]))
+}
+
+/// Builds a signed P-256 PKCS#10 request using the RFC 7468
+/// `CERTIFICATE REQUEST` textual label.
+pub fn encode_p256_csr_pem(private_key: Scalar, dns_names: &[&str]) -> Result<String, DerError> {
+    let der = encode_p256_csr_der(private_key, dns_names)?;
+
+    pem_encode("CERTIFICATE REQUEST", &der)
 }
 
 /// Persists an RFC 5915 P-256 private key with restrictive filesystem
@@ -764,13 +910,27 @@ fn decode_base64_character(byte: u8) -> Option<u8> {
 mod tests {
     use super::{
         DER_TAG_BIT_STRING, DER_TAG_INTEGER, DER_TAG_OBJECT_IDENTIFIER, DER_TAG_OCTET_STRING,
-        DER_TAG_SEQUENCE, DerError, DerReader, der_bit_string, der_context_specific,
+        DER_TAG_SEQUENCE, DER_TAG_SET, DerError, DerReader, der_bit_string, der_context_specific,
         der_integer_unsigned, der_object_identifier, der_octet_string, der_sequence, der_set,
-        encode_p256_sec1_private_key_der, encode_p256_sec1_private_key_pem, encode_p256_spki_der,
-        encode_p256_spki_pem, pem_decode, pem_encode, persist_p256_private_key_pem,
+        der_wrap, encode_p256_csr_der, encode_p256_csr_pem, encode_p256_sec1_private_key_der,
+        encode_p256_sec1_private_key_pem, encode_p256_spki_der, encode_p256_spki_pem,
+        encode_subject_alt_name_dns, pem_decode, pem_encode, persist_p256_private_key_pem,
     };
 
-    use crate::p256::{P256Point, Scalar};
+    use crate::p256::{
+        P256Point, P256Signature, Scalar, Uint256, p256_ecdsa_verify_sha256,
+        p256_generator_multiply,
+    };
+
+    fn uint256_from_der_unsigned(bytes: &[u8]) -> Uint256 {
+        assert!(bytes.len() <= 32);
+
+        let mut padded = [0_u8; 32];
+
+        padded[32 - bytes.len()..].copy_from_slice(bytes);
+
+        Uint256::from_be_bytes(padded)
+    }
 
     #[test]
     fn der_length_uses_short_form_through_127() {
@@ -1228,5 +1388,251 @@ mod tests {
         assert!(encoded.starts_with("-----BEGIN EC PRIVATE KEY-----\n"));
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn subject_alt_name_dns_encodes_general_names() {
+        let encoded = encode_subject_alt_name_dns(&["example.com", "*.example.net"]).unwrap();
+
+        let mut outer = DerReader::new(&encoded);
+
+        let sequence = outer.read_expected(DER_TAG_SEQUENCE).unwrap();
+
+        outer.finish().unwrap();
+
+        let mut names = sequence.reader();
+
+        assert_eq!(names.read_expected(0x82).unwrap().content, b"example.com");
+
+        assert_eq!(names.read_expected(0x82).unwrap().content, b"*.example.net");
+
+        names.finish().unwrap();
+    }
+
+    #[test]
+    fn subject_alt_name_dns_rejects_invalid_names() {
+        assert_eq!(
+            encode_subject_alt_name_dns(&[]),
+            Err(DerError::InvalidDnsName)
+        );
+
+        assert_eq!(
+            encode_subject_alt_name_dns(&["bad name.example"],),
+            Err(DerError::InvalidDnsName)
+        );
+
+        assert_eq!(
+            encode_subject_alt_name_dns(&["münich.example"],),
+            Err(DerError::InvalidDnsName)
+        );
+
+        assert_eq!(
+            encode_subject_alt_name_dns(&["-example.com"],),
+            Err(DerError::InvalidDnsName)
+        );
+    }
+
+    #[test]
+    fn p256_csr_contains_san_and_valid_ecdsa_signature() {
+        let private_key = Scalar::ONE;
+
+        let public_key = p256_generator_multiply(private_key);
+
+        let der = encode_p256_csr_der(private_key, &["example.com", "www.example.com"]).unwrap();
+
+        let mut outer = DerReader::new(&der);
+
+        let request = outer.read_expected(DER_TAG_SEQUENCE).unwrap();
+
+        outer.finish().unwrap();
+
+        let mut request = request.reader();
+
+        let certification_request_info = request.read_expected(DER_TAG_SEQUENCE).unwrap();
+
+        let signed_bytes = der_wrap(DER_TAG_SEQUENCE, certification_request_info.content);
+
+        let mut info = certification_request_info.reader();
+
+        assert_eq!(info.read_integer_unsigned().unwrap(), &[0]);
+
+        assert!(
+            info.read_expected(DER_TAG_SEQUENCE,)
+                .unwrap()
+                .content
+                .is_empty()
+        );
+
+        info.read_expected(DER_TAG_SEQUENCE).unwrap();
+
+        let attributes = info.read_expected(0xa0).unwrap();
+
+        info.finish().unwrap();
+
+        let mut attributes = attributes.reader();
+
+        let extension_request = attributes.read_expected(DER_TAG_SEQUENCE).unwrap();
+
+        attributes.finish().unwrap();
+
+        let mut extension_request = extension_request.reader();
+
+        assert_eq!(
+            extension_request
+                .read_expected(DER_TAG_OBJECT_IDENTIFIER,)
+                .unwrap()
+                .content,
+            &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x0e,]
+        );
+
+        let values = extension_request.read_expected(DER_TAG_SET).unwrap();
+
+        extension_request.finish().unwrap();
+
+        let mut values = values.reader();
+
+        let extensions = values.read_expected(DER_TAG_SEQUENCE).unwrap();
+
+        values.finish().unwrap();
+
+        let mut extensions = extensions.reader();
+
+        let extension = extensions.read_expected(DER_TAG_SEQUENCE).unwrap();
+
+        extensions.finish().unwrap();
+
+        let mut extension = extension.reader();
+
+        assert_eq!(
+            extension
+                .read_expected(DER_TAG_OBJECT_IDENTIFIER,)
+                .unwrap()
+                .content,
+            &[0x55, 0x1d, 0x11]
+        );
+
+        let extension_value = extension.read_expected(DER_TAG_OCTET_STRING).unwrap();
+
+        extension.finish().unwrap();
+
+        let mut general_names = DerReader::new(extension_value.content);
+
+        let general_names = general_names.read_expected(DER_TAG_SEQUENCE).unwrap();
+
+        general_names.reader().finish().unwrap_err();
+
+        let mut names = general_names.reader();
+
+        assert_eq!(names.read_expected(0x82).unwrap().content, b"example.com");
+
+        assert_eq!(
+            names.read_expected(0x82).unwrap().content,
+            b"www.example.com"
+        );
+
+        names.finish().unwrap();
+
+        let signature_algorithm = request.read_expected(DER_TAG_SEQUENCE).unwrap();
+
+        let mut signature_algorithm = signature_algorithm.reader();
+
+        assert_eq!(
+            signature_algorithm
+                .read_expected(DER_TAG_OBJECT_IDENTIFIER,)
+                .unwrap()
+                .content,
+            &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02,]
+        );
+
+        signature_algorithm.finish().unwrap();
+
+        let signature = request.read_expected(DER_TAG_BIT_STRING).unwrap();
+
+        request.finish().unwrap();
+
+        assert_eq!(signature.content[0], 0);
+
+        let mut signature_outer = DerReader::new(&signature.content[1..]);
+
+        let signature_sequence = signature_outer.read_expected(DER_TAG_SEQUENCE).unwrap();
+
+        signature_outer.finish().unwrap();
+
+        let mut signature_values = signature_sequence.reader();
+
+        let r = uint256_from_der_unsigned(signature_values.read_integer_unsigned().unwrap());
+
+        let s = uint256_from_der_unsigned(signature_values.read_integer_unsigned().unwrap());
+
+        signature_values.finish().unwrap();
+
+        let signature = P256Signature::from_components(r, s).unwrap();
+
+        assert!(p256_ecdsa_verify_sha256(
+            public_key,
+            &signed_bytes,
+            signature,
+        ));
+    }
+
+    #[test]
+    fn p256_csr_pem_round_trips() {
+        let pem = encode_p256_csr_pem(Scalar::ONE, &["example.com"]).unwrap();
+
+        let decoded = pem_decode("CERTIFICATE REQUEST", &pem).unwrap();
+
+        assert_eq!(
+            decoded,
+            encode_p256_csr_der(Scalar::ONE, &["example.com"],).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires the OpenSSL command-line tool"]
+    fn p256_csr_openssl_interoperability() {
+        use std::{
+            fs,
+            process::Command,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let pem = encode_p256_csr_pem(Scalar::ONE, &["example.com", "www.example.com"]).unwrap();
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let path = std::env::temp_dir()
+            .join(format!("bareproxy-csr-{}-{unique}.pem", std::process::id(),));
+
+        fs::write(&path, pem).unwrap();
+
+        let output = Command::new("openssl")
+            .arg("req")
+            .arg("-in")
+            .arg(&path)
+            .args(["-noout", "-verify", "-text"])
+            .output()
+            .expect("OpenSSL must be installed for this ignored interoperability test");
+
+        fs::remove_file(path).unwrap();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        let combined = format!("{stdout}\n{stderr}");
+
+        assert!(
+            output.status.success(),
+            "OpenSSL rejected BareProxy CSR:\n{combined}"
+        );
+
+        assert!(
+            combined.contains("DNS:example.com"),
+            "OpenSSL did not decode the requested SAN:\n{combined}"
+        );
     }
 }
