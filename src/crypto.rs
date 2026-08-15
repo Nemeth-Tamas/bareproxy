@@ -14,6 +14,9 @@ const SHA256_LENGTH_OFFSET: usize = 56;
 const HMAC_INNER_PAD_BYTE: u8 = 0x36;
 const HMAC_OUTER_PAD_BYTE: u8 = 0x5c;
 
+const SHA256_DIGEST_SIZE: usize = 32;
+const HKDF_MAX_OUTPUT_SIZE: usize = 255 * SHA256_DIGEST_SIZE;
+
 const SHA256_INITIAL_STATE: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
@@ -50,6 +53,33 @@ impl fmt::Display for HexError {
 }
 
 impl Error for HexError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HkdfError {
+    PrkTooShort { length: usize },
+    OutputTooLong { length: usize },
+}
+
+impl fmt::Display for HkdfError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PrkTooShort { length } => {
+                write!(
+                    formatter,
+                    "HKDF-SHA256 PRK must be at least {SHA256_DIGEST_SIZE} bytes, got {length}"
+                )
+            }
+            Self::OutputTooLong { length } => {
+                write!(
+                    formatter,
+                    "HKDF-SHA256 output cannot exceed {HKDF_MAX_OUTPUT_SIZE} bytes, got {length}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for HkdfError {}
 
 pub fn fill_random(output: &mut [u8]) -> io::Result<()> {
     platform::fill_random(output)
@@ -380,6 +410,10 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
 ///
 /// Keys longer than SHA-256's 64-byte block size are hashed first.
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    hmac_sha256_parts(key, &[data])
+}
+
+fn hmac_sha256_parts(key: &[u8], data_parts: &[&[u8]]) -> [u8; 32] {
     let mut key_block = [0_u8; SHA256_BLOCK_SIZE];
 
     if key.len() > SHA256_BLOCK_SIZE {
@@ -405,7 +439,10 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut inner = Sha256::new();
 
     inner.update(&inner_pad);
-    inner.update(data);
+
+    for part in data_parts {
+        inner.update(part);
+    }
 
     let mut inner_digest = inner.finalize();
 
@@ -420,6 +457,52 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     outer_pad.fill(0);
 
     outer.finalize()
+}
+
+/// Performs HKDF-Extract using HMAC-SHA256 as specified by RFC 5869.
+///
+/// An empty salt has the same effect as RFC 5869's omitted-salt default for
+/// HMAC-SHA256 because HMAC pads both keys with zero octets to the block size.
+pub fn hkdf_extract_sha256(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
+    hmac_sha256(salt, ikm)
+}
+
+/// Performs HKDF-Expand using HMAC-SHA256 as specified by RFC 5869.
+pub fn hkdf_expand_sha256(prk: &[u8], info: &[u8], length: usize) -> Result<Vec<u8>, HkdfError> {
+    if prk.len() < SHA256_DIGEST_SIZE {
+        return Err(HkdfError::PrkTooShort { length: prk.len() });
+    }
+
+    if length > HKDF_MAX_OUTPUT_SIZE {
+        return Err(HkdfError::OutputTooLong { length });
+    }
+
+    let block_count = length.div_ceil(SHA256_DIGEST_SIZE);
+    let mut output = Vec::with_capacity(length);
+    let mut previous_block = [0_u8; SHA256_DIGEST_SIZE];
+
+    for block_index in 1..=block_count {
+        let counter =
+            u8::try_from(block_index).expect("validated HKDF block count must fit in one octet");
+
+        let next_block = if block_index == 1 {
+            hmac_sha256_parts(prk, &[info, &[counter]])
+        } else {
+            hmac_sha256_parts(prk, &[&previous_block, info, &[counter]])
+        };
+
+        previous_block.fill(0);
+        previous_block = next_block;
+
+        let remaining = length - output.len();
+        let bytes_to_copy = remaining.min(SHA256_DIGEST_SIZE);
+
+        output.extend_from_slice(&previous_block[..bytes_to_copy]);
+    }
+
+    previous_block.fill(0);
+
+    Ok(output)
 }
 
 fn choice(x: u32, y: u32, z: u32) -> u32 {
@@ -481,8 +564,9 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::{
-        HexError, Sha256, constant_time_eq, decode_hex, encode_base64, encode_base64_url_no_pad,
-        encode_hex, fill_random, hmac_sha256, sha256,
+        HexError, HkdfError, Sha256, constant_time_eq, decode_hex, encode_base64,
+        encode_base64_url_no_pad, encode_hex, fill_random, hkdf_expand_sha256, hkdf_extract_sha256,
+        hmac_sha256, sha256,
     };
 
     #[test]
@@ -760,6 +844,107 @@ f1809a48a497200e046d39ccc7112cd0"
             )),
             "60e431591ee0b67f0d8a26aacbf5b77f\
 8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn hkdf_sha256_matches_rfc_5869_case_1() {
+        let ikm = [0x0b_u8; 22];
+        let salt: Vec<u8> = (0x00..=0x0c).collect();
+        let info: Vec<u8> = (0xf0..=0xf9).collect();
+
+        let prk = hkdf_extract_sha256(&salt, &ikm);
+
+        assert_eq!(
+            encode_hex(&prk),
+            "077709362c2e32df0ddc3f0dc47bba63\
+90b6c73bb50f9c3122ec844ad7c2b3e5"
+        );
+
+        let okm = hkdf_expand_sha256(&prk, &info, 42).unwrap();
+
+        assert_eq!(
+            encode_hex(&okm),
+            "3cb25f25faacd57a90434f64d0362f2a\
+2d2d0a90cf1a5a4c5db02d56ecc4c5bf\
+34007208d5b887185865"
+        );
+    }
+
+    #[test]
+    fn hkdf_sha256_matches_rfc_5869_case_2() {
+        let ikm: Vec<u8> = (0x00..=0x4f).collect();
+        let salt: Vec<u8> = (0x60..=0xaf).collect();
+        let info: Vec<u8> = (0xb0..=0xff).collect();
+
+        let prk = hkdf_extract_sha256(&salt, &ikm);
+
+        assert_eq!(
+            encode_hex(&prk),
+            "06a6b88c5853361a06104c9ceb35b45c\
+ef760014904671014a193f40c15fc244"
+        );
+
+        let okm = hkdf_expand_sha256(&prk, &info, 82).unwrap();
+
+        assert_eq!(
+            encode_hex(&okm),
+            "b11e398dc80327a1c8e7f78c596a4934\
+4f012eda2d4efad8a050cc4c19afa97c\
+59045a99cac7827271cb41c65e590e09\
+da3275600c2f09b8367793a9aca3db71\
+cc30c58179ec3e87c14c01d5c1f3434f\
+1d87"
+        );
+    }
+
+    #[test]
+    fn hkdf_sha256_matches_rfc_5869_case_3() {
+        let ikm = [0x0b_u8; 22];
+
+        let prk = hkdf_extract_sha256(&[], &ikm);
+
+        assert_eq!(
+            encode_hex(&prk),
+            "19ef24a32c717b167f33a91d6f648bdf\
+96596776afdb6377ac434c1c293ccb04"
+        );
+
+        let okm = hkdf_expand_sha256(&prk, &[], 42).unwrap();
+
+        assert_eq!(
+            encode_hex(&okm),
+            "8da4e775a563c18f715f802a063c5a31\
+b8a11f5c5ee1879ec3454e5f3c738d2d\
+9d201395faa4b61a96c8"
+        );
+    }
+
+    #[test]
+    fn hkdf_expand_accepts_zero_length_output() {
+        let prk = [0x42_u8; 32];
+
+        assert_eq!(
+            hkdf_expand_sha256(&prk, b"context", 0).unwrap(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn hkdf_expand_rejects_short_prk() {
+        assert_eq!(
+            hkdf_expand_sha256(&[0_u8; 31], b"", 32),
+            Err(HkdfError::PrkTooShort { length: 31 })
+        );
+    }
+
+    #[test]
+    fn hkdf_expand_rejects_output_beyond_rfc_limit() {
+        let prk = [0_u8; 32];
+
+        assert_eq!(
+            hkdf_expand_sha256(&prk, b"", 8161),
+            Err(HkdfError::OutputTooLong { length: 8161 })
         );
     }
 }

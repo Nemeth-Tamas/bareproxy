@@ -318,10 +318,10 @@ This is where BareProxy stops being a reasonable weekend project.
 * [x] Test SHA-256 against published vectors.
 * [x] Implement HMAC-SHA256.
 * [x] Test HMAC-SHA256 against published vectors.
-* [ ] Implement HKDF-Extract with SHA-256.
-* [ ] Implement HKDF-Expand with SHA-256.
+* [x] Implement HKDF-Extract with SHA-256.
+* [x] Implement HKDF-Expand with SHA-256.
 * [ ] Implement TLS 1.3 HKDF label expansion.
-* [ ] Test HKDF against published vectors.
+* [x] Test HKDF against published vectors.
 * [ ] Ensure secret-bearing temporary buffers are minimized.
 * [ ] Document every implemented cryptographic primitive and its source RFC/specification.
 
