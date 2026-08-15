@@ -17,6 +17,10 @@ const HMAC_OUTER_PAD_BYTE: u8 = 0x5c;
 const SHA256_DIGEST_SIZE: usize = 32;
 const HKDF_MAX_OUTPUT_SIZE: usize = 255 * SHA256_DIGEST_SIZE;
 
+const TLS13_LABEL_PREFIX: &[u8] = b"tls13 ";
+const TLS13_MAX_LABEL_SIZE: usize = u8::MAX as usize - TLS13_LABEL_PREFIX.len();
+const TLS13_MAX_CONTEXT_SIZE: usize = u8::MAX as usize;
+
 const SHA256_INITIAL_STATE: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
@@ -58,6 +62,9 @@ impl Error for HexError {}
 pub enum HkdfError {
     PrkTooShort { length: usize },
     OutputTooLong { length: usize },
+    TlsLabelEmpty,
+    TlsLabelTooLong { length: usize },
+    TlsContextTooLong { length: usize },
 }
 
 impl fmt::Display for HkdfError {
@@ -73,6 +80,19 @@ impl fmt::Display for HkdfError {
                 write!(
                     formatter,
                     "HKDF-SHA256 output cannot exceed {HKDF_MAX_OUTPUT_SIZE} bytes, got {length}"
+                )
+            }
+            Self::TlsLabelEmpty => formatter.write_str("TLS 1.3 HKDF label cannot be empty"),
+            Self::TlsLabelTooLong { length } => {
+                write!(
+                    formatter,
+                    "TLS 1.3 HKDF label cannot exceed {TLS13_MAX_LABEL_SIZE} bytes, got {length}"
+                )
+            }
+            Self::TlsContextTooLong { length } => {
+                write!(
+                    formatter,
+                    "TLS 1.3 HKDF context cannot exceed {TLS13_MAX_CONTEXT_SIZE} bytes, got {length}"
                 )
             }
         }
@@ -505,6 +525,70 @@ pub fn hkdf_expand_sha256(prk: &[u8], info: &[u8], length: usize) -> Result<Vec<
     Ok(output)
 }
 
+/// Performs TLS 1.3 HKDF-Expand-Label using HKDF-SHA256.
+///
+/// `label` is supplied without the mandatory `tls13 ` prefix.
+pub fn tls13_hkdf_expand_label_sha256(
+    secret: &[u8],
+    label: &str,
+    context: &[u8],
+    length: usize,
+) -> Result<Vec<u8>, HkdfError> {
+    if length > HKDF_MAX_OUTPUT_SIZE {
+        return Err(HkdfError::OutputTooLong { length });
+    }
+
+    let info = build_tls13_hkdf_label(label, context, length)?;
+
+    hkdf_expand_sha256(secret, &info, length)
+}
+
+fn build_tls13_hkdf_label(
+    label: &str,
+    context: &[u8],
+    length: usize,
+) -> Result<Vec<u8>, HkdfError> {
+    if label.is_empty() {
+        return Err(HkdfError::TlsLabelEmpty);
+    }
+
+    if label.len() > TLS13_MAX_LABEL_SIZE {
+        return Err(HkdfError::TlsLabelTooLong {
+            length: label.len(),
+        });
+    }
+
+    if context.len() > TLS13_MAX_CONTEXT_SIZE {
+        return Err(HkdfError::TlsContextTooLong {
+            length: context.len(),
+        });
+    }
+
+    let encoded_length =
+        u16::try_from(length).expect("validated HKDF-SHA256 output length must fit in uint16");
+
+    let full_label_length = TLS13_LABEL_PREFIX.len() + label.len();
+
+    let encoded_label_length =
+        u8::try_from(full_label_length).expect("validated TLS 1.3 label length must fit in uint8");
+
+    let encoded_context_length =
+        u8::try_from(context.len()).expect("validated TLS 1.3 context length must fit in uint8");
+
+    let mut info = Vec::with_capacity(2 + 1 + full_label_length + 1 + context.len());
+
+    info.extend_from_slice(&encoded_length.to_be_bytes());
+
+    info.push(encoded_label_length);
+    info.extend_from_slice(TLS13_LABEL_PREFIX);
+    info.extend_from_slice(label.as_bytes());
+
+    info.push(encoded_context_length);
+    info.extend_from_slice(context);
+
+    Ok(info)
+}
+
 fn choice(x: u32, y: u32, z: u32) -> u32 {
     (x & y) ^ (!x & z)
 }
@@ -564,9 +648,9 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::{
-        HexError, HkdfError, Sha256, constant_time_eq, decode_hex, encode_base64,
-        encode_base64_url_no_pad, encode_hex, fill_random, hkdf_expand_sha256, hkdf_extract_sha256,
-        hmac_sha256, sha256,
+        HexError, HkdfError, Sha256, build_tls13_hkdf_label, constant_time_eq, decode_hex,
+        encode_base64, encode_base64_url_no_pad, encode_hex, fill_random, hkdf_expand_sha256,
+        hkdf_extract_sha256, hmac_sha256, sha256, tls13_hkdf_expand_label_sha256,
     };
 
     #[test]
@@ -945,6 +1029,84 @@ b8a11f5c5ee1879ec3454e5f3c738d2d\
         assert_eq!(
             hkdf_expand_sha256(&prk, b"", 8161),
             Err(HkdfError::OutputTooLong { length: 8161 })
+        );
+    }
+
+    #[test]
+    fn tls13_hkdf_label_matches_rfc_8448_info() {
+        let context = decode_hex(
+            "860c06edc07858ee8e78f0e7428c58ed\
+d6b43f2ca3e6e95f02ed063cf0e1cad8",
+        )
+        .unwrap();
+
+        let info = build_tls13_hkdf_label("c hs traffic", &context, 32).unwrap();
+
+        assert_eq!(
+            encode_hex(&info),
+            "002012746c733133206320687320747261\
+6666696320860c06edc07858ee8e78f0e7\
+428c58edd6b43f2ca3e6e95f02ed063cf0\
+e1cad8"
+        );
+    }
+
+    #[test]
+    fn tls13_hkdf_expand_label_matches_rfc_8448_vector() {
+        let secret = decode_hex(
+            "1dc826e93606aa6fdc0aadc12f741b01\
+046aa6b99f691ed221a9f0ca043fbeac",
+        )
+        .unwrap();
+
+        let context = decode_hex(
+            "860c06edc07858ee8e78f0e7428c58ed\
+d6b43f2ca3e6e95f02ed063cf0e1cad8",
+        )
+        .unwrap();
+
+        let expanded =
+            tls13_hkdf_expand_label_sha256(&secret, "c hs traffic", &context, 32).unwrap();
+
+        assert_eq!(
+            encode_hex(&expanded),
+            "b3eddb126e067f35a780b3abf45e2d8f\
+3b1a950738f52e9600746a0e27a55a21"
+        );
+    }
+
+    #[test]
+    fn tls13_hkdf_label_encodes_empty_context() {
+        let info = build_tls13_hkdf_label("key", &[], 16).unwrap();
+
+        assert_eq!(encode_hex(&info), "001009746c733133206b657900");
+    }
+
+    #[test]
+    fn tls13_hkdf_label_rejects_empty_label() {
+        assert_eq!(
+            build_tls13_hkdf_label("", &[], 32),
+            Err(HkdfError::TlsLabelEmpty)
+        );
+    }
+
+    #[test]
+    fn tls13_hkdf_label_rejects_oversized_label() {
+        let label = "x".repeat(250);
+
+        assert_eq!(
+            build_tls13_hkdf_label(&label, &[], 32),
+            Err(HkdfError::TlsLabelTooLong { length: 250 })
+        );
+    }
+
+    #[test]
+    fn tls13_hkdf_label_rejects_oversized_context() {
+        let context = [0_u8; 256];
+
+        assert_eq!(
+            build_tls13_hkdf_label("key", &context, 32),
+            Err(HkdfError::TlsContextTooLong { length: 256 })
         );
     }
 }
