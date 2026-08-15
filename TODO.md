@@ -362,14 +362,14 @@ TLS_CHACHA20_POLY1305_SHA256
 
 Goal: obtain the key-exchange and signing primitives needed for TLS, certificates, and ACME.
 
-* [ ] Implement fixed-width 256-bit integer storage.
-* [ ] Implement limb addition.
-* [ ] Implement limb subtraction.
-* [ ] Implement multiplication.
-* [ ] Implement modular reduction.
-* [ ] Implement modular inversion.
-* [ ] Implement scalar arithmetic modulo the P-256 group order.
-* [ ] Implement P-256 field arithmetic.
+* [x] Implement fixed-width 256-bit integer storage.
+* [x] Implement limb addition.
+* [x] Implement limb subtraction.
+* [x] Implement multiplication.
+* [x] Implement modular reduction.
+* [x] Implement modular inversion.
+* [x] Implement scalar arithmetic modulo the P-256 group order.
+* [x] Implement P-256 field arithmetic.
 * [ ] Represent curve points safely.
 * [ ] Validate curve points.
 * [ ] Implement point addition.

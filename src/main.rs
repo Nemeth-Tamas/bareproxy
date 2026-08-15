@@ -2,6 +2,7 @@ mod app;
 mod config;
 pub mod crypto;
 mod http;
+pub mod p256;
 mod proxy;
 mod server;
 
