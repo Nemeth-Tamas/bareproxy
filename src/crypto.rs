@@ -1,3 +1,28 @@
+//! BareProxy cryptographic foundation.
+//!
+//! Implemented primitives and source specifications:
+//!
+//! - OS-backed secure randomness:
+//!   Unix/WSL reads from `/dev/urandom`, backed by the operating-system CSPRNG.
+//! - Base64 and URL-safe Base64:
+//!   RFC 4648 sections 4 and 5.
+//! - SHA-256:
+//!   FIPS 180-4, with RFC 6234 as an implementation reference.
+//! - HMAC-SHA256:
+//!   RFC 2104, tested with RFC 4231 vectors.
+//! - HKDF-SHA256:
+//!   RFC 5869.
+//! - TLS 1.3 HKDF-Expand-Label:
+//!   RFC 8446 section 7.1, tested with RFC 8448 vectors.
+//!
+//! Secret-handling policy:
+//!
+//! Controlled temporary buffers containing key material or intermediate
+//! secret state are kept stack-sized where practical and explicitly wiped
+//! with volatile writes after use. This reduces residual secret material,
+//! but cannot guarantee clearing compiler-created temporaries, CPU registers,
+//! or copies made outside this module.
+
 use std::{error::Error, fmt, io};
 
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -101,6 +126,27 @@ impl fmt::Display for HkdfError {
 
 impl Error for HkdfError {}
 
+fn wipe_bytes(bytes: &mut [u8]) {
+    for byte in bytes {
+        unsafe {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+}
+
+fn wipe_words(words: &mut [u32]) {
+    for word in words {
+        unsafe {
+            std::ptr::write_volatile(word, 0);
+        }
+    }
+}
+
+/// Fills a buffer using the operating-system cryptographically secure
+/// random source.
+///
+/// The current Unix/WSL backend reads from `/dev/urandom`. Other platforms
+/// fail closed until a native secure-random implementation is provided.
 pub fn fill_random(output: &mut [u8]) -> io::Result<()> {
     platform::fill_random(output)
 }
@@ -408,12 +454,24 @@ impl Sha256 {
         self.state[5] = self.state[5].wrapping_add(f);
         self.state[6] = self.state[6].wrapping_add(g);
         self.state[7] = self.state[7].wrapping_add(h);
+
+        wipe_words(&mut schedule);
     }
 }
 
 impl Default for Sha256 {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Sha256 {
+    fn drop(&mut self) {
+        wipe_words(&mut self.state);
+        wipe_bytes(&mut self.buffer);
+
+        self.buffer_len = 0;
+        self.message_len_bytes = 0;
     }
 }
 
@@ -440,7 +498,7 @@ fn hmac_sha256_parts(key: &[u8], data_parts: &[&[u8]]) -> [u8; 32] {
         let mut hashed_key = sha256(key);
 
         key_block[..hashed_key.len()].copy_from_slice(&hashed_key);
-        hashed_key.fill(0);
+        wipe_bytes(&mut hashed_key);
     } else {
         key_block[..key.len()].copy_from_slice(key);
     }
@@ -471,10 +529,10 @@ fn hmac_sha256_parts(key: &[u8], data_parts: &[&[u8]]) -> [u8; 32] {
     outer.update(&outer_pad);
     outer.update(&inner_digest);
 
-    inner_digest.fill(0);
-    key_block.fill(0);
-    inner_pad.fill(0);
-    outer_pad.fill(0);
+    wipe_bytes(&mut inner_digest);
+    wipe_bytes(&mut key_block);
+    wipe_bytes(&mut inner_pad);
+    wipe_bytes(&mut outer_pad);
 
     outer.finalize()
 }
@@ -511,7 +569,7 @@ pub fn hkdf_expand_sha256(prk: &[u8], info: &[u8], length: usize) -> Result<Vec<
             hmac_sha256_parts(prk, &[&previous_block, info, &[counter]])
         };
 
-        previous_block.fill(0);
+        wipe_bytes(&mut previous_block);
         previous_block = next_block;
 
         let remaining = length - output.len();
@@ -520,12 +578,12 @@ pub fn hkdf_expand_sha256(prk: &[u8], info: &[u8], length: usize) -> Result<Vec<
         output.extend_from_slice(&previous_block[..bytes_to_copy]);
     }
 
-    previous_block.fill(0);
+    wipe_bytes(&mut previous_block);
 
     Ok(output)
 }
 
-/// Performs TLS 1.3 HKDF-Expand-Label using HKDF-SHA256.
+/// Performs TLS 1.3 HKDF-Expand-Label as specified by RFC 8446 section 7.1.
 ///
 /// `label` is supplied without the mandatory `tls13 ` prefix.
 pub fn tls13_hkdf_expand_label_sha256(
@@ -650,8 +708,21 @@ mod tests {
     use super::{
         HexError, HkdfError, Sha256, build_tls13_hkdf_label, constant_time_eq, decode_hex,
         encode_base64, encode_base64_url_no_pad, encode_hex, fill_random, hkdf_expand_sha256,
-        hkdf_extract_sha256, hmac_sha256, sha256, tls13_hkdf_expand_label_sha256,
+        hkdf_extract_sha256, hmac_sha256, sha256, tls13_hkdf_expand_label_sha256, wipe_bytes,
+        wipe_words,
     };
+
+    #[test]
+    fn volatile_wipe_clears_controlled_buffers() {
+        let mut bytes = [0xa5_u8; 64];
+        let mut words = [0xdead_beef_u32; 16];
+
+        wipe_bytes(&mut bytes);
+        wipe_words(&mut words);
+
+        assert_eq!(bytes, [0_u8; 64]);
+        assert_eq!(words, [0_u32; 16]);
+    }
 
     #[test]
     fn constant_time_comparison_accepts_equal_inputs() {

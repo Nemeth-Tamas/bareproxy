@@ -322,8 +322,8 @@ This is where BareProxy stops being a reasonable weekend project.
 * [x] Implement HKDF-Expand with SHA-256.
 * [x] Implement TLS 1.3 HKDF label expansion.
 * [x] Test HKDF against published vectors.
-* [ ] Ensure secret-bearing temporary buffers are minimized.
-* [ ] Document every implemented cryptographic primitive and its source RFC/specification.
+* [x] Ensure secret-bearing temporary buffers are minimized.
+* [x] Document every implemented cryptographic primitive and its source RFC/specification.
 
 **Milestone complete when:** SHA-256/HMAC/HKDF/Base64 functionality passes known external test vectors.
 
