@@ -309,8 +309,8 @@ This is where BareProxy stops being a reasonable weekend project.
 * [x] Obtain cryptographically secure random bytes on Linux/WSL.
 * [x] Read entropy from the OS rather than creating a pseudo-random generator.
 * [x] Define a future abstraction for Windows secure randomness.
-* [ ] Implement constant-time byte comparison where secrets require it.
-* [ ] Implement hexadecimal encoding/decoding utilities.
+* [x] Implement constant-time byte comparison where secrets require it.
+* [x] Implement hexadecimal encoding/decoding utilities.
 * [ ] Implement standard Base64 encoding.
 * [ ] Implement URL-safe Base64 without padding.
 * [ ] Add RFC/test-vector coverage for Base64.

@@ -1,7 +1,95 @@
-use std::io;
+use std::{error::Error, fmt, io};
+
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HexError {
+    OddLength,
+    InvalidDigit { index: usize, byte: u8 },
+}
+
+impl fmt::Display for HexError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OddLength => formatter.write_str("hex input has an odd number of digits"),
+            Self::InvalidDigit { index, byte } => {
+                write!(
+                    formatter,
+                    "invalid hex digit 0x{byte:02x} at byte index {index}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for HexError {}
 
 pub fn fill_random(output: &mut [u8]) -> io::Result<()> {
     platform::fill_random(output)
+}
+
+/// Compares equal-length byte strings without data-dependent early exit.
+///
+/// Length is not treated as secret. Callers comparing secret values should
+/// use fixed-size encodings so both inputs always have the same length.
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let mut difference = 0_u8;
+
+    for (&left_byte, &right_byte) in left.iter().zip(right) {
+        difference |= left_byte ^ right_byte;
+    }
+
+    difference == 0
+}
+
+pub fn encode_hex(input: &[u8]) -> String {
+    let mut output = String::with_capacity(input.len() * 2);
+
+    for &byte in input {
+        output.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+        output.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+    }
+
+    output
+}
+
+pub fn decode_hex(input: &str) -> Result<Vec<u8>, HexError> {
+    let input = input.as_bytes();
+
+    if !input.len().is_multiple_of(2) {
+        return Err(HexError::OddLength);
+    }
+
+    let mut output = Vec::with_capacity(input.len() / 2);
+
+    for index in (0..input.len()).step_by(2) {
+        let high = decode_hex_nibble(input[index]).ok_or(HexError::InvalidDigit {
+            index,
+            byte: input[index],
+        })?;
+
+        let low = decode_hex_nibble(input[index + 1]).ok_or(HexError::InvalidDigit {
+            index: index + 1,
+            byte: input[index + 1],
+        })?;
+
+        output.push((high << 4) | low);
+    }
+
+    Ok(output)
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(unix)]
@@ -38,7 +126,26 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
-    use super::fill_random;
+    use super::{HexError, constant_time_eq, decode_hex, encode_hex, fill_random};
+
+    #[test]
+    fn constant_time_comparison_accepts_equal_inputs() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"BareProxy", b"BareProxy"));
+        assert!(constant_time_eq(&[0_u8; 32], &[0_u8; 32]));
+    }
+
+    #[test]
+    fn constant_time_comparison_rejects_different_inputs() {
+        assert!(!constant_time_eq(b"XareProxy", b"BareProxy"));
+        assert!(!constant_time_eq(b"BareXroxy", b"BareProxy"));
+        assert!(!constant_time_eq(b"BareProxX", b"BareProxy"));
+    }
+
+    #[test]
+    fn constant_time_comparison_rejects_different_lengths() {
+        assert!(!constant_time_eq(b"BareProxy", b"BareProxy!"));
+    }
 
     #[test]
     fn fills_random_bytes_from_operating_system() {
@@ -68,5 +175,66 @@ mod tests {
         let mut output = [];
 
         fill_random(&mut output).unwrap();
+    }
+
+    #[test]
+    fn encodes_hex_in_lowercase() {
+        assert_eq!(
+            encode_hex(&[0x00, 0x01, 0x0f, 0x10, 0xab, 0xcd, 0xef, 0xff]),
+            "00010f10abcdefff"
+        );
+    }
+
+    #[test]
+    fn decodes_lowercase_and_uppercase_hex() {
+        assert_eq!(
+            decode_hex("00010f10abcdefff").unwrap(),
+            vec![0x00, 0x01, 0x0f, 0x10, 0xab, 0xcd, 0xef, 0xff]
+        );
+
+        assert_eq!(
+            decode_hex("00010F10ABCDEFFF").unwrap(),
+            vec![0x00, 0x01, 0x0f, 0x10, 0xab, 0xcd, 0xef, 0xff]
+        );
+    }
+
+    #[test]
+    fn hex_round_trips_every_byte_value() {
+        let input: Vec<u8> = (0..=u8::MAX).collect();
+
+        let encoded = encode_hex(&input);
+        let decoded = decode_hex(&encoded).unwrap();
+
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn hex_accepts_empty_input() {
+        assert_eq!(encode_hex(&[]), "");
+        assert_eq!(decode_hex("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn hex_rejects_odd_length() {
+        assert_eq!(decode_hex("abc"), Err(HexError::OddLength));
+    }
+
+    #[test]
+    fn hex_reports_invalid_digit_position() {
+        assert_eq!(
+            decode_hex("00xz"),
+            Err(HexError::InvalidDigit {
+                index: 2,
+                byte: b'x',
+            })
+        );
+
+        assert_eq!(
+            decode_hex("001z"),
+            Err(HexError::InvalidDigit {
+                index: 3,
+                byte: b'z',
+            })
+        );
     }
 }
