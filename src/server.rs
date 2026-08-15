@@ -18,30 +18,56 @@ const READ_CHUNK_SIZE: usize = 4096;
 #[cfg(test)]
 const RESPONSE_BODY: &str = "BareProxy is alive.\n";
 
+#[derive(Default)]
+struct ServerCounters {
+    requests: AtomicUsize,
+    errors: AtomicUsize,
+}
+
+impl ServerCounters {
+    fn record_request(&self) -> usize {
+        self.requests.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn record_error(&self) -> usize {
+        self.errors.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn snapshot(&self) -> (usize, usize) {
+        (
+            self.requests.load(Ordering::Relaxed),
+            self.errors.load(Ordering::Relaxed),
+        )
+    }
+}
+
 pub fn bind_listener() -> io::Result<TcpListener> {
     TcpListener::bind(DEV_LISTEN_ADDR)
 }
 
 pub fn serve(listener: &TcpListener, configuration: &config::Config) -> io::Result<()> {
     let active_connections = Arc::new(AtomicUsize::new(0));
+    let counters = Arc::new(ServerCounters::default());
 
     loop {
-        let _ = accept_and_spawn(listener, configuration, &active_connections)?;
+        let _ = accept_and_spawn(listener, configuration, &active_connections, &counters)?;
     }
 }
 
 #[cfg(test)]
 pub fn serve_one(listener: &TcpListener, configuration: &config::Config) -> io::Result<()> {
+    let counters = ServerCounters::default();
     let (stream, peer_addr) = listener.accept()?;
     println!("INFO event=connection_accept peer={peer_addr}");
 
-    handle_accepted_connection(stream, peer_addr, configuration)
+    handle_accepted_connection(stream, peer_addr, configuration, &counters)
 }
 
 fn accept_and_spawn(
     listener: &TcpListener,
     configuration: &config::Config,
     active_connections: &Arc<AtomicUsize>,
+    counters: &Arc<ServerCounters>,
 ) -> io::Result<Option<JoinHandle<()>>> {
     let (mut stream, peer_addr) = listener.accept()?;
 
@@ -68,13 +94,14 @@ fn accept_and_spawn(
 
     let configuration = configuration.clone();
     let active_connections = Arc::clone(active_connections);
+    let counters = Arc::clone(counters);
 
     let active = active_connections.fetch_add(1, Ordering::SeqCst) + 1;
 
     println!("INFO event=connection_accept peer={peer_addr} active={active} maximum={maximum}");
 
     Ok(Some(thread::spawn(move || {
-        let result = handle_accepted_connection(stream, peer_addr, &configuration);
+        let result = handle_accepted_connection(stream, peer_addr, &configuration, &counters);
 
         let active = active_connections.fetch_sub(1, Ordering::SeqCst) - 1;
 
@@ -82,7 +109,11 @@ fn accept_and_spawn(
             eprintln!("ERROR event=connection_failure peer={peer_addr} error={error}");
         }
 
-        println!("INFO event=connection_close peer={peer_addr} active={active} maximum={maximum}");
+        let (requests_total, errors_total) = counters.snapshot();
+
+        println!(
+            "INFO event=connection_close peer={peer_addr} active={active} maximum={maximum} requests_total={requests_total} errors_total={errors_total}"
+        );
     })))
 }
 
@@ -90,12 +121,13 @@ fn handle_accepted_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     configuration: &config::Config,
+    counters: &ServerCounters,
 ) -> io::Result<()> {
     let idle_timeout = Duration::from_secs(configuration.client_idle_timeout_seconds());
 
     stream.set_read_timeout(Some(idle_timeout))?;
 
-    match handle_connection(&mut stream, configuration) {
+    match handle_connection(&mut stream, configuration, counters) {
         Ok(()) => Ok(()),
         Err(error) if is_client_idle_timeout(&error) => {
             println!(
@@ -108,8 +140,10 @@ fn handle_accepted_connection(
             Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            let errors_total = counters.record_error();
+
             eprintln!(
-                "WARN event=protocol_error peer={peer_addr} phase=request_head error={error}"
+                "WARN event=protocol_error peer={peer_addr} phase=request_head error={error} errors_total={errors_total}"
             );
 
             write_text_response(&mut stream, http::StatusCode::BadRequest, "Bad Request\n")
@@ -122,7 +156,11 @@ fn handle_accepted_connection(
     }
 }
 
-fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> io::Result<()> {
+fn handle_connection(
+    stream: &mut TcpStream,
+    configuration: &config::Config,
+    counters: &ServerCounters,
+) -> io::Result<()> {
     let peer_addr = stream.peer_addr()?;
     let mut buffered = Vec::new();
     let mut proxy_session = proxy::Session::new(configuration.upstream_timeout_seconds());
@@ -139,8 +177,10 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
             bytes_read,
         } = received;
 
+        let requests_total = counters.record_request();
+
         println!(
-            "INFO event=request peer={peer_addr} method={} target={} version={} host={} content_length={:?} transfer_encoding={} persistence={} head_bytes={} buffered_bytes={}",
+            "INFO event=request peer={peer_addr} method={} target={} version={} host={} content_length={:?} transfer_encoding={} persistence={} head_bytes={} buffered_bytes={} requests_total={requests_total}",
             request.method,
             request.target,
             request.version,
@@ -159,8 +199,10 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
         let route = match select_route(&request, configuration) {
             Ok(route) => route,
             Err(status) => {
+                let errors_total = counters.record_error();
+
                 eprintln!(
-                    "WARN event=protocol_error peer={peer_addr} phase=route status={} reason={}",
+                    "WARN event=protocol_error peer={peer_addr} phase=route status={} reason={} errors_total={errors_total}",
                     status.code(),
                     status.reason_phrase()
                 );
@@ -183,8 +225,10 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
                         println!("INFO event=upgrade_tunnel_close peer={peer_addr}");
                     }
                     Err(error) => {
+                        let errors_total = counters.record_error();
+
                         eprintln!(
-                            "ERROR event=upgrade_tunnel_failure peer={peer_addr} error={error}"
+                            "ERROR event=upgrade_tunnel_failure peer={peer_addr} error={error} errors_total={errors_total}"
                         );
                     }
                 }
@@ -217,8 +261,10 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
                 return Ok(());
             }
             Err(proxy::ProxyError::InvalidClientBody { message }) => {
+                let errors_total = counters.record_error();
+
                 eprintln!(
-                    "WARN event=protocol_error peer={peer_addr} phase=request_body error={message}"
+                    "WARN event=protocol_error peer={peer_addr} phase=request_body error={message} errors_total={errors_total}"
                 );
 
                 return write_text_response(stream, http::StatusCode::BadRequest, "Bad Request\n");
@@ -227,8 +273,10 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
                 return Err(io::Error::new(kind, message));
             }
             Err(proxy::ProxyError::ResponseStarted { message }) => {
+                let errors_total = counters.record_error();
+
                 eprintln!(
-                    "ERROR event=upstream_failure peer={peer_addr} phase=response_stream error={message}"
+                    "ERROR event=upstream_failure peer={peer_addr} phase=response_stream error={message} errors_total={errors_total}"
                 );
 
                 let _ = stream.shutdown(Shutdown::Both);
@@ -236,8 +284,10 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
                 return Ok(());
             }
             Err(error) if error.is_upstream_timeout() => {
+                let errors_total = counters.record_error();
+
                 eprintln!(
-                    "ERROR event=upstream_failure peer={peer_addr} kind=timeout error={error}"
+                    "ERROR event=upstream_failure peer={peer_addr} kind=timeout error={error} errors_total={errors_total}"
                 );
 
                 return write_text_response(
@@ -247,7 +297,11 @@ fn handle_connection(stream: &mut TcpStream, configuration: &config::Config) -> 
                 );
             }
             Err(error) => {
-                eprintln!("ERROR event=upstream_failure peer={peer_addr} error={error}");
+                let errors_total = counters.record_error();
+
+                eprintln!(
+                    "ERROR event=upstream_failure peer={peer_addr} error={error} errors_total={errors_total}"
+                );
 
                 return write_text_response(stream, http::StatusCode::BadGateway, "Bad Gateway\n");
             }
@@ -396,7 +450,8 @@ mod tests {
     use crate::{config, http};
 
     use super::{
-        RESPONSE_BODY, accept_and_spawn, build_response, read_request_head, select_route, serve_one,
+        RESPONSE_BODY, ServerCounters, accept_and_spawn, build_response, read_request_head,
+        select_route, serve_one,
     };
 
     struct FragmentedReader {
@@ -784,17 +839,28 @@ second works\n",
         let bare_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let bare_address = bare_listener.local_addr().unwrap();
         let active_connections = Arc::new(AtomicUsize::new(0));
+        let counters = Arc::new(ServerCounters::default());
 
         let active_for_server = Arc::clone(&active_connections);
 
         let bare_thread = thread::spawn(move || {
-            let first = accept_and_spawn(&bare_listener, &configuration, &active_for_server)
-                .unwrap()
-                .unwrap();
+            let first = accept_and_spawn(
+                &bare_listener,
+                &configuration,
+                &active_for_server,
+                &counters,
+            )
+            .unwrap()
+            .unwrap();
 
-            let second = accept_and_spawn(&bare_listener, &configuration, &active_for_server)
-                .unwrap()
-                .unwrap();
+            let second = accept_and_spawn(
+                &bare_listener,
+                &configuration,
+                &active_for_server,
+                &counters,
+            )
+            .unwrap()
+            .unwrap();
 
             first.join().unwrap();
             second.join().unwrap();
@@ -1046,15 +1112,26 @@ localhost -> 127.0.0.1:3000",
         let bare_address = bare_listener.local_addr().unwrap();
 
         let active_connections = Arc::new(AtomicUsize::new(0));
+        let counters = Arc::new(ServerCounters::default());
         let active_for_server = Arc::clone(&active_connections);
 
         let bare_thread = thread::spawn(move || {
-            let first = accept_and_spawn(&bare_listener, &configuration, &active_for_server)
-                .unwrap()
-                .unwrap();
+            let first = accept_and_spawn(
+                &bare_listener,
+                &configuration,
+                &active_for_server,
+                &counters,
+            )
+            .unwrap()
+            .unwrap();
 
-            let rejected =
-                accept_and_spawn(&bare_listener, &configuration, &active_for_server).unwrap();
+            let rejected = accept_and_spawn(
+                &bare_listener,
+                &configuration,
+                &active_for_server,
+                &counters,
+            )
+            .unwrap();
 
             assert!(rejected.is_none());
 
@@ -1547,5 +1624,115 @@ Connection: close\r\n\
                 .windows(b"X-Safe: yes\r\n".len())
                 .any(|window| window == b"X-Safe: yes\r\n")
         );
+    }
+
+    #[test]
+    fn failed_request_does_not_terminate_listener() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 512];
+
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let bytes_read = stream.read(&mut chunk).unwrap();
+
+                assert!(bytes_read > 0);
+
+                request.extend_from_slice(&chunk[..bytes_read]);
+            }
+
+            assert!(request.starts_with(b"GET /still-alive HTTP/1.1\r\n"));
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+Content-Length: 6\r\n\
+Connection: close\r\n\
+\r\n\
+ALIVE\n",
+                )
+                .unwrap();
+        });
+
+        let configuration =
+            config::parse(&format!("localhost -> 127.0.0.1:{upstream_port}")).unwrap();
+
+        let bare_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bare_address = bare_listener.local_addr().unwrap();
+
+        let active_connections = Arc::new(AtomicUsize::new(0));
+        let counters = Arc::new(ServerCounters::default());
+
+        let active_for_server = Arc::clone(&active_connections);
+        let counters_for_server = Arc::clone(&counters);
+
+        let bare_thread = thread::spawn(move || {
+            let failed = accept_and_spawn(
+                &bare_listener,
+                &configuration,
+                &active_for_server,
+                &counters_for_server,
+            )
+            .unwrap()
+            .unwrap();
+
+            let successful = accept_and_spawn(
+                &bare_listener,
+                &configuration,
+                &active_for_server,
+                &counters_for_server,
+            )
+            .unwrap()
+            .unwrap();
+
+            failed.join().unwrap();
+            successful.join().unwrap();
+        });
+
+        let mut bad_client = TcpStream::connect(bare_address).unwrap();
+
+        bad_client
+            .write_all(
+                b"POST /bad HTTP/1.1\r\n\
+Host: localhost\r\n\
+Content-Length: 4\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+0\r\n\
+\r\n",
+            )
+            .unwrap();
+
+        let mut bad_response = Vec::new();
+        bad_client.read_to_end(&mut bad_response).unwrap();
+
+        assert!(bad_response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+
+        let mut good_client = TcpStream::connect(bare_address).unwrap();
+
+        good_client
+            .write_all(
+                b"GET /still-alive HTTP/1.1\r\n\
+Host: localhost\r\n\
+Connection: close\r\n\
+\r\n",
+            )
+            .unwrap();
+
+        let mut good_response = Vec::new();
+        good_client.read_to_end(&mut good_response).unwrap();
+
+        bare_thread.join().unwrap();
+        upstream_thread.join().unwrap();
+
+        assert!(good_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(good_response.ends_with(b"ALIVE\n"));
+
+        assert_eq!(counters.snapshot(), (1, 1));
+        assert_eq!(active_connections.load(Ordering::SeqCst), 0);
     }
 }
