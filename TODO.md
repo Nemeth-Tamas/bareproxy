@@ -311,9 +311,9 @@ This is where BareProxy stops being a reasonable weekend project.
 * [x] Define a future abstraction for Windows secure randomness.
 * [x] Implement constant-time byte comparison where secrets require it.
 * [x] Implement hexadecimal encoding/decoding utilities.
-* [ ] Implement standard Base64 encoding.
-* [ ] Implement URL-safe Base64 without padding.
-* [ ] Add RFC/test-vector coverage for Base64.
+* [x] Implement standard Base64 encoding.
+* [x] Implement URL-safe Base64 without padding.
+* [x] Add RFC/test-vector coverage for Base64.
 * [ ] Implement SHA-256.
 * [ ] Test SHA-256 against published vectors.
 * [ ] Implement HMAC-SHA256.
