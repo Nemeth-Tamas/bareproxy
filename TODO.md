@@ -370,15 +370,15 @@ Goal: obtain the key-exchange and signing primitives needed for TLS, certificate
 * [x] Implement modular inversion.
 * [x] Implement scalar arithmetic modulo the P-256 group order.
 * [x] Implement P-256 field arithmetic.
-* [ ] Represent curve points safely.
-* [ ] Validate curve points.
-* [ ] Implement point addition.
-* [ ] Implement point doubling.
-* [ ] Implement scalar multiplication.
-* [ ] Implement generator multiplication.
-* [ ] Implement SEC1 uncompressed point encoding.
-* [ ] Implement SEC1 point decoding.
-* [ ] Reject invalid points.
+* [x] Represent curve points safely.
+* [x] Validate curve points.
+* [x] Implement point addition.
+* [x] Implement point doubling.
+* [x] Implement scalar multiplication.
+* [x] Implement generator multiplication.
+* [x] Implement SEC1 uncompressed point encoding.
+* [x] Implement SEC1 point decoding.
+* [x] Reject invalid points.
 * [ ] Implement P-256 ECDH.
 * [ ] Implement ECDSA signing with SHA-256.
 * [ ] Implement ECDSA verification with SHA-256.
