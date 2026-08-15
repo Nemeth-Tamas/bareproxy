@@ -339,13 +339,13 @@ Initial target:
 TLS_CHACHA20_POLY1305_SHA256
 ```
 
-* [ ] Implement ChaCha20 quarter-round.
-* [ ] Implement ChaCha20 block generation.
-* [ ] Implement ChaCha20 stream encryption.
-* [ ] Verify ChaCha20 against RFC test vectors.
-* [ ] Implement Poly1305 field arithmetic.
-* [ ] Implement Poly1305 authentication.
-* [ ] Verify Poly1305 against RFC test vectors.
+* [x] Implement ChaCha20 quarter-round.
+* [x] Implement ChaCha20 block generation.
+* [x] Implement ChaCha20 stream encryption.
+* [x] Verify ChaCha20 against RFC test vectors.
+* [x] Implement Poly1305 field arithmetic.
+* [x] Implement Poly1305 authentication.
+* [x] Verify Poly1305 against RFC test vectors.
 * [ ] Implement ChaCha20-Poly1305 AEAD.
 * [ ] Implement additional authenticated data handling.
 * [ ] Implement nonce construction.

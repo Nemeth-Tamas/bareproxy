@@ -14,6 +14,10 @@
 //!   RFC 5869.
 //! - TLS 1.3 HKDF-Expand-Label:
 //!   RFC 8446 section 7.1, tested with RFC 8448 vectors.
+//! - ChaCha20:
+//!   RFC 8439 sections 2.1 through 2.4.
+//! - Poly1305:
+//!   RFC 8439 section 2.5.
 //!
 //! Secret-handling policy:
 //!
@@ -45,6 +49,13 @@ const HKDF_MAX_OUTPUT_SIZE: usize = 255 * SHA256_DIGEST_SIZE;
 const TLS13_LABEL_PREFIX: &[u8] = b"tls13 ";
 const TLS13_MAX_LABEL_SIZE: usize = u8::MAX as usize - TLS13_LABEL_PREFIX.len();
 const TLS13_MAX_CONTEXT_SIZE: usize = u8::MAX as usize;
+
+const CHACHA20_BLOCK_SIZE: usize = 64;
+const CHACHA20_CONSTANTS: [u32; 4] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574];
+
+const POLY1305_BLOCK_SIZE: usize = 16;
+const POLY1305_LIMB_MASK: u64 = (1_u64 << 26) - 1;
+const POLY1305_FULL_BLOCK_HIGH_BIT: u64 = 1_u64 << 24;
 
 const SHA256_INITIAL_STATE: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
@@ -125,6 +136,26 @@ impl fmt::Display for HkdfError {
 }
 
 impl Error for HkdfError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChaCha20Error {
+    CounterExhausted { counter: u32, blocks: u64 },
+}
+
+impl fmt::Display for ChaCha20Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CounterExhausted { counter, blocks } => {
+                write!(
+                    formatter,
+                    "ChaCha20 counter {counter} cannot cover {blocks} block(s)"
+                )
+            }
+        }
+    }
+}
+
+impl Error for ChaCha20Error {}
 
 fn wipe_bytes(bytes: &mut [u8]) {
     for byte in bytes {
@@ -671,6 +702,337 @@ fn small_sigma1(value: u32) -> u32 {
     value.rotate_right(17) ^ value.rotate_right(19) ^ (value >> 10)
 }
 
+/// Performs the ChaCha quarter-round from RFC 8439 section 2.1.
+fn chacha20_quarter_round(mut a: u32, mut b: u32, mut c: u32, mut d: u32) -> (u32, u32, u32, u32) {
+    a = a.wrapping_add(b);
+    d ^= a;
+    d = d.rotate_left(16);
+
+    c = c.wrapping_add(d);
+    b ^= c;
+    b = b.rotate_left(12);
+
+    a = a.wrapping_add(b);
+    d ^= a;
+    d = d.rotate_left(8);
+
+    c = c.wrapping_add(d);
+    b ^= c;
+    b = b.rotate_left(7);
+
+    (a, b, c, d)
+}
+
+fn chacha20_quarter_round_state(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    let (a_value, b_value, c_value, d_value) =
+        chacha20_quarter_round(state[a], state[b], state[c], state[d]);
+
+    state[a] = a_value;
+    state[b] = b_value;
+    state[c] = c_value;
+    state[d] = d_value;
+}
+
+/// Generates one 64-byte ChaCha20 keystream block as specified by RFC 8439.
+///
+/// `nonce` must never repeat for the same key.
+pub fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; CHACHA20_BLOCK_SIZE] {
+    let mut state = [0_u32; 16];
+
+    state[..4].copy_from_slice(&CHACHA20_CONSTANTS);
+
+    for (word, bytes) in state[4..12].iter_mut().zip(key.chunks_exact(4)) {
+        *word = read_u32_le(bytes);
+    }
+
+    state[12] = counter;
+
+    for (word, bytes) in state[13..16].iter_mut().zip(nonce.chunks_exact(4)) {
+        *word = read_u32_le(bytes);
+    }
+
+    let mut initial_state = state;
+
+    for _ in 0..10 {
+        chacha20_quarter_round_state(&mut state, 0, 4, 8, 12);
+        chacha20_quarter_round_state(&mut state, 1, 5, 9, 13);
+        chacha20_quarter_round_state(&mut state, 2, 6, 10, 14);
+        chacha20_quarter_round_state(&mut state, 3, 7, 11, 15);
+
+        chacha20_quarter_round_state(&mut state, 0, 5, 10, 15);
+        chacha20_quarter_round_state(&mut state, 1, 6, 11, 12);
+        chacha20_quarter_round_state(&mut state, 2, 7, 8, 13);
+        chacha20_quarter_round_state(&mut state, 3, 4, 9, 14);
+    }
+
+    for (word, initial_word) in state.iter_mut().zip(&initial_state) {
+        *word = word.wrapping_add(*initial_word);
+    }
+
+    let mut output = [0_u8; CHACHA20_BLOCK_SIZE];
+
+    for (word, bytes) in state.iter().zip(output.chunks_exact_mut(4)) {
+        bytes.copy_from_slice(&word.to_le_bytes());
+    }
+
+    wipe_words(&mut state);
+    wipe_words(&mut initial_state);
+
+    output
+}
+
+/// Applies the ChaCha20 stream cipher from RFC 8439 section 2.4.
+///
+/// Encryption and decryption are the same XOR operation.
+pub fn chacha20_xor(
+    key: &[u8; 32],
+    counter: u32,
+    nonce: &[u8; 12],
+    input: &[u8],
+) -> Result<Vec<u8>, ChaCha20Error> {
+    let block_count = input.len().div_ceil(CHACHA20_BLOCK_SIZE);
+
+    let block_count = u64::try_from(block_count).expect("ChaCha20 block count must fit in u64");
+
+    let available_blocks = u64::from(u32::MAX - counter) + 1;
+
+    if block_count > available_blocks {
+        return Err(ChaCha20Error::CounterExhausted {
+            counter,
+            blocks: block_count,
+        });
+    }
+
+    let mut output = input.to_vec();
+
+    for (block_index, chunk) in output.chunks_mut(CHACHA20_BLOCK_SIZE).enumerate() {
+        let block_offset =
+            u32::try_from(block_index).expect("validated ChaCha20 block offset must fit in u32");
+
+        let block_counter = counter
+            .checked_add(block_offset)
+            .expect("validated ChaCha20 counter must not overflow");
+
+        let mut key_stream = chacha20_block(key, block_counter, nonce);
+
+        for (byte, key_byte) in chunk.iter_mut().zip(&key_stream) {
+            *byte ^= key_byte;
+        }
+
+        wipe_bytes(&mut key_stream);
+    }
+
+    Ok(output)
+}
+
+/// Computes a Poly1305 authentication tag as specified by RFC 8439.
+///
+/// The 32-byte key is a one-time key and must not be reused for unrelated
+/// messages.
+pub fn poly1305_authenticate(key: &[u8; 32], message: &[u8]) -> [u8; 16] {
+    let mut r_bytes = [0_u8; 16];
+
+    r_bytes.copy_from_slice(&key[..16]);
+
+    for index in [3, 7, 11, 15] {
+        r_bytes[index] &= 0x0f;
+    }
+
+    for index in [4, 8, 12] {
+        r_bytes[index] &= 0xfc;
+    }
+
+    let r0 = u64::from(read_u32_le(&r_bytes[0..4])) & POLY1305_LIMB_MASK;
+
+    let r1 = (u64::from(read_u32_le(&r_bytes[3..7])) >> 2) & POLY1305_LIMB_MASK;
+
+    let r2 = (u64::from(read_u32_le(&r_bytes[6..10])) >> 4) & POLY1305_LIMB_MASK;
+
+    let r3 = (u64::from(read_u32_le(&r_bytes[9..13])) >> 6) & POLY1305_LIMB_MASK;
+
+    let r4 = (u64::from(read_u32_le(&r_bytes[12..16])) >> 8) & POLY1305_LIMB_MASK;
+
+    let r1_times_5 = r1 * 5;
+    let r2_times_5 = r2 * 5;
+    let r3_times_5 = r3 * 5;
+    let r4_times_5 = r4 * 5;
+
+    let mut h0 = 0_u64;
+    let mut h1 = 0_u64;
+    let mut h2 = 0_u64;
+    let mut h3 = 0_u64;
+    let mut h4 = 0_u64;
+
+    for chunk in message.chunks(POLY1305_BLOCK_SIZE) {
+        let mut block = [0_u8; POLY1305_BLOCK_SIZE];
+
+        block[..chunk.len()].copy_from_slice(chunk);
+
+        let high_bit = if chunk.len() == POLY1305_BLOCK_SIZE {
+            POLY1305_FULL_BLOCK_HIGH_BIT
+        } else {
+            block[chunk.len()] = 1;
+            0
+        };
+
+        h0 += u64::from(read_u32_le(&block[0..4])) & POLY1305_LIMB_MASK;
+
+        h1 += (u64::from(read_u32_le(&block[3..7])) >> 2) & POLY1305_LIMB_MASK;
+
+        h2 += (u64::from(read_u32_le(&block[6..10])) >> 4) & POLY1305_LIMB_MASK;
+
+        h3 += (u64::from(read_u32_le(&block[9..13])) >> 6) & POLY1305_LIMB_MASK;
+
+        h4 += (u64::from(read_u32_le(&block[12..16])) >> 8) | high_bit;
+
+        let mut d0 =
+            h0 * r0 + h1 * r4_times_5 + h2 * r3_times_5 + h3 * r2_times_5 + h4 * r1_times_5;
+
+        let mut d1 = h0 * r1 + h1 * r0 + h2 * r4_times_5 + h3 * r3_times_5 + h4 * r2_times_5;
+
+        let mut d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * r4_times_5 + h4 * r3_times_5;
+
+        let mut d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * r4_times_5;
+
+        let d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
+
+        let mut carry = d0 >> 26;
+        h0 = d0 & POLY1305_LIMB_MASK;
+        d1 += carry;
+
+        carry = d1 >> 26;
+        h1 = d1 & POLY1305_LIMB_MASK;
+        d2 += carry;
+
+        carry = d2 >> 26;
+        h2 = d2 & POLY1305_LIMB_MASK;
+        d3 += carry;
+
+        carry = d3 >> 26;
+        h3 = d3 & POLY1305_LIMB_MASK;
+
+        let mut d4 = d4 + carry;
+
+        carry = d4 >> 26;
+        h4 = d4 & POLY1305_LIMB_MASK;
+
+        h0 += carry * 5;
+
+        carry = h0 >> 26;
+        h0 &= POLY1305_LIMB_MASK;
+        h1 += carry;
+
+        wipe_bytes(&mut block);
+
+        d0 = 0;
+        d1 = 0;
+        d2 = 0;
+        d3 = 0;
+        d4 = 0;
+
+        std::hint::black_box((d0, d1, d2, d3, d4));
+    }
+
+    let mut carry = h1 >> 26;
+    h1 &= POLY1305_LIMB_MASK;
+    h2 += carry;
+
+    carry = h2 >> 26;
+    h2 &= POLY1305_LIMB_MASK;
+    h3 += carry;
+
+    carry = h3 >> 26;
+    h3 &= POLY1305_LIMB_MASK;
+    h4 += carry;
+
+    carry = h4 >> 26;
+    h4 &= POLY1305_LIMB_MASK;
+    h0 += carry * 5;
+
+    carry = h0 >> 26;
+    h0 &= POLY1305_LIMB_MASK;
+    h1 += carry;
+
+    let mut g0 = h0 + 5;
+
+    carry = g0 >> 26;
+    g0 &= POLY1305_LIMB_MASK;
+
+    let mut g1 = h1 + carry;
+
+    carry = g1 >> 26;
+    g1 &= POLY1305_LIMB_MASK;
+
+    let mut g2 = h2 + carry;
+
+    carry = g2 >> 26;
+    g2 &= POLY1305_LIMB_MASK;
+
+    let mut g3 = h3 + carry;
+
+    carry = g3 >> 26;
+    g3 &= POLY1305_LIMB_MASK;
+
+    let g4 = h4.wrapping_add(carry).wrapping_sub(1_u64 << 26);
+
+    let select_g = (g4 >> 63).wrapping_sub(1);
+    let select_h = !select_g;
+
+    h0 = (h0 & select_h) | (g0 & select_g);
+    h1 = (h1 & select_h) | (g1 & select_g);
+    h2 = (h2 & select_h) | (g2 & select_g);
+    h3 = (h3 & select_h) | (g3 & select_g);
+    h4 = (h4 & select_h) | (g4 & select_g);
+
+    let word_mask = u64::from(u32::MAX);
+
+    let mut f0 = (h0 | (h1 << 26)) & word_mask;
+
+    let mut f1 = ((h1 >> 6) | (h2 << 20)) & word_mask;
+
+    let mut f2 = ((h2 >> 12) | (h3 << 14)) & word_mask;
+
+    let mut f3 = ((h3 >> 18) | (h4 << 8)) & word_mask;
+
+    let pad0 = u64::from(read_u32_le(&key[16..20]));
+    let pad1 = u64::from(read_u32_le(&key[20..24]));
+    let pad2 = u64::from(read_u32_le(&key[24..28]));
+    let pad3 = u64::from(read_u32_le(&key[28..32]));
+
+    f0 += pad0;
+
+    f1 += pad1 + (f0 >> 32);
+    f0 &= word_mask;
+
+    f2 += pad2 + (f1 >> 32);
+    f1 &= word_mask;
+
+    f3 += pad3 + (f2 >> 32);
+    f2 &= word_mask;
+    f3 &= word_mask;
+
+    let final_words = [f0, f1, f2, f3];
+    let mut tag = [0_u8; 16];
+
+    for (word, bytes) in final_words.iter().zip(tag.chunks_exact_mut(4)) {
+        let word = u32::try_from(*word).expect("reduced Poly1305 word must fit in u32");
+
+        bytes.copy_from_slice(&word.to_le_bytes());
+    }
+
+    wipe_bytes(&mut r_bytes);
+
+    tag
+}
+
+fn read_u32_le(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(
+        bytes
+            .try_into()
+            .expect("little-endian word must contain exactly four bytes"),
+    )
+}
+
 #[cfg(unix)]
 mod platform {
     use std::{
@@ -706,9 +1068,10 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::{
-        HexError, HkdfError, Sha256, build_tls13_hkdf_label, constant_time_eq, decode_hex,
-        encode_base64, encode_base64_url_no_pad, encode_hex, fill_random, hkdf_expand_sha256,
-        hkdf_extract_sha256, hmac_sha256, sha256, tls13_hkdf_expand_label_sha256, wipe_bytes,
+        HexError, HkdfError, Sha256, build_tls13_hkdf_label, chacha20_block,
+        chacha20_quarter_round, chacha20_xor, constant_time_eq, decode_hex, encode_base64,
+        encode_base64_url_no_pad, encode_hex, fill_random, hkdf_expand_sha256, hkdf_extract_sha256,
+        hmac_sha256, poly1305_authenticate, sha256, tls13_hkdf_expand_label_sha256, wipe_bytes,
         wipe_words,
     };
 
@@ -1178,6 +1541,109 @@ d6b43f2ca3e6e95f02ed063cf0e1cad8",
         assert_eq!(
             build_tls13_hkdf_label("key", &context, 32),
             Err(HkdfError::TlsContextTooLong { length: 256 })
+        );
+    }
+
+    #[test]
+    fn chacha20_quarter_round_matches_rfc_8439_vector() {
+        assert_eq!(
+            chacha20_quarter_round(0x11111111, 0x01020304, 0x9b8d6f43, 0x01234567,),
+            (0xea2a92f4, 0xcb1cf8ce, 0x4581472e, 0x5881c4bb,)
+        );
+    }
+
+    #[test]
+    fn chacha20_block_matches_rfc_8439_vector() {
+        let key: [u8; 32] = decode_hex(
+            "000102030405060708090a0b0c0d0e0f\
+101112131415161718191a1b1c1d1e1f",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        let nonce: [u8; 12] = decode_hex("000000090000004a00000000")
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        let block = chacha20_block(&key, 1, &nonce);
+
+        assert_eq!(
+            encode_hex(&block),
+            "10f1e7e4d13b5915500fdd1fa32071c4\
+c7d1f4c733c068030422aa9ac3d46c4e\
+d2826446079faa0914c2d705d98b02a2\
+b5129cd1de164eb9cbd083e8a2503c4e"
+        );
+    }
+
+    #[test]
+    fn chacha20_stream_matches_rfc_8439_vector() {
+        let key: [u8; 32] = decode_hex(
+            "000102030405060708090a0b0c0d0e0f\
+101112131415161718191a1b1c1d1e1f",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        let nonce: [u8; 12] = decode_hex("000000000000004a00000000")
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        let plaintext = b"Ladies and Gentlemen of the class of '99: \
+If I could offer you only one tip for the future, \
+sunscreen would be it.";
+
+        let ciphertext = chacha20_xor(&key, 1, &nonce, plaintext).unwrap();
+
+        assert_eq!(
+            encode_hex(&ciphertext),
+            "6e2e359a2568f98041ba0728dd0d6981\
+e97e7aec1d4360c20a27afccfd9fae0b\
+f91b65c5524733ab8f593dabcd62b357\
+1639d624e65152ab8f530c359f0861d8\
+07ca0dbf500d6a6156a38e088a22b65e\
+52bc514d16ccf806818ce91ab7793736\
+5af90bbf74a35be6b40b8eedf2785e42\
+874d"
+        );
+
+        let decrypted = chacha20_xor(&key, 1, &nonce, &ciphertext).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn poly1305_matches_rfc_8439_vector() {
+        let key: [u8; 32] = decode_hex(
+            "85d6be7857556d337f4452fe42d506a8\
+0103808afb0db2fd4abff6af4149f51b",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        let tag = poly1305_authenticate(&key, b"Cryptographic Forum Research Group");
+
+        assert_eq!(encode_hex(&tag), "a8061dc1305136c6c22b8baf0c0127a9");
+    }
+
+    #[test]
+    fn poly1305_empty_message_returns_additive_key() {
+        let key: [u8; 32] = decode_hex(
+            "00000000000000000000000000000000\
+0102030405060708090a0b0c0d0e0f10",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        assert_eq!(
+            encode_hex(&poly1305_authenticate(&key, b"")),
+            "0102030405060708090a0b0c0d0e0f10"
         );
     }
 }
