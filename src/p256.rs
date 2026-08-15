@@ -504,7 +504,7 @@ impl P256Point {
         self.0.map(|point| (point.x.value(), point.y.value()))
     }
 
-    pub fn add(self, other: Self) -> Self {
+    pub fn add_point(self, other: Self) -> Self {
         JacobianPoint::from_point(self)
             .add(JacobianPoint::from_point(other))
             .to_point()
@@ -576,6 +576,56 @@ impl P256Point {
 
 pub fn p256_generator_multiply(scalar: Scalar) -> P256Point {
     P256Point::generator().multiply(scalar)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum P256EcdhError {
+    ZeroPrivateScalar,
+    IdentityPeerPublicKey,
+    SharedPointAtInfinity,
+}
+
+impl fmt::Display for P256EcdhError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroPrivateScalar => {
+                formatter.write_str("P-256 ECDH private scalar cannot be zero")
+            }
+            Self::IdentityPeerPublicKey => {
+                formatter.write_str("P-256 ECDH peer public key cannot be the identity")
+            }
+            Self::SharedPointAtInfinity => {
+                formatter.write_str("P-256 ECDH produced the identity point")
+            }
+        }
+    }
+}
+
+impl Error for P256EcdhError {}
+
+/// Computes the raw P-256 ECDH shared secret.
+///
+/// Following RFC 5903, the returned 32-byte secret is the big-endian
+/// x-coordinate of the elliptic-curve Diffie-Hellman common point.
+pub fn p256_ecdh(
+    private_scalar: Scalar,
+    peer_public_key: P256Point,
+) -> Result<[u8; 32], P256EcdhError> {
+    if private_scalar == Scalar::ZERO {
+        return Err(P256EcdhError::ZeroPrivateScalar);
+    }
+
+    if peer_public_key.is_identity() {
+        return Err(P256EcdhError::IdentityPeerPublicKey);
+    }
+
+    let shared_point = peer_public_key.multiply(private_scalar);
+
+    let Some((shared_x, _)) = shared_point.coordinates() else {
+        return Err(P256EcdhError::SharedPointAtInfinity);
+    };
+
+    Ok(shared_x.to_be_bytes())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -744,8 +794,18 @@ fn field_triple(value: FieldElement) -> FieldElement {
 mod tests {
     use super::{
         FieldElement, P256_FIELD_MODULUS, P256_GENERATOR_X, P256_GENERATOR_Y, P256_GROUP_ORDER,
-        P256Point, P256PointError, Scalar, Uint256, p256_generator_multiply,
+        P256EcdhError, P256Point, P256PointError, Scalar, Uint256, p256_ecdh,
+        p256_generator_multiply,
     };
+
+    fn uint256_from_hex(input: &str) -> Uint256 {
+        let bytes: [u8; 32] = crate::crypto::decode_hex(input)
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        Uint256::from_be_bytes(bytes)
+    }
 
     #[test]
     fn uint256_big_endian_round_trip() {
@@ -904,9 +964,9 @@ mod tests {
     fn p256_point_identity_behaves_as_group_identity() {
         let generator = P256Point::generator();
 
-        assert_eq!(generator.add(P256Point::IDENTITY), generator);
+        assert_eq!(generator.add_point(P256Point::IDENTITY), generator);
 
-        assert_eq!(P256Point::IDENTITY.add(generator), generator);
+        assert_eq!(P256Point::IDENTITY.add_point(generator), generator);
 
         assert_eq!(P256Point::IDENTITY.double(), P256Point::IDENTITY);
     }
@@ -934,7 +994,7 @@ mod tests {
             Some((expected_x, expected_y))
         );
 
-        assert_eq!(generator.add(generator), generator.double());
+        assert_eq!(generator.add_point(generator), generator.double());
     }
 
     #[test]
@@ -967,7 +1027,11 @@ mod tests {
 
         let negative_generator = P256Point::from_coordinates(P256_GENERATOR_X, negative_y).unwrap();
 
-        assert!(P256Point::generator().add(negative_generator).is_identity());
+        assert!(
+            P256Point::generator()
+                .add_point(negative_generator)
+                .is_identity()
+        );
     }
 
     #[test]
@@ -1028,6 +1092,98 @@ mod tests {
         assert_eq!(
             P256Point::IDENTITY.to_sec1_uncompressed(),
             Err(P256PointError::IdentityCannotBeEncoded)
+        );
+    }
+
+    #[test]
+    fn p256_generator_multiplication_matches_rfc_5903_vector() {
+        let private_scalar = Scalar::new(uint256_from_hex(
+            "c88f01f510d9ac3f70a292daa2316de5\
+44e9aab8afe84049c62a9c57862d1433",
+        ));
+
+        let expected_x = uint256_from_hex(
+            "dad0b65394221cf9b051e1feca5787d0\
+98dfe637fc90b9ef945d0c3772581180",
+        );
+
+        let expected_y = uint256_from_hex(
+            "5271a0461cdb8252d61f1c456fa3e59a\
+b1f45b33accf5f58389e0577b8990bb3",
+        );
+
+        assert_eq!(
+            p256_generator_multiply(private_scalar).coordinates(),
+            Some((expected_x, expected_y))
+        );
+    }
+
+    #[test]
+    fn p256_ecdh_matches_rfc_5903_vector() {
+        let initiator_private = Scalar::new(uint256_from_hex(
+            "c88f01f510d9ac3f70a292daa2316de5\
+44e9aab8afe84049c62a9c57862d1433",
+        ));
+
+        let responder_private = Scalar::new(uint256_from_hex(
+            "c6ef9c5d78ae012a011164acb397ce20\
+88685d8f06bf9be0b283ab46476bee53",
+        ));
+
+        let initiator_public = P256Point::from_coordinates(
+            uint256_from_hex(
+                "dad0b65394221cf9b051e1feca5787d0\
+98dfe637fc90b9ef945d0c3772581180",
+            ),
+            uint256_from_hex(
+                "5271a0461cdb8252d61f1c456fa3e59a\
+b1f45b33accf5f58389e0577b8990bb3",
+            ),
+        )
+        .unwrap();
+
+        let responder_public = P256Point::from_coordinates(
+            uint256_from_hex(
+                "d12dfb5289c8d4f81208b70270398c34\
+2296970a0bccb74c736fc7554494bf63",
+            ),
+            uint256_from_hex(
+                "56fbf3ca366cc23e8157854c13c58d6a\
+ac23f046ada30f8353e74f33039872ab",
+            ),
+        )
+        .unwrap();
+
+        let expected_shared_secret = uint256_from_hex(
+            "d6840f6b42f6edafd13116e0e1256520\
+2fef8e9ece7dce03812464d04b9442de",
+        )
+        .to_be_bytes();
+
+        assert_eq!(
+            p256_ecdh(initiator_private, responder_public,).unwrap(),
+            expected_shared_secret
+        );
+
+        assert_eq!(
+            p256_ecdh(responder_private, initiator_public,).unwrap(),
+            expected_shared_secret
+        );
+    }
+
+    #[test]
+    fn p256_ecdh_rejects_zero_private_scalar() {
+        assert_eq!(
+            p256_ecdh(Scalar::ZERO, P256Point::generator(),),
+            Err(P256EcdhError::ZeroPrivateScalar)
+        );
+    }
+
+    #[test]
+    fn p256_ecdh_rejects_identity_peer() {
+        assert_eq!(
+            p256_ecdh(Scalar::ONE, P256Point::IDENTITY,),
+            Err(P256EcdhError::IdentityPeerPublicKey)
         );
     }
 }
