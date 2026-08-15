@@ -430,14 +430,14 @@ Goal: speak enough ASN.1/X.509 machinery to request and store real certificates.
 
 Goal: implement TLS framing before attempting the entire handshake.
 
-* [ ] Implement TLS plaintext record parsing.
-* [ ] Implement TLS plaintext record serialization.
-* [ ] Enforce record-size limits.
-* [ ] Support handshake record types.
-* [ ] Support alert record types.
-* [ ] Support application-data record types.
-* [ ] Handle fragmented TLS records.
-* [ ] Handle multiple messages inside one record.
+* [x] Implement TLS plaintext record parsing.
+* [x] Implement TLS plaintext record serialization.
+* [x] Enforce record-size limits.
+* [x] Support handshake record types.
+* [x] Support alert record types.
+* [x] Support application-data record types.
+* [x] Handle fragmented TLS records.
+* [x] Handle multiple messages inside one record.
 * [ ] Implement encrypted TLS 1.3 record construction.
 * [ ] Implement encrypted record decryption.
 * [ ] Implement per-direction sequence numbers.
@@ -446,7 +446,7 @@ Goal: implement TLS framing before attempting the entire handshake.
 * [ ] Handle TLS inner content types.
 * [ ] Reject bad AEAD tags.
 * [ ] Reject sequence-number overflow.
-* [ ] Add record-layer unit tests.
+* [x] Add record-layer unit tests.
 
 **Milestone complete when:** encrypted and plaintext TLS records round-trip correctly through our parser.
 

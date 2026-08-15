@@ -6,6 +6,7 @@ mod http;
 pub mod p256;
 mod proxy;
 mod server;
+pub mod tls;
 
 fn main() -> std::process::ExitCode {
     app::main_exit_code()
