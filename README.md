@@ -18,25 +18,53 @@ WSL is the primary target during early development. Native Windows support is pl
 
 ## Localhost smoke test
 
-Start BareProxy from WSL:
+Start a local upstream from WSL:
+
+```bash
+python3 -m http.server 3000
+```
+
+Start BareProxy in another terminal:
 
 ```bash
 cargo run
 ```
 
-Then, from Windows PowerShell:
+Then request the configured `localhost` route:
 
-```powershell
-curl.exe http://localhost:8080/
+```bash
+curl http://127.0.0.1:8080/ -H 'Host: localhost'
 ```
 
-The response body should be:
+BareProxy should proxy the response from the local upstream.
+
+## Long-running runtime smoke test
+
+Milestone 10 includes an automated WSL/Linux smoke harness that exercises sustained concurrent requests, malformed-request rejection, configuration reload, runtime counters, and graceful shutdown.
+
+Run the default 60-second test with eight concurrent workers:
+
+```bash
+python3 smoke.py
+```
+
+The duration and concurrency can be overridden:
+
+```bash
+python3 smoke.py 300 16
+```
+
+The harness creates temporary upstream servers and configuration files automatically and cleans them up when complete.
+
+A successful run ends with a summary similar to:
 
 ```text
-BareProxy is alive.
+SMOKE PASS
+duration_seconds=60 concurrency=8
+valid_requests=6127 malformed_requests=618
+old_backend_responses=2058 new_backend_responses=4069
+requests_total=6131 errors_total=618
 ```
-
-During Milestone 1, BareProxy intentionally serves one connection and then exits. A persistent accept loop is introduced in the next development phase.
 
 ## Development gates
 
