@@ -465,10 +465,11 @@ Goal: establish HTTPS with a manually supplied certificate before touching ACME.
 * [x] Parse supported signature algorithms.
 * [x] Parse offered cipher suites.
 * [x] Recognize `TLS_CHACHA20_POLY1305_SHA256`.
-* [ ] Negotiate P-256 key exchange.
-* [ ] Generate an ephemeral server key.
-* [ ] Produce `ServerHello`.
-* [ ] Maintain the TLS transcript hash.
+* [x] Negotiate P-256 key exchange.
+* [ ] Produce `HelloRetryRequest` when P-256 is supported but not initially shared.
+* [x] Generate an ephemeral server key.
+* [x] Produce `ServerHello`.
+* [x] Maintain the TLS transcript hash.
 * [ ] Derive TLS handshake secrets using HKDF.
 * [ ] Produce `EncryptedExtensions`.
 * [ ] Process ALPN sufficiently to select HTTP/1.1 when offered.
@@ -480,8 +481,8 @@ Goal: establish HTTPS with a manually supplied certificate before touching ACME.
 * [ ] Transition into encrypted application data.
 * [ ] Support TLS alerts.
 * [ ] Support `close_notify`.
-* [ ] Reject unsupported cipher suites cleanly.
-* [ ] Reject unsupported curves cleanly.
+* [x] Reject unsupported cipher suites cleanly.
+* [x] Reject unsupported curves cleanly.
 * [ ] Reject malformed handshake messages.
 * [ ] Compare handshake behavior against real browser/OpenSSL clients.
 

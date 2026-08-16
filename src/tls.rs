@@ -8,11 +8,18 @@
 //! Higher-level server handshake state is added incrementally as BareProxy
 //! learns to negotiate and authenticate real TLS connections.
 
-use crate::crypto::{
-    ChaCha20Poly1305Error, chacha20_poly1305_decrypt, chacha20_poly1305_encrypt, wipe_bytes,
+use crate::{
+    crypto::{
+        ChaCha20Poly1305Error, Sha256, chacha20_poly1305_decrypt, chacha20_poly1305_encrypt,
+        fill_random, wipe_bytes,
+    },
+    p256::{
+        P256_GROUP_ORDER, P256EcdhError, P256Point, P256PointError, Scalar, Uint256, p256_ecdh,
+        p256_generator_multiply,
+    },
 };
 
-use std::{error::Error, fmt, net::IpAddr};
+use std::{error::Error, fmt, io, net::IpAddr};
 
 pub const TLS_RECORD_HEADER_SIZE: usize = 5;
 pub const TLS_PLAINTEXT_FRAGMENT_LIMIT: usize = 1 << 14;
@@ -27,6 +34,7 @@ pub const TLS_SIGNATURE_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
 
 const HANDSHAKE_HEADER_SIZE: usize = 4;
 const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 1;
+const HANDSHAKE_TYPE_SERVER_HELLO: u8 = 2;
 
 const EXTENSION_SERVER_NAME: u16 = 0;
 const EXTENSION_SUPPORTED_GROUPS: u16 = 10;
@@ -307,6 +315,137 @@ impl fmt::Display for TlsHandshakeError {
 }
 
 impl Error for TlsHandshakeError {}
+
+#[derive(Debug)]
+pub enum TlsServerHandshakeError {
+    ClientHello(TlsHandshakeError),
+    UnsupportedCipherSuite,
+    UnsupportedGroup,
+    UnsupportedSignatureAlgorithm,
+    HelloRetryRequired { group: u16 },
+    InvalidP256KeyShare(P256PointError),
+    ServerPublicKey(P256PointError),
+    Random(io::Error),
+    Ecdh(P256EcdhError),
+    HandshakeMessageTooLong { length: usize },
+}
+
+impl fmt::Display for TlsServerHandshakeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClientHello(error) => write!(formatter, "invalid ClientHello: {error}"),
+            Self::UnsupportedCipherSuite => {
+                formatter.write_str("client does not offer TLS_CHACHA20_POLY1305_SHA256")
+            }
+            Self::UnsupportedGroup => {
+                formatter.write_str("client does not support the P-256 key exchange group")
+            }
+            Self::UnsupportedSignatureAlgorithm => {
+                formatter.write_str("client does not support ecdsa_secp256r1_sha256")
+            }
+            Self::HelloRetryRequired { group } => {
+                write!(
+                    formatter,
+                    "client supports group 0x{group:04x} but did not provide a usable key share; HelloRetryRequest is required"
+                )
+            }
+            Self::InvalidP256KeyShare(error) => {
+                write!(formatter, "invalid client P-256 key share: {error}")
+            }
+            Self::ServerPublicKey(error) => {
+                write!(
+                    formatter,
+                    "failed to encode server P-256 key share: {error}"
+                )
+            }
+            Self::Random(error) => {
+                write!(
+                    formatter,
+                    "failed to generate TLS handshake randomness: {error}"
+                )
+            }
+            Self::Ecdh(error) => write!(formatter, "P-256 ECDH failed: {error}"),
+            Self::HandshakeMessageTooLong { length } => {
+                write!(
+                    formatter,
+                    "TLS handshake message body is {length} bytes and exceeds uint24"
+                )
+            }
+        }
+    }
+}
+
+impl Error for TlsServerHandshakeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ClientHello(error) => Some(error),
+            Self::InvalidP256KeyShare(error) | Self::ServerPublicKey(error) => Some(error),
+            Self::Random(error) => Some(error),
+            Self::Ecdh(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<TlsHandshakeError> for TlsServerHandshakeError {
+    fn from(error: TlsHandshakeError) -> Self {
+        Self::ClientHello(error)
+    }
+}
+
+#[derive(Clone)]
+pub struct TlsTranscript {
+    sha256: Sha256,
+}
+
+impl TlsTranscript {
+    pub fn new() -> Self {
+        Self {
+            sha256: Sha256::new(),
+        }
+    }
+
+    pub fn update_handshake_message(&mut self, message: &[u8]) {
+        self.sha256.update(message);
+    }
+
+    pub fn hash(&self) -> [u8; 32] {
+        self.sha256.clone().finalize()
+    }
+}
+
+impl Default for TlsTranscript {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct Tls13ServerHelloFlight {
+    server_hello: Vec<u8>,
+    server_key_share: [u8; 65],
+    shared_secret: [u8; 32],
+    transcript: TlsTranscript,
+}
+
+impl Tls13ServerHelloFlight {
+    pub fn server_hello(&self) -> &[u8] {
+        &self.server_hello
+    }
+
+    pub fn server_key_share(&self) -> &[u8; 65] {
+        &self.server_key_share
+    }
+
+    pub fn transcript_hash(&self) -> [u8; 32] {
+        self.transcript.hash()
+    }
+}
+
+impl Drop for Tls13ServerHelloFlight {
+    fn drop(&mut self) {
+        wipe_bytes(&mut self.shared_secret);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsKeyShareEntry {
@@ -1332,6 +1471,160 @@ fn validate_key_share_groups(
     Ok(())
 }
 
+pub fn negotiate_tls13_server_hello(
+    client_hello_message: &[u8],
+) -> Result<Tls13ServerHelloFlight, TlsServerHandshakeError> {
+    let client_hello = parse_client_hello(client_hello_message)?;
+
+    if !client_hello.offers_chacha20_poly1305_sha256() {
+        return Err(TlsServerHandshakeError::UnsupportedCipherSuite);
+    }
+
+    if !client_hello.supports_secp256r1() {
+        return Err(TlsServerHandshakeError::UnsupportedGroup);
+    }
+
+    if !client_hello.supports_ecdsa_secp256r1_sha256() {
+        return Err(TlsServerHandshakeError::UnsupportedSignatureAlgorithm);
+    }
+
+    let encoded_client_key_share =
+        client_hello
+            .secp256r1_key_share()
+            .ok_or(TlsServerHandshakeError::HelloRetryRequired {
+                group: TLS_GROUP_SECP256R1,
+            })?;
+
+    let client_public_key = P256Point::from_sec1_uncompressed(encoded_client_key_share)
+        .map_err(TlsServerHandshakeError::InvalidP256KeyShare)?;
+
+    let server_private_key =
+        generate_ephemeral_p256_private_key().map_err(TlsServerHandshakeError::Random)?;
+
+    let server_public_key = p256_generator_multiply(server_private_key);
+
+    let server_key_share = server_public_key
+        .to_sec1_uncompressed()
+        .map_err(TlsServerHandshakeError::ServerPublicKey)?;
+
+    let shared_secret =
+        p256_ecdh(server_private_key, client_public_key).map_err(TlsServerHandshakeError::Ecdh)?;
+
+    let mut server_random = [0_u8; 32];
+
+    fill_random(&mut server_random).map_err(TlsServerHandshakeError::Random)?;
+
+    let server_hello = build_tls13_server_hello(&client_hello, &server_random, &server_key_share)?;
+
+    let mut transcript = TlsTranscript::new();
+
+    transcript.update_handshake_message(client_hello_message);
+    transcript.update_handshake_message(&server_hello);
+
+    Ok(Tls13ServerHelloFlight {
+        server_hello,
+        server_key_share,
+        shared_secret,
+        transcript,
+    })
+}
+
+fn generate_ephemeral_p256_private_key() -> io::Result<Scalar> {
+    let mut candidate_bytes = [0_u8; 32];
+
+    loop {
+        fill_random(&mut candidate_bytes)?;
+
+        let candidate = Uint256::from_be_bytes(candidate_bytes);
+
+        wipe_bytes(&mut candidate_bytes);
+
+        if candidate != Uint256::ZERO && candidate < P256_GROUP_ORDER {
+            return Ok(Scalar::new(candidate));
+        }
+    }
+}
+
+fn build_tls13_server_hello(
+    client_hello: &ClientHello,
+    random: &[u8; 32],
+    server_key_share: &[u8; 65],
+) -> Result<Vec<u8>, TlsServerHandshakeError> {
+    let mut extensions = Vec::new();
+
+    append_tls_extension(
+        &mut extensions,
+        EXTENSION_SUPPORTED_VERSIONS,
+        &TLS_VERSION_1_3.to_be_bytes(),
+    );
+
+    let mut key_share_extension = Vec::with_capacity(69);
+
+    key_share_extension.extend_from_slice(&TLS_GROUP_SECP256R1.to_be_bytes());
+    key_share_extension.extend_from_slice(&(server_key_share.len() as u16).to_be_bytes());
+    key_share_extension.extend_from_slice(server_key_share);
+
+    append_tls_extension(&mut extensions, EXTENSION_KEY_SHARE, &key_share_extension);
+
+    let mut body = Vec::with_capacity(
+        2 + random.len() + 1 + client_hello.legacy_session_id.len() + 2 + 1 + 2 + extensions.len(),
+    );
+
+    body.extend_from_slice(&TLS_LEGACY_RECORD_VERSION.to_be_bytes());
+    body.extend_from_slice(random);
+
+    body.push(
+        u8::try_from(client_hello.legacy_session_id.len())
+            .expect("validated TLS legacy session ID must fit in uint8"),
+    );
+    body.extend_from_slice(&client_hello.legacy_session_id);
+
+    body.extend_from_slice(&TLS_CHACHA20_POLY1305_SHA256.to_be_bytes());
+    body.push(0);
+
+    body.extend_from_slice(
+        &u16::try_from(extensions.len())
+            .expect("TLS 1.3 ServerHello extensions must fit in uint16")
+            .to_be_bytes(),
+    );
+    body.extend_from_slice(&extensions);
+
+    encode_handshake_message(HANDSHAKE_TYPE_SERVER_HELLO, &body)
+}
+
+fn append_tls_extension(output: &mut Vec<u8>, extension_type: u16, data: &[u8]) {
+    output.extend_from_slice(&extension_type.to_be_bytes());
+    output.extend_from_slice(
+        &u16::try_from(data.len())
+            .expect("TLS extension data must fit in uint16")
+            .to_be_bytes(),
+    );
+    output.extend_from_slice(data);
+}
+
+fn encode_handshake_message(
+    message_type: u8,
+    body: &[u8],
+) -> Result<Vec<u8>, TlsServerHandshakeError> {
+    if body.len() > 0x00ff_ffff {
+        return Err(TlsServerHandshakeError::HandshakeMessageTooLong { length: body.len() });
+    }
+
+    let body_length = body.len();
+
+    let mut message = Vec::with_capacity(HANDSHAKE_HEADER_SIZE + body_length);
+
+    message.extend_from_slice(&[
+        message_type,
+        ((body_length >> 16) & 0xff) as u8,
+        ((body_length >> 8) & 0xff) as u8,
+        (body_length & 0xff) as u8,
+    ]);
+    message.extend_from_slice(body);
+
+    Ok(message)
+}
+
 struct HandshakeReader<'a> {
     input: &'a [u8],
     offset: usize,
@@ -2086,12 +2379,13 @@ mod tests {
 
         let body_length = body.len();
 
-        let mut message = Vec::new();
+        let mut message = vec![
+            HANDSHAKE_TYPE_CLIENT_HELLO,
+            ((body_length >> 16) & 0xff) as u8,
+            ((body_length >> 8) & 0xff) as u8,
+            (body_length & 0xff) as u8,
+        ];
 
-        message.push(HANDSHAKE_TYPE_CLIENT_HELLO);
-        message.push(((body_length >> 16) & 0xff) as u8);
-        message.push(((body_length >> 8) & 0xff) as u8);
-        message.push((body_length & 0xff) as u8);
         message.extend_from_slice(&body);
 
         message
@@ -2109,6 +2403,25 @@ mod tests {
             test_key_share_extension(TLS_GROUP_SECP256R1, &[4_u8; 65]),
             test_extension(0x0a0a, &[0xde, 0xad]),
         ]
+    }
+
+    fn p256_negotiation_client_hello(client_private_key: Scalar, cipher_suites: &[u16]) -> Vec<u8> {
+        let client_public_key = p256_generator_multiply(client_private_key)
+            .to_sec1_uncompressed()
+            .expect("test P-256 public key should encode");
+
+        let extensions = vec![
+            test_server_name_extension("example.test"),
+            test_u16_list_extension(EXTENSION_SUPPORTED_GROUPS, &[TLS_GROUP_SECP256R1]),
+            test_u16_list_extension(
+                EXTENSION_SIGNATURE_ALGORITHMS,
+                &[TLS_SIGNATURE_ECDSA_SECP256R1_SHA256],
+            ),
+            test_supported_versions_extension(&[TLS_VERSION_1_3]),
+            test_key_share_extension(TLS_GROUP_SECP256R1, &client_public_key),
+        ];
+
+        test_client_hello(TLS_LEGACY_RECORD_VERSION, &[0], cipher_suites, &extensions)
     }
 
     #[test]
@@ -2272,5 +2585,218 @@ mod tests {
                 actual: actual_length,
             })
         );
+    }
+
+    #[test]
+    fn server_hello_negotiates_p256_and_matches_client_ecdh() {
+        let client_private_key = Scalar::new(Uint256::from_limbs([2, 0, 0, 0]));
+
+        let client_hello = p256_negotiation_client_hello(
+            client_private_key,
+            &[0x1301, TLS_CHACHA20_POLY1305_SHA256],
+        );
+
+        let flight = negotiate_tls13_server_hello(&client_hello)
+            .expect("TLS 1.3 ServerHello negotiation should succeed");
+
+        let server_hello = flight.server_hello();
+
+        assert_eq!(server_hello[0], HANDSHAKE_TYPE_SERVER_HELLO);
+
+        let declared_length = (usize::from(server_hello[1]) << 16)
+            | (usize::from(server_hello[2]) << 8)
+            | usize::from(server_hello[3]);
+
+        assert_eq!(declared_length, server_hello.len() - HANDSHAKE_HEADER_SIZE);
+
+        let mut body = HandshakeReader::new(&server_hello[HANDSHAKE_HEADER_SIZE..]);
+
+        assert_eq!(
+            body.read_u16().expect("legacy version should parse"),
+            TLS_LEGACY_RECORD_VERSION
+        );
+
+        body.read_exact(32).expect("server random should exist");
+
+        assert!(
+            body.read_vector_u8("legacy_session_id_echo")
+                .expect("session ID echo should parse")
+                .is_empty()
+        );
+
+        assert_eq!(
+            body.read_u16().expect("cipher suite should parse"),
+            TLS_CHACHA20_POLY1305_SHA256
+        );
+
+        assert_eq!(body.read_u8().expect("compression method should parse"), 0);
+
+        let extensions = body
+            .read_vector_u16("ServerHello extensions")
+            .expect("ServerHello extensions should parse");
+
+        body.finish("ServerHello")
+            .expect("ServerHello should end cleanly");
+
+        let mut extensions = HandshakeReader::new(extensions);
+
+        assert_eq!(
+            extensions
+                .read_u16()
+                .expect("supported_versions type should parse"),
+            EXTENSION_SUPPORTED_VERSIONS
+        );
+
+        assert_eq!(
+            extensions
+                .read_vector_u16("supported_versions")
+                .expect("supported_versions data should parse"),
+            TLS_VERSION_1_3.to_be_bytes()
+        );
+
+        assert_eq!(
+            extensions.read_u16().expect("key_share type should parse"),
+            EXTENSION_KEY_SHARE
+        );
+
+        let key_share = extensions
+            .read_vector_u16("key_share")
+            .expect("key_share data should parse");
+
+        extensions
+            .finish("ServerHello extensions")
+            .expect("extension block should end cleanly");
+
+        let mut key_share = HandshakeReader::new(key_share);
+
+        assert_eq!(
+            key_share.read_u16().expect("server group should parse"),
+            TLS_GROUP_SECP256R1
+        );
+
+        assert_eq!(
+            key_share
+                .read_vector_u16("server key exchange")
+                .expect("server key exchange should parse"),
+            flight.server_key_share()
+        );
+
+        key_share
+            .finish("server key share")
+            .expect("server key share should end cleanly");
+
+        let server_public_key = P256Point::from_sec1_uncompressed(flight.server_key_share())
+            .expect("server P-256 key share should be valid");
+
+        let client_shared_secret = p256_ecdh(client_private_key, server_public_key)
+            .expect("client-side ECDH should succeed");
+
+        assert_eq!(client_shared_secret, flight.shared_secret);
+
+        let mut transcript_bytes = client_hello.clone();
+        transcript_bytes.extend_from_slice(server_hello);
+
+        assert_eq!(
+            flight.transcript_hash(),
+            crate::crypto::sha256(&transcript_bytes)
+        );
+    }
+
+    #[test]
+    fn server_hello_rejects_invalid_p256_client_share() {
+        let extensions = vec![
+            test_server_name_extension("example.test"),
+            test_u16_list_extension(EXTENSION_SUPPORTED_GROUPS, &[TLS_GROUP_SECP256R1]),
+            test_u16_list_extension(
+                EXTENSION_SIGNATURE_ALGORITHMS,
+                &[TLS_SIGNATURE_ECDSA_SECP256R1_SHA256],
+            ),
+            test_supported_versions_extension(&[TLS_VERSION_1_3]),
+            test_key_share_extension(TLS_GROUP_SECP256R1, &[0x04_u8; 64]),
+        ];
+
+        let client_hello = test_client_hello(
+            TLS_LEGACY_RECORD_VERSION,
+            &[0],
+            &[TLS_CHACHA20_POLY1305_SHA256],
+            &extensions,
+        );
+
+        assert!(matches!(
+            negotiate_tls13_server_hello(&client_hello),
+            Err(TlsServerHandshakeError::InvalidP256KeyShare(
+                P256PointError::InvalidEncodingLength { length: 64 }
+            ))
+        ));
+    }
+
+    #[test]
+    fn server_hello_rejects_unsupported_cipher_suite_cleanly() {
+        let client_private_key = Scalar::new(Uint256::from_limbs([3, 0, 0, 0]));
+
+        let client_hello = p256_negotiation_client_hello(client_private_key, &[0x1301]);
+
+        assert!(matches!(
+            negotiate_tls13_server_hello(&client_hello),
+            Err(TlsServerHandshakeError::UnsupportedCipherSuite)
+        ));
+    }
+
+    #[test]
+    fn server_hello_rejects_unsupported_group_cleanly() {
+        const X25519: u16 = 0x001d;
+
+        let extensions = vec![
+            test_server_name_extension("example.test"),
+            test_u16_list_extension(EXTENSION_SUPPORTED_GROUPS, &[X25519]),
+            test_u16_list_extension(
+                EXTENSION_SIGNATURE_ALGORITHMS,
+                &[TLS_SIGNATURE_ECDSA_SECP256R1_SHA256],
+            ),
+            test_supported_versions_extension(&[TLS_VERSION_1_3]),
+            test_key_share_extension(X25519, &[0x11_u8; 32]),
+        ];
+
+        let client_hello = test_client_hello(
+            TLS_LEGACY_RECORD_VERSION,
+            &[0],
+            &[TLS_CHACHA20_POLY1305_SHA256],
+            &extensions,
+        );
+
+        assert!(matches!(
+            negotiate_tls13_server_hello(&client_hello),
+            Err(TlsServerHandshakeError::UnsupportedGroup)
+        ));
+    }
+
+    #[test]
+    fn server_hello_requests_retry_when_p256_has_no_client_share() {
+        const X25519: u16 = 0x001d;
+
+        let extensions = vec![
+            test_server_name_extension("example.test"),
+            test_u16_list_extension(EXTENSION_SUPPORTED_GROUPS, &[TLS_GROUP_SECP256R1, X25519]),
+            test_u16_list_extension(
+                EXTENSION_SIGNATURE_ALGORITHMS,
+                &[TLS_SIGNATURE_ECDSA_SECP256R1_SHA256],
+            ),
+            test_supported_versions_extension(&[TLS_VERSION_1_3]),
+            test_key_share_extension(X25519, &[0x22_u8; 32]),
+        ];
+
+        let client_hello = test_client_hello(
+            TLS_LEGACY_RECORD_VERSION,
+            &[0],
+            &[TLS_CHACHA20_POLY1305_SHA256],
+            &extensions,
+        );
+
+        assert!(matches!(
+            negotiate_tls13_server_hello(&client_hello),
+            Err(TlsServerHandshakeError::HelloRetryRequired {
+                group: TLS_GROUP_SECP256R1,
+            })
+        ));
     }
 }
