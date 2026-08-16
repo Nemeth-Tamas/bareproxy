@@ -456,15 +456,15 @@ Goal: implement TLS framing before attempting the entire handshake.
 
 Goal: establish HTTPS with a manually supplied certificate before touching ACME.
 
-* [ ] Parse `ClientHello`.
-* [ ] Parse supported TLS versions.
-* [ ] Require TLS 1.3.
-* [ ] Parse SNI.
-* [ ] Parse supported groups.
-* [ ] Parse key-share extensions.
-* [ ] Parse supported signature algorithms.
-* [ ] Parse offered cipher suites.
-* [ ] Recognize `TLS_CHACHA20_POLY1305_SHA256`.
+* [x] Parse `ClientHello`.
+* [x] Parse supported TLS versions.
+* [x] Require TLS 1.3.
+* [x] Parse SNI.
+* [x] Parse supported groups.
+* [x] Parse key-share extensions.
+* [x] Parse supported signature algorithms.
+* [x] Parse offered cipher suites.
+* [x] Recognize `TLS_CHACHA20_POLY1305_SHA256`.
 * [ ] Negotiate P-256 key exchange.
 * [ ] Generate an ephemeral server key.
 * [ ] Produce `ServerHello`.

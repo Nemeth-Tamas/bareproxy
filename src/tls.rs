@@ -1,17 +1,18 @@
-//! BareProxy TLS 1.3 record-layer foundation.
+//! BareProxy TLS 1.3 protocol foundation.
 //!
-//! The record framing implemented here follows RFC 8446 section 5.
+//! Record framing and handshake parsing follow RFC 9846, the current TLS 1.3
+//! specification. RFC 9846 obsoletes RFC 8446 while retaining TLS 1.3 wire
+//! compatibility.
 //!
-//! This module deliberately stops below the TLS handshake state machine.
-//! It understands record framing, content types, fragmentation, and the
-//! generic 4-byte handshake-message envelope, but not ClientHello,
-//! ServerHello, certificate, or Finished message contents yet.
+//! This module owns bounded TLS record framing and handshake wire parsing.
+//! Higher-level server handshake state is added incrementally as BareProxy
+//! learns to negotiate and authenticate real TLS connections.
 
 use crate::crypto::{
     ChaCha20Poly1305Error, chacha20_poly1305_decrypt, chacha20_poly1305_encrypt, wipe_bytes,
 };
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, net::IpAddr};
 
 pub const TLS_RECORD_HEADER_SIZE: usize = 5;
 pub const TLS_PLAINTEXT_FRAGMENT_LIMIT: usize = 1 << 14;
@@ -19,7 +20,21 @@ pub const TLS_INNER_PLAINTEXT_LIMIT: usize = TLS_PLAINTEXT_FRAGMENT_LIMIT + 1;
 pub const TLS_CIPHERTEXT_FRAGMENT_LIMIT: usize = TLS_PLAINTEXT_FRAGMENT_LIMIT + 256;
 pub const TLS_LEGACY_RECORD_VERSION: u16 = 0x0303;
 
+pub const TLS_VERSION_1_3: u16 = 0x0304;
+pub const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
+pub const TLS_GROUP_SECP256R1: u16 = 0x0017;
+pub const TLS_SIGNATURE_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
+
 const HANDSHAKE_HEADER_SIZE: usize = 4;
+const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 1;
+
+const EXTENSION_SERVER_NAME: u16 = 0;
+const EXTENSION_SUPPORTED_GROUPS: u16 = 10;
+const EXTENSION_SIGNATURE_ALGORITHMS: u16 = 13;
+const EXTENSION_PRE_SHARED_KEY: u16 = 41;
+const EXTENSION_SUPPORTED_VERSIONS: u16 = 43;
+const EXTENSION_KEY_SHARE: u16 = 51;
+
 const CHACHA20_POLY1305_TAG_SIZE: usize = 16;
 const TLS_CHACHA20_POLY1305_CIPHERTEXT_LIMIT: usize =
     TLS_INNER_PLAINTEXT_LIMIT + CHACHA20_POLY1305_TAG_SIZE;
@@ -180,6 +195,207 @@ impl Error for TlsRecordError {
 impl From<ChaCha20Poly1305Error> for TlsRecordError {
     fn from(error: ChaCha20Poly1305Error) -> Self {
         Self::Aead(error)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TlsHandshakeError {
+    Truncated,
+    UnexpectedHandshakeType { message_type: u8 },
+    HandshakeLengthMismatch { declared: usize, actual: usize },
+    InvalidLegacyVersion { version: u16 },
+    InvalidSessionIdLength { length: usize },
+    InvalidCipherSuiteVector { length: usize },
+    InvalidCompressionMethods,
+    MissingExtensions,
+    MalformedVector { field: &'static str },
+    DuplicateExtension { extension_type: u16 },
+    Tls13Required,
+    MissingRequiredExtension { extension_type: u16 },
+    PreSharedKeyNotLast,
+    InvalidServerName,
+    DuplicateServerName,
+    DuplicateKeyShareGroup { group: u16 },
+    KeyShareGroupNotOffered { group: u16 },
+    KeyShareOrderMismatch,
+}
+
+impl fmt::Display for TlsHandshakeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Truncated => formatter.write_str("truncated TLS handshake structure"),
+            Self::UnexpectedHandshakeType { message_type } => {
+                write!(
+                    formatter,
+                    "expected TLS ClientHello handshake type 1, got {message_type}"
+                )
+            }
+            Self::HandshakeLengthMismatch { declared, actual } => {
+                write!(
+                    formatter,
+                    "TLS handshake declares {declared} body bytes but contains {actual}"
+                )
+            }
+            Self::InvalidLegacyVersion { version } => {
+                write!(
+                    formatter,
+                    "TLS 1.3 ClientHello legacy_version must be 0x0303, got 0x{version:04x}"
+                )
+            }
+            Self::InvalidSessionIdLength { length } => {
+                write!(
+                    formatter,
+                    "TLS ClientHello legacy_session_id is {length} bytes, exceeding 32"
+                )
+            }
+            Self::InvalidCipherSuiteVector { length } => {
+                write!(
+                    formatter,
+                    "TLS ClientHello cipher suite vector has invalid length {length}"
+                )
+            }
+            Self::InvalidCompressionMethods => formatter.write_str(
+                "TLS 1.3 ClientHello legacy_compression_methods must contain exactly the null method",
+            ),
+            Self::MissingExtensions => {
+                formatter.write_str("TLS 1.3 ClientHello contains no extension block")
+            }
+            Self::MalformedVector { field } => {
+                write!(formatter, "malformed TLS ClientHello {field} vector")
+            }
+            Self::DuplicateExtension { extension_type } => {
+                write!(
+                    formatter,
+                    "TLS ClientHello repeats extension type {extension_type}"
+                )
+            }
+            Self::Tls13Required => formatter.write_str(
+                "BareProxy requires TLS 1.3 but ClientHello does not offer version 0x0304",
+            ),
+            Self::MissingRequiredExtension { extension_type } => {
+                write!(
+                    formatter,
+                    "TLS 1.3 ClientHello is missing required extension type {extension_type}"
+                )
+            }
+            Self::PreSharedKeyNotLast => formatter.write_str(
+                "TLS ClientHello pre_shared_key extension must be the final extension",
+            ),
+            Self::InvalidServerName => {
+                formatter.write_str("invalid TLS server_name host_name value")
+            }
+            Self::DuplicateServerName => {
+                formatter.write_str("TLS server_name list repeats a name type")
+            }
+            Self::DuplicateKeyShareGroup { group } => {
+                write!(
+                    formatter,
+                    "TLS ClientHello contains multiple key shares for group 0x{group:04x}"
+                )
+            }
+            Self::KeyShareGroupNotOffered { group } => {
+                write!(
+                    formatter,
+                    "TLS ClientHello key share group 0x{group:04x} is absent from supported_groups"
+                )
+            }
+            Self::KeyShareOrderMismatch => formatter.write_str(
+                "TLS ClientHello key shares do not preserve supported_groups ordering",
+            ),
+        }
+    }
+}
+
+impl Error for TlsHandshakeError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsKeyShareEntry {
+    group: u16,
+    key_exchange: Vec<u8>,
+}
+
+impl TlsKeyShareEntry {
+    pub fn group(&self) -> u16 {
+        self.group
+    }
+
+    pub fn key_exchange(&self) -> &[u8] {
+        &self.key_exchange
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientHello {
+    random: [u8; 32],
+    legacy_session_id: Vec<u8>,
+    cipher_suites: Vec<u16>,
+    server_name: Option<String>,
+    supported_versions: Vec<u16>,
+    supported_groups: Vec<u16>,
+    key_shares: Vec<TlsKeyShareEntry>,
+    signature_algorithms: Vec<u16>,
+    pre_shared_key_present: bool,
+}
+
+impl ClientHello {
+    pub fn random(&self) -> &[u8; 32] {
+        &self.random
+    }
+
+    pub fn legacy_session_id(&self) -> &[u8] {
+        &self.legacy_session_id
+    }
+
+    pub fn cipher_suites(&self) -> &[u16] {
+        &self.cipher_suites
+    }
+
+    pub fn server_name(&self) -> Option<&str> {
+        self.server_name.as_deref()
+    }
+
+    pub fn supported_versions(&self) -> &[u16] {
+        &self.supported_versions
+    }
+
+    pub fn supported_groups(&self) -> &[u16] {
+        &self.supported_groups
+    }
+
+    pub fn key_shares(&self) -> &[TlsKeyShareEntry] {
+        &self.key_shares
+    }
+
+    pub fn signature_algorithms(&self) -> &[u16] {
+        &self.signature_algorithms
+    }
+
+    pub fn pre_shared_key_present(&self) -> bool {
+        self.pre_shared_key_present
+    }
+
+    pub fn offers_tls13(&self) -> bool {
+        self.supported_versions.contains(&TLS_VERSION_1_3)
+    }
+
+    pub fn offers_chacha20_poly1305_sha256(&self) -> bool {
+        self.cipher_suites.contains(&TLS_CHACHA20_POLY1305_SHA256)
+    }
+
+    pub fn supports_secp256r1(&self) -> bool {
+        self.supported_groups.contains(&TLS_GROUP_SECP256R1)
+    }
+
+    pub fn supports_ecdsa_secp256r1_sha256(&self) -> bool {
+        self.signature_algorithms
+            .contains(&TLS_SIGNATURE_ECDSA_SECP256R1_SHA256)
+    }
+
+    pub fn secp256r1_key_share(&self) -> Option<&[u8]> {
+        self.key_shares
+            .iter()
+            .find(|share| share.group == TLS_GROUP_SECP256R1)
+            .map(TlsKeyShareEntry::key_exchange)
     }
 }
 
@@ -762,6 +978,423 @@ impl HandshakeDeframer {
     }
 }
 
+pub fn parse_client_hello(message: &[u8]) -> Result<ClientHello, TlsHandshakeError> {
+    if message.len() < HANDSHAKE_HEADER_SIZE {
+        return Err(TlsHandshakeError::Truncated);
+    }
+
+    let message_type = message[0];
+
+    if message_type != HANDSHAKE_TYPE_CLIENT_HELLO {
+        return Err(TlsHandshakeError::UnexpectedHandshakeType { message_type });
+    }
+
+    let declared_length =
+        (usize::from(message[1]) << 16) | (usize::from(message[2]) << 8) | usize::from(message[3]);
+
+    let actual_length = message.len() - HANDSHAKE_HEADER_SIZE;
+
+    if declared_length != actual_length {
+        return Err(TlsHandshakeError::HandshakeLengthMismatch {
+            declared: declared_length,
+            actual: actual_length,
+        });
+    }
+
+    let mut reader = HandshakeReader::new(&message[HANDSHAKE_HEADER_SIZE..]);
+
+    let legacy_version = reader.read_u16()?;
+
+    if legacy_version != TLS_LEGACY_RECORD_VERSION {
+        return Err(TlsHandshakeError::InvalidLegacyVersion {
+            version: legacy_version,
+        });
+    }
+
+    let random_bytes = reader.read_exact(32)?;
+
+    let mut random = [0_u8; 32];
+    random.copy_from_slice(random_bytes);
+
+    let legacy_session_id = reader.read_vector_u8("legacy_session_id")?.to_vec();
+
+    if legacy_session_id.len() > 32 {
+        return Err(TlsHandshakeError::InvalidSessionIdLength {
+            length: legacy_session_id.len(),
+        });
+    }
+
+    let cipher_suite_bytes = reader.read_vector_u16("cipher_suites")?;
+
+    if cipher_suite_bytes.len() < 2 || !cipher_suite_bytes.len().is_multiple_of(2) {
+        return Err(TlsHandshakeError::InvalidCipherSuiteVector {
+            length: cipher_suite_bytes.len(),
+        });
+    }
+
+    let cipher_suites = cipher_suite_bytes
+        .chunks_exact(2)
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+        .collect();
+
+    let compression_methods = reader.read_vector_u8("legacy_compression_methods")?;
+
+    if compression_methods != [0_u8] {
+        return Err(TlsHandshakeError::InvalidCompressionMethods);
+    }
+
+    if reader.remaining() == 0 {
+        return Err(TlsHandshakeError::MissingExtensions);
+    }
+
+    let extension_block = reader.read_vector_u16("extensions")?;
+
+    reader.finish("ClientHello")?;
+
+    let ParsedClientHelloExtensions {
+        server_name,
+        supported_versions,
+        supported_groups,
+        key_shares,
+        signature_algorithms,
+        pre_shared_key_present,
+    } = parse_client_hello_extensions(extension_block)?;
+
+    let supported_versions =
+        supported_versions.ok_or(TlsHandshakeError::MissingRequiredExtension {
+            extension_type: EXTENSION_SUPPORTED_VERSIONS,
+        })?;
+
+    if !supported_versions.contains(&TLS_VERSION_1_3) {
+        return Err(TlsHandshakeError::Tls13Required);
+    }
+
+    if !pre_shared_key_present {
+        if signature_algorithms.is_none() {
+            return Err(TlsHandshakeError::MissingRequiredExtension {
+                extension_type: EXTENSION_SIGNATURE_ALGORITHMS,
+            });
+        }
+
+        if supported_groups.is_none() {
+            return Err(TlsHandshakeError::MissingRequiredExtension {
+                extension_type: EXTENSION_SUPPORTED_GROUPS,
+            });
+        }
+    }
+
+    match (&supported_groups, &key_shares) {
+        (Some(_), None) => {
+            return Err(TlsHandshakeError::MissingRequiredExtension {
+                extension_type: EXTENSION_KEY_SHARE,
+            });
+        }
+        (None, Some(_)) => {
+            return Err(TlsHandshakeError::MissingRequiredExtension {
+                extension_type: EXTENSION_SUPPORTED_GROUPS,
+            });
+        }
+        (Some(groups), Some(shares)) => {
+            validate_key_share_groups(groups, shares)?;
+        }
+        (None, None) => {}
+    }
+
+    Ok(ClientHello {
+        random,
+        legacy_session_id,
+        cipher_suites,
+        server_name,
+        supported_versions,
+        supported_groups: supported_groups.unwrap_or_default(),
+        key_shares: key_shares.unwrap_or_default(),
+        signature_algorithms: signature_algorithms.unwrap_or_default(),
+        pre_shared_key_present,
+    })
+}
+
+#[derive(Debug, Default)]
+struct ParsedClientHelloExtensions {
+    server_name: Option<String>,
+    supported_versions: Option<Vec<u16>>,
+    supported_groups: Option<Vec<u16>>,
+    key_shares: Option<Vec<TlsKeyShareEntry>>,
+    signature_algorithms: Option<Vec<u16>>,
+    pre_shared_key_present: bool,
+}
+
+fn parse_client_hello_extensions(
+    input: &[u8],
+) -> Result<ParsedClientHelloExtensions, TlsHandshakeError> {
+    let mut reader = HandshakeReader::new(input);
+    let mut parsed = ParsedClientHelloExtensions::default();
+    let mut seen_extensions = Vec::new();
+
+    while reader.remaining() != 0 {
+        let extension_type = reader.read_u16()?;
+        let extension_data = reader.read_vector_u16("extension_data")?;
+
+        if seen_extensions.contains(&extension_type) {
+            return Err(TlsHandshakeError::DuplicateExtension { extension_type });
+        }
+
+        seen_extensions.push(extension_type);
+
+        let is_last_extension = reader.remaining() == 0;
+
+        match extension_type {
+            EXTENSION_SERVER_NAME => {
+                parsed.server_name = parse_server_name(extension_data)?;
+            }
+            EXTENSION_SUPPORTED_GROUPS => {
+                parsed.supported_groups =
+                    Some(parse_u16_vector_u16(extension_data, "supported_groups")?);
+            }
+            EXTENSION_SIGNATURE_ALGORITHMS => {
+                parsed.signature_algorithms = Some(parse_u16_vector_u16(
+                    extension_data,
+                    "signature_algorithms",
+                )?);
+            }
+            EXTENSION_PRE_SHARED_KEY => {
+                if !is_last_extension {
+                    return Err(TlsHandshakeError::PreSharedKeyNotLast);
+                }
+
+                parsed.pre_shared_key_present = true;
+            }
+            EXTENSION_SUPPORTED_VERSIONS => {
+                parsed.supported_versions =
+                    Some(parse_u16_vector_u8(extension_data, "supported_versions")?);
+            }
+            EXTENSION_KEY_SHARE => {
+                parsed.key_shares = Some(parse_client_key_shares(extension_data)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn parse_server_name(input: &[u8]) -> Result<Option<String>, TlsHandshakeError> {
+    let mut outer = HandshakeReader::new(input);
+    let server_name_list = outer.read_vector_u16("server_name_list")?;
+
+    outer.finish("server_name")?;
+
+    if server_name_list.is_empty() {
+        return Err(TlsHandshakeError::MalformedVector {
+            field: "server_name_list",
+        });
+    }
+
+    let mut reader = HandshakeReader::new(server_name_list);
+    let mut seen_name_types = Vec::new();
+    let mut server_name = None;
+
+    while reader.remaining() != 0 {
+        let name_type = reader.read_u8()?;
+        let name = reader.read_vector_u16("server_name")?;
+
+        if seen_name_types.contains(&name_type) {
+            return Err(TlsHandshakeError::DuplicateServerName);
+        }
+
+        seen_name_types.push(name_type);
+
+        if name_type == 0 {
+            if !is_valid_server_name(name) {
+                return Err(TlsHandshakeError::InvalidServerName);
+            }
+
+            let host_name =
+                std::str::from_utf8(name).map_err(|_| TlsHandshakeError::InvalidServerName)?;
+
+            server_name = Some(host_name.to_ascii_lowercase());
+        }
+    }
+
+    Ok(server_name)
+}
+
+fn is_valid_server_name(name: &[u8]) -> bool {
+    if name.is_empty() || !name.is_ascii() {
+        return false;
+    }
+
+    let Ok(host_name) = std::str::from_utf8(name) else {
+        return false;
+    };
+
+    if host_name.len() > 253 || host_name.ends_with('.') || host_name.parse::<IpAddr>().is_ok() {
+        return false;
+    }
+
+    host_name.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
+fn parse_u16_vector_u8(input: &[u8], field: &'static str) -> Result<Vec<u16>, TlsHandshakeError> {
+    let mut reader = HandshakeReader::new(input);
+    let values = reader.read_vector_u8(field)?;
+
+    reader.finish(field)?;
+
+    parse_u16_values(values, field)
+}
+
+fn parse_u16_vector_u16(input: &[u8], field: &'static str) -> Result<Vec<u16>, TlsHandshakeError> {
+    let mut reader = HandshakeReader::new(input);
+    let values = reader.read_vector_u16(field)?;
+
+    reader.finish(field)?;
+
+    parse_u16_values(values, field)
+}
+
+fn parse_u16_values(input: &[u8], field: &'static str) -> Result<Vec<u16>, TlsHandshakeError> {
+    if input.len() < 2 || !input.len().is_multiple_of(2) {
+        return Err(TlsHandshakeError::MalformedVector { field });
+    }
+
+    Ok(input
+        .chunks_exact(2)
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+        .collect())
+}
+
+fn parse_client_key_shares(input: &[u8]) -> Result<Vec<TlsKeyShareEntry>, TlsHandshakeError> {
+    let mut outer = HandshakeReader::new(input);
+    let encoded_shares = outer.read_vector_u16("key_share")?;
+
+    outer.finish("key_share")?;
+
+    let mut reader = HandshakeReader::new(encoded_shares);
+    let mut shares = Vec::new();
+
+    while reader.remaining() != 0 {
+        let group = reader.read_u16()?;
+        let key_exchange = reader.read_vector_u16("key_exchange")?;
+
+        if key_exchange.is_empty() {
+            return Err(TlsHandshakeError::MalformedVector {
+                field: "key_exchange",
+            });
+        }
+
+        if shares
+            .iter()
+            .any(|share: &TlsKeyShareEntry| share.group == group)
+        {
+            return Err(TlsHandshakeError::DuplicateKeyShareGroup { group });
+        }
+
+        shares.push(TlsKeyShareEntry {
+            group,
+            key_exchange: key_exchange.to_vec(),
+        });
+    }
+
+    Ok(shares)
+}
+
+fn validate_key_share_groups(
+    supported_groups: &[u16],
+    key_shares: &[TlsKeyShareEntry],
+) -> Result<(), TlsHandshakeError> {
+    let mut previous_group_index = None;
+
+    for key_share in key_shares {
+        let Some(group_index) = supported_groups
+            .iter()
+            .position(|group| *group == key_share.group)
+        else {
+            return Err(TlsHandshakeError::KeyShareGroupNotOffered {
+                group: key_share.group,
+            });
+        };
+
+        if previous_group_index.is_some_and(|previous| group_index <= previous) {
+            return Err(TlsHandshakeError::KeyShareOrderMismatch);
+        }
+
+        previous_group_index = Some(group_index);
+    }
+
+    Ok(())
+}
+
+struct HandshakeReader<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> HandshakeReader<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self { input, offset: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.input.len() - self.offset
+    }
+
+    fn read_u8(&mut self) -> Result<u8, TlsHandshakeError> {
+        Ok(self.read_exact(1)?[0])
+    }
+
+    fn read_u16(&mut self) -> Result<u16, TlsHandshakeError> {
+        let bytes = self.read_exact(2)?;
+
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_exact(&mut self, length: usize) -> Result<&'a [u8], TlsHandshakeError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(TlsHandshakeError::Truncated)?;
+
+        if end > self.input.len() {
+            return Err(TlsHandshakeError::Truncated);
+        }
+
+        let value = &self.input[self.offset..end];
+        self.offset = end;
+
+        Ok(value)
+    }
+
+    fn read_vector_u8(&mut self, field: &'static str) -> Result<&'a [u8], TlsHandshakeError> {
+        let length = usize::from(self.read_u8()?);
+
+        self.read_exact(length)
+            .map_err(|_| TlsHandshakeError::MalformedVector { field })
+    }
+
+    fn read_vector_u16(&mut self, field: &'static str) -> Result<&'a [u8], TlsHandshakeError> {
+        let length = usize::from(self.read_u16()?);
+
+        self.read_exact(length)
+            .map_err(|_| TlsHandshakeError::MalformedVector { field })
+    }
+
+    fn finish(&self, field: &'static str) -> Result<(), TlsHandshakeError> {
+        if self.remaining() == 0 {
+            Ok(())
+        } else {
+            Err(TlsHandshakeError::MalformedVector { field })
+        }
+    }
+}
+
 fn validate_plaintext_fragment(
     content_type: ContentType,
     fragment: &[u8],
@@ -1303,6 +1936,340 @@ mod tests {
             server.decrypt_record(&encrypted),
             Err(TlsRecordError::SequenceNumberExhausted {
                 direction: RecordDirection::Read,
+            })
+        );
+    }
+
+    fn test_extension(extension_type: u16, data: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+
+        output.extend_from_slice(&extension_type.to_be_bytes());
+        output.extend_from_slice(
+            &u16::try_from(data.len())
+                .expect("test extension must fit in uint16")
+                .to_be_bytes(),
+        );
+        output.extend_from_slice(data);
+
+        output
+    }
+
+    fn test_server_name_extension(host_name: &str) -> Vec<u8> {
+        let mut name = Vec::new();
+
+        name.push(0);
+        name.extend_from_slice(
+            &u16::try_from(host_name.len())
+                .expect("test host name must fit in uint16")
+                .to_be_bytes(),
+        );
+        name.extend_from_slice(host_name.as_bytes());
+
+        let mut data = Vec::new();
+
+        data.extend_from_slice(
+            &u16::try_from(name.len())
+                .expect("test server name list must fit in uint16")
+                .to_be_bytes(),
+        );
+        data.extend_from_slice(&name);
+
+        test_extension(EXTENSION_SERVER_NAME, &data)
+    }
+
+    fn test_supported_versions_extension(versions: &[u16]) -> Vec<u8> {
+        let mut encoded_versions = Vec::new();
+
+        for version in versions {
+            encoded_versions.extend_from_slice(&version.to_be_bytes());
+        }
+
+        let mut data = Vec::new();
+
+        data.push(
+            u8::try_from(encoded_versions.len())
+                .expect("test supported versions must fit in uint8"),
+        );
+        data.extend_from_slice(&encoded_versions);
+
+        test_extension(EXTENSION_SUPPORTED_VERSIONS, &data)
+    }
+
+    fn test_u16_list_extension(extension_type: u16, values: &[u16]) -> Vec<u8> {
+        let mut encoded_values = Vec::new();
+
+        for value in values {
+            encoded_values.extend_from_slice(&value.to_be_bytes());
+        }
+
+        let mut data = Vec::new();
+
+        data.extend_from_slice(
+            &u16::try_from(encoded_values.len())
+                .expect("test vector must fit in uint16")
+                .to_be_bytes(),
+        );
+        data.extend_from_slice(&encoded_values);
+
+        test_extension(extension_type, &data)
+    }
+
+    fn test_key_share_extension(group: u16, key_exchange: &[u8]) -> Vec<u8> {
+        let mut entry = Vec::new();
+
+        entry.extend_from_slice(&group.to_be_bytes());
+        entry.extend_from_slice(
+            &u16::try_from(key_exchange.len())
+                .expect("test key share must fit in uint16")
+                .to_be_bytes(),
+        );
+        entry.extend_from_slice(key_exchange);
+
+        let mut data = Vec::new();
+
+        data.extend_from_slice(
+            &u16::try_from(entry.len())
+                .expect("test key share list must fit in uint16")
+                .to_be_bytes(),
+        );
+        data.extend_from_slice(&entry);
+
+        test_extension(EXTENSION_KEY_SHARE, &data)
+    }
+
+    fn test_client_hello(
+        legacy_version: u16,
+        compression_methods: &[u8],
+        cipher_suites: &[u16],
+        extensions: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+
+        body.extend_from_slice(&legacy_version.to_be_bytes());
+        body.extend_from_slice(&[0x11_u8; 32]);
+
+        body.push(0);
+
+        let mut encoded_cipher_suites = Vec::new();
+
+        for cipher_suite in cipher_suites {
+            encoded_cipher_suites.extend_from_slice(&cipher_suite.to_be_bytes());
+        }
+
+        body.extend_from_slice(
+            &u16::try_from(encoded_cipher_suites.len())
+                .expect("test cipher suites must fit in uint16")
+                .to_be_bytes(),
+        );
+        body.extend_from_slice(&encoded_cipher_suites);
+
+        body.push(
+            u8::try_from(compression_methods.len())
+                .expect("test compression methods must fit in uint8"),
+        );
+        body.extend_from_slice(compression_methods);
+
+        let mut encoded_extensions = Vec::new();
+
+        for extension in extensions {
+            encoded_extensions.extend_from_slice(extension);
+        }
+
+        body.extend_from_slice(
+            &u16::try_from(encoded_extensions.len())
+                .expect("test extensions must fit in uint16")
+                .to_be_bytes(),
+        );
+        body.extend_from_slice(&encoded_extensions);
+
+        assert!(body.len() <= 0x00ff_ffff);
+
+        let body_length = body.len();
+
+        let mut message = Vec::new();
+
+        message.push(HANDSHAKE_TYPE_CLIENT_HELLO);
+        message.push(((body_length >> 16) & 0xff) as u8);
+        message.push(((body_length >> 8) & 0xff) as u8);
+        message.push((body_length & 0xff) as u8);
+        message.extend_from_slice(&body);
+
+        message
+    }
+
+    fn valid_client_hello_extensions() -> Vec<Vec<u8>> {
+        vec![
+            test_server_name_extension("Example.Test"),
+            test_u16_list_extension(EXTENSION_SUPPORTED_GROUPS, &[TLS_GROUP_SECP256R1]),
+            test_u16_list_extension(
+                EXTENSION_SIGNATURE_ALGORITHMS,
+                &[TLS_SIGNATURE_ECDSA_SECP256R1_SHA256],
+            ),
+            test_supported_versions_extension(&[TLS_VERSION_1_3]),
+            test_key_share_extension(TLS_GROUP_SECP256R1, &[4_u8; 65]),
+            test_extension(0x0a0a, &[0xde, 0xad]),
+        ]
+    }
+
+    #[test]
+    fn client_hello_parser_extracts_tls13_negotiation_inputs() {
+        let message = test_client_hello(
+            TLS_LEGACY_RECORD_VERSION,
+            &[0],
+            &[0x1301, TLS_CHACHA20_POLY1305_SHA256],
+            &valid_client_hello_extensions(),
+        );
+
+        let client_hello = parse_client_hello(&message).expect("ClientHello should parse");
+
+        assert_eq!(client_hello.random(), &[0x11_u8; 32]);
+        assert!(client_hello.legacy_session_id().is_empty());
+
+        assert_eq!(
+            client_hello.cipher_suites(),
+            &[0x1301, TLS_CHACHA20_POLY1305_SHA256]
+        );
+
+        assert_eq!(client_hello.server_name(), Some("example.test"));
+        assert_eq!(client_hello.supported_versions(), &[TLS_VERSION_1_3]);
+        assert_eq!(client_hello.supported_groups(), &[TLS_GROUP_SECP256R1]);
+        assert_eq!(
+            client_hello.signature_algorithms(),
+            &[TLS_SIGNATURE_ECDSA_SECP256R1_SHA256]
+        );
+
+        assert_eq!(client_hello.key_shares().len(), 1);
+        assert_eq!(client_hello.key_shares()[0].group(), TLS_GROUP_SECP256R1);
+        assert_eq!(client_hello.key_shares()[0].key_exchange(), &[4_u8; 65]);
+
+        assert!(client_hello.offers_tls13());
+        assert!(client_hello.offers_chacha20_poly1305_sha256());
+        assert!(client_hello.supports_secp256r1());
+        assert!(client_hello.supports_ecdsa_secp256r1_sha256());
+        assert_eq!(client_hello.secp256r1_key_share(), Some(&[4_u8; 65][..]));
+        assert!(!client_hello.pre_shared_key_present());
+    }
+
+    #[test]
+    fn client_hello_requires_tls13_and_legacy_0303() {
+        let extensions = valid_client_hello_extensions();
+
+        let wrong_legacy_version =
+            test_client_hello(0x0304, &[0], &[TLS_CHACHA20_POLY1305_SHA256], &extensions);
+
+        assert_eq!(
+            parse_client_hello(&wrong_legacy_version),
+            Err(TlsHandshakeError::InvalidLegacyVersion { version: 0x0304 })
+        );
+
+        let mut old_version_extensions = valid_client_hello_extensions();
+
+        old_version_extensions.retain(|extension| {
+            u16::from_be_bytes([extension[0], extension[1]]) != EXTENSION_SUPPORTED_VERSIONS
+        });
+
+        old_version_extensions.push(test_supported_versions_extension(&[0x0303]));
+
+        let no_tls13 = test_client_hello(
+            TLS_LEGACY_RECORD_VERSION,
+            &[0],
+            &[TLS_CHACHA20_POLY1305_SHA256],
+            &old_version_extensions,
+        );
+
+        assert_eq!(
+            parse_client_hello(&no_tls13),
+            Err(TlsHandshakeError::Tls13Required)
+        );
+    }
+
+    #[test]
+    fn client_hello_rejects_non_null_legacy_compression() {
+        let message = test_client_hello(
+            TLS_LEGACY_RECORD_VERSION,
+            &[0, 1],
+            &[TLS_CHACHA20_POLY1305_SHA256],
+            &valid_client_hello_extensions(),
+        );
+
+        assert_eq!(
+            parse_client_hello(&message),
+            Err(TlsHandshakeError::InvalidCompressionMethods)
+        );
+    }
+
+    #[test]
+    fn client_hello_rejects_duplicate_extensions() {
+        let mut extensions = valid_client_hello_extensions();
+
+        extensions.push(test_supported_versions_extension(&[TLS_VERSION_1_3]));
+
+        let message = test_client_hello(
+            TLS_LEGACY_RECORD_VERSION,
+            &[0],
+            &[TLS_CHACHA20_POLY1305_SHA256],
+            &extensions,
+        );
+
+        assert_eq!(
+            parse_client_hello(&message),
+            Err(TlsHandshakeError::DuplicateExtension {
+                extension_type: EXTENSION_SUPPORTED_VERSIONS,
+            })
+        );
+    }
+
+    #[test]
+    fn client_hello_rejects_key_share_not_in_supported_groups() {
+        let mut extensions = valid_client_hello_extensions();
+
+        extensions.retain(|extension| {
+            u16::from_be_bytes([extension[0], extension[1]]) != EXTENSION_SUPPORTED_GROUPS
+        });
+
+        extensions.push(test_u16_list_extension(
+            EXTENSION_SUPPORTED_GROUPS,
+            &[0x001d],
+        ));
+
+        let message = test_client_hello(
+            TLS_LEGACY_RECORD_VERSION,
+            &[0],
+            &[TLS_CHACHA20_POLY1305_SHA256],
+            &extensions,
+        );
+
+        assert_eq!(
+            parse_client_hello(&message),
+            Err(TlsHandshakeError::KeyShareGroupNotOffered {
+                group: TLS_GROUP_SECP256R1,
+            })
+        );
+    }
+
+    #[test]
+    fn client_hello_rejects_truncated_and_misframed_messages() {
+        assert_eq!(
+            parse_client_hello(&[HANDSHAKE_TYPE_CLIENT_HELLO, 0, 0]),
+            Err(TlsHandshakeError::Truncated)
+        );
+
+        let mut message = test_client_hello(
+            TLS_LEGACY_RECORD_VERSION,
+            &[0],
+            &[TLS_CHACHA20_POLY1305_SHA256],
+            &valid_client_hello_extensions(),
+        );
+
+        message[3] = message[3].wrapping_add(1);
+
+        let actual_length = message.len() - HANDSHAKE_HEADER_SIZE;
+
+        assert_eq!(
+            parse_client_hello(&message),
+            Err(TlsHandshakeError::HandshakeLengthMismatch {
+                declared: actual_length + 1,
+                actual: actual_length,
             })
         );
     }
