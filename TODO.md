@@ -470,9 +470,9 @@ Goal: establish HTTPS with a manually supplied certificate before touching ACME.
 * [x] Generate an ephemeral server key.
 * [x] Produce `ServerHello`.
 * [x] Maintain the TLS transcript hash.
-* [ ] Derive TLS handshake secrets using HKDF.
-* [ ] Produce `EncryptedExtensions`.
-* [ ] Process ALPN sufficiently to select HTTP/1.1 when offered.
+* [x] Derive TLS handshake secrets using HKDF.
+* [x] Produce `EncryptedExtensions`.
+* [x] Process ALPN sufficiently to select HTTP/1.1 when offered.
 * [ ] Produce the TLS `Certificate` message.
 * [ ] Produce `CertificateVerify`.
 * [ ] Produce server `Finished`.

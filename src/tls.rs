@@ -10,8 +10,9 @@
 
 use crate::{
     crypto::{
-        ChaCha20Poly1305Error, Sha256, chacha20_poly1305_decrypt, chacha20_poly1305_encrypt,
-        fill_random, wipe_bytes,
+        ChaCha20Poly1305Error, HkdfError, Sha256, chacha20_poly1305_decrypt,
+        chacha20_poly1305_encrypt, fill_random, hkdf_extract_sha256, sha256,
+        tls13_hkdf_expand_label_sha256, wipe_bytes,
     },
     p256::{
         P256_GROUP_ORDER, P256EcdhError, P256Point, P256PointError, Scalar, Uint256, p256_ecdh,
@@ -35,13 +36,20 @@ pub const TLS_SIGNATURE_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
 const HANDSHAKE_HEADER_SIZE: usize = 4;
 const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 1;
 const HANDSHAKE_TYPE_SERVER_HELLO: u8 = 2;
+const HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS: u8 = 8;
 
 const EXTENSION_SERVER_NAME: u16 = 0;
 const EXTENSION_SUPPORTED_GROUPS: u16 = 10;
 const EXTENSION_SIGNATURE_ALGORITHMS: u16 = 13;
+const EXTENSION_APPLICATION_LAYER_PROTOCOL_NEGOTIATION: u16 = 16;
 const EXTENSION_PRE_SHARED_KEY: u16 = 41;
 const EXTENSION_SUPPORTED_VERSIONS: u16 = 43;
 const EXTENSION_KEY_SHARE: u16 = 51;
+
+const TLS_SHA256_HASH_SIZE: usize = 32;
+const TLS_CHACHA20_POLY1305_KEY_SIZE: usize = 32;
+const TLS_CHACHA20_POLY1305_IV_SIZE: usize = 12;
+const ALPN_HTTP_1_1: &[u8] = b"http/1.1";
 
 const CHACHA20_POLY1305_TAG_SIZE: usize = 16;
 const TLS_CHACHA20_POLY1305_CIPHERTEXT_LIMIT: usize =
@@ -226,6 +234,7 @@ pub enum TlsHandshakeError {
     DuplicateKeyShareGroup { group: u16 },
     KeyShareGroupNotOffered { group: u16 },
     KeyShareOrderMismatch,
+    InvalidAlpn,
 }
 
 impl fmt::Display for TlsHandshakeError {
@@ -310,6 +319,9 @@ impl fmt::Display for TlsHandshakeError {
             Self::KeyShareOrderMismatch => formatter.write_str(
                 "TLS ClientHello key shares do not preserve supported_groups ordering",
             ),
+            Self::InvalidAlpn => {
+                formatter.write_str("invalid application_layer_protocol_negotiation extension")
+            }
         }
     }
 }
@@ -327,6 +339,8 @@ pub enum TlsServerHandshakeError {
     ServerPublicKey(P256PointError),
     Random(io::Error),
     Ecdh(P256EcdhError),
+    KeySchedule(HkdfError),
+    RecordProtection(TlsRecordError),
     HandshakeMessageTooLong { length: usize },
 }
 
@@ -365,6 +379,12 @@ impl fmt::Display for TlsServerHandshakeError {
                 )
             }
             Self::Ecdh(error) => write!(formatter, "P-256 ECDH failed: {error}"),
+            Self::KeySchedule(error) => {
+                write!(formatter, "TLS 1.3 key schedule failed: {error}")
+            }
+            Self::RecordProtection(error) => {
+                write!(formatter, "TLS handshake record protection failed: {error}")
+            }
             Self::HandshakeMessageTooLong { length } => {
                 write!(
                     formatter,
@@ -382,6 +402,8 @@ impl Error for TlsServerHandshakeError {
             Self::InvalidP256KeyShare(error) | Self::ServerPublicKey(error) => Some(error),
             Self::Random(error) => Some(error),
             Self::Ecdh(error) => Some(error),
+            Self::KeySchedule(error) => Some(error),
+            Self::RecordProtection(error) => Some(error),
             _ => None,
         }
     }
@@ -390,6 +412,18 @@ impl Error for TlsServerHandshakeError {
 impl From<TlsHandshakeError> for TlsServerHandshakeError {
     fn from(error: TlsHandshakeError) -> Self {
         Self::ClientHello(error)
+    }
+}
+
+impl From<HkdfError> for TlsServerHandshakeError {
+    fn from(error: HkdfError) -> Self {
+        Self::KeySchedule(error)
+    }
+}
+
+impl From<TlsRecordError> for TlsServerHandshakeError {
+    fn from(error: TlsRecordError) -> Self {
+        Self::RecordProtection(error)
     }
 }
 
@@ -423,8 +457,14 @@ impl Default for TlsTranscript {
 pub struct Tls13ServerHelloFlight {
     server_hello: Vec<u8>,
     server_key_share: [u8; 65],
-    shared_secret: [u8; 32],
+    encrypted_extensions: Vec<u8>,
+    encrypted_extensions_record: TlsCiphertextRecord,
+    negotiated_alpn: Option<Vec<u8>>,
+    client_handshake_traffic_secret: [u8; TLS_SHA256_HASH_SIZE],
+    server_handshake_traffic_secret: [u8; TLS_SHA256_HASH_SIZE],
+    main_secret: [u8; TLS_SHA256_HASH_SIZE],
     transcript: TlsTranscript,
+    handshake_record_protection: Tls13RecordProtection,
 }
 
 impl Tls13ServerHelloFlight {
@@ -436,15 +476,154 @@ impl Tls13ServerHelloFlight {
         &self.server_key_share
     }
 
+    pub fn encrypted_extensions(&self) -> &[u8] {
+        &self.encrypted_extensions
+    }
+
+    pub fn encrypted_extensions_record(&self) -> &TlsCiphertextRecord {
+        &self.encrypted_extensions_record
+    }
+
+    pub fn negotiated_alpn(&self) -> Option<&[u8]> {
+        self.negotiated_alpn.as_deref()
+    }
+
     pub fn transcript_hash(&self) -> [u8; 32] {
         self.transcript.hash()
+    }
+
+    pub fn handshake_record_protection_mut(&mut self) -> &mut Tls13RecordProtection {
+        &mut self.handshake_record_protection
     }
 }
 
 impl Drop for Tls13ServerHelloFlight {
     fn drop(&mut self) {
-        wipe_bytes(&mut self.shared_secret);
+        wipe_bytes(&mut self.client_handshake_traffic_secret);
+        wipe_bytes(&mut self.server_handshake_traffic_secret);
+        wipe_bytes(&mut self.main_secret);
     }
+}
+
+struct SecretArray<const N: usize>([u8; N]);
+
+impl<const N: usize> Drop for SecretArray<N> {
+    fn drop(&mut self) {
+        wipe_bytes(&mut self.0);
+    }
+}
+
+struct Tls13HandshakeKeySchedule {
+    client_handshake_traffic_secret: [u8; TLS_SHA256_HASH_SIZE],
+    server_handshake_traffic_secret: [u8; TLS_SHA256_HASH_SIZE],
+    main_secret: [u8; TLS_SHA256_HASH_SIZE],
+    client_key: [u8; TLS_CHACHA20_POLY1305_KEY_SIZE],
+    client_iv: [u8; TLS_CHACHA20_POLY1305_IV_SIZE],
+    server_key: [u8; TLS_CHACHA20_POLY1305_KEY_SIZE],
+    server_iv: [u8; TLS_CHACHA20_POLY1305_IV_SIZE],
+}
+
+impl Drop for Tls13HandshakeKeySchedule {
+    fn drop(&mut self) {
+        wipe_bytes(&mut self.client_handshake_traffic_secret);
+        wipe_bytes(&mut self.server_handshake_traffic_secret);
+        wipe_bytes(&mut self.main_secret);
+        wipe_bytes(&mut self.client_key);
+        wipe_bytes(&mut self.client_iv);
+        wipe_bytes(&mut self.server_key);
+        wipe_bytes(&mut self.server_iv);
+    }
+}
+
+fn derive_tls13_handshake_key_schedule(
+    shared_secret: &[u8; TLS_SHA256_HASH_SIZE],
+    hello_transcript_hash: &[u8; TLS_SHA256_HASH_SIZE],
+) -> Result<Tls13HandshakeKeySchedule, HkdfError> {
+    let zero_secret = [0_u8; TLS_SHA256_HASH_SIZE];
+    let empty_hash = sha256(&[]);
+
+    let early_secret = SecretArray(hkdf_extract_sha256(&zero_secret, &zero_secret));
+
+    let derived_early_secret = SecretArray(tls13_expand_label_array::<TLS_SHA256_HASH_SIZE>(
+        &early_secret.0,
+        "derived",
+        &empty_hash,
+    )?);
+
+    let handshake_secret = SecretArray(hkdf_extract_sha256(&derived_early_secret.0, shared_secret));
+
+    let client_handshake_traffic_secret =
+        SecretArray(tls13_expand_label_array::<TLS_SHA256_HASH_SIZE>(
+            &handshake_secret.0,
+            "c hs traffic",
+            hello_transcript_hash,
+        )?);
+
+    let server_handshake_traffic_secret =
+        SecretArray(tls13_expand_label_array::<TLS_SHA256_HASH_SIZE>(
+            &handshake_secret.0,
+            "s hs traffic",
+            hello_transcript_hash,
+        )?);
+
+    let derived_handshake_secret = SecretArray(tls13_expand_label_array::<TLS_SHA256_HASH_SIZE>(
+        &handshake_secret.0,
+        "derived",
+        &empty_hash,
+    )?);
+
+    let main_secret = SecretArray(hkdf_extract_sha256(
+        &derived_handshake_secret.0,
+        &zero_secret,
+    ));
+
+    let (client_key, client_iv) = derive_tls13_traffic_key_iv(&client_handshake_traffic_secret.0)?;
+
+    let (server_key, server_iv) = derive_tls13_traffic_key_iv(&server_handshake_traffic_secret.0)?;
+
+    Ok(Tls13HandshakeKeySchedule {
+        client_handshake_traffic_secret: client_handshake_traffic_secret.0,
+        server_handshake_traffic_secret: server_handshake_traffic_secret.0,
+        main_secret: main_secret.0,
+        client_key,
+        client_iv,
+        server_key,
+        server_iv,
+    })
+}
+
+fn derive_tls13_traffic_key_iv(
+    traffic_secret: &[u8; TLS_SHA256_HASH_SIZE],
+) -> Result<
+    (
+        [u8; TLS_CHACHA20_POLY1305_KEY_SIZE],
+        [u8; TLS_CHACHA20_POLY1305_IV_SIZE],
+    ),
+    HkdfError,
+> {
+    let key =
+        tls13_expand_label_array::<TLS_CHACHA20_POLY1305_KEY_SIZE>(traffic_secret, "key", &[])?;
+
+    let iv = tls13_expand_label_array::<TLS_CHACHA20_POLY1305_IV_SIZE>(traffic_secret, "iv", &[])?;
+
+    Ok((key, iv))
+}
+
+fn tls13_expand_label_array<const N: usize>(
+    secret: &[u8],
+    label: &str,
+    context: &[u8],
+) -> Result<[u8; N], HkdfError> {
+    let mut expanded = tls13_hkdf_expand_label_sha256(secret, label, context, N)?;
+
+    let output: [u8; N] = expanded
+        .as_slice()
+        .try_into()
+        .expect("HKDF-Expand-Label returned the requested output length");
+
+    wipe_bytes(&mut expanded);
+
+    Ok(output)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,6 +652,7 @@ pub struct ClientHello {
     supported_groups: Vec<u16>,
     key_shares: Vec<TlsKeyShareEntry>,
     signature_algorithms: Vec<u16>,
+    alpn_protocols: Vec<Vec<u8>>,
     pre_shared_key_present: bool,
 }
 
@@ -507,6 +687,16 @@ impl ClientHello {
 
     pub fn signature_algorithms(&self) -> &[u16] {
         &self.signature_algorithms
+    }
+
+    pub fn alpn_protocols(&self) -> &[Vec<u8>] {
+        &self.alpn_protocols
+    }
+
+    pub fn offers_http11(&self) -> bool {
+        self.alpn_protocols
+            .iter()
+            .any(|protocol| protocol.as_slice() == ALPN_HTTP_1_1)
     }
 
     pub fn pre_shared_key_present(&self) -> bool {
@@ -1196,6 +1386,7 @@ pub fn parse_client_hello(message: &[u8]) -> Result<ClientHello, TlsHandshakeErr
         supported_groups,
         key_shares,
         signature_algorithms,
+        alpn_protocols,
         pre_shared_key_present,
     } = parse_client_hello_extensions(extension_block)?;
 
@@ -1248,6 +1439,7 @@ pub fn parse_client_hello(message: &[u8]) -> Result<ClientHello, TlsHandshakeErr
         supported_groups: supported_groups.unwrap_or_default(),
         key_shares: key_shares.unwrap_or_default(),
         signature_algorithms: signature_algorithms.unwrap_or_default(),
+        alpn_protocols: alpn_protocols.unwrap_or_default(),
         pre_shared_key_present,
     })
 }
@@ -1259,6 +1451,7 @@ struct ParsedClientHelloExtensions {
     supported_groups: Option<Vec<u16>>,
     key_shares: Option<Vec<TlsKeyShareEntry>>,
     signature_algorithms: Option<Vec<u16>>,
+    alpn_protocols: Option<Vec<Vec<u8>>>,
     pre_shared_key_present: bool,
 }
 
@@ -1295,6 +1488,9 @@ fn parse_client_hello_extensions(
                     "signature_algorithms",
                 )?);
             }
+            EXTENSION_APPLICATION_LAYER_PROTOCOL_NEGOTIATION => {
+                parsed.alpn_protocols = Some(parse_alpn_protocols(extension_data)?);
+            }
             EXTENSION_PRE_SHARED_KEY => {
                 if !is_last_extension {
                     return Err(TlsHandshakeError::PreSharedKeyNotLast);
@@ -1314,6 +1510,33 @@ fn parse_client_hello_extensions(
     }
 
     Ok(parsed)
+}
+
+fn parse_alpn_protocols(input: &[u8]) -> Result<Vec<Vec<u8>>, TlsHandshakeError> {
+    let mut outer = HandshakeReader::new(input);
+
+    let encoded_protocols = outer.read_vector_u16("application_layer_protocol_negotiation")?;
+
+    outer.finish("application_layer_protocol_negotiation")?;
+
+    if encoded_protocols.is_empty() {
+        return Err(TlsHandshakeError::InvalidAlpn);
+    }
+
+    let mut reader = HandshakeReader::new(encoded_protocols);
+    let mut protocols = Vec::new();
+
+    while reader.remaining() != 0 {
+        let protocol = reader.read_vector_u8("alpn_protocol_name")?;
+
+        if protocol.is_empty() {
+            return Err(TlsHandshakeError::InvalidAlpn);
+        }
+
+        protocols.push(protocol.to_vec());
+    }
+
+    Ok(protocols)
 }
 
 fn parse_server_name(input: &[u8]) -> Result<Option<String>, TlsHandshakeError> {
@@ -1507,7 +1730,7 @@ pub fn negotiate_tls13_server_hello(
         .to_sec1_uncompressed()
         .map_err(TlsServerHandshakeError::ServerPublicKey)?;
 
-    let shared_secret =
+    let mut shared_secret =
         p256_ecdh(server_private_key, client_public_key).map_err(TlsServerHandshakeError::Ecdh)?;
 
     let mut server_random = [0_u8; 32];
@@ -1521,11 +1744,43 @@ pub fn negotiate_tls13_server_hello(
     transcript.update_handshake_message(client_hello_message);
     transcript.update_handshake_message(&server_hello);
 
+    let hello_transcript_hash = transcript.hash();
+
+    let key_schedule_result =
+        derive_tls13_handshake_key_schedule(&shared_secret, &hello_transcript_hash);
+
+    wipe_bytes(&mut shared_secret);
+
+    let key_schedule = key_schedule_result?;
+
+    let mut handshake_record_protection = Tls13RecordProtection::new(
+        key_schedule.server_key,
+        key_schedule.server_iv,
+        key_schedule.client_key,
+        key_schedule.client_iv,
+    );
+
+    let (encrypted_extensions, negotiated_alpn) = build_tls13_encrypted_extensions(&client_hello)?;
+
+    let encrypted_extensions_plaintext =
+        TlsPlaintextRecord::new(ContentType::Handshake, encrypted_extensions.clone())?;
+
+    let encrypted_extensions_record =
+        handshake_record_protection.encrypt_record(&encrypted_extensions_plaintext, 0)?;
+
+    transcript.update_handshake_message(&encrypted_extensions);
+
     Ok(Tls13ServerHelloFlight {
         server_hello,
         server_key_share,
-        shared_secret,
+        encrypted_extensions,
+        encrypted_extensions_record,
+        negotiated_alpn,
+        client_handshake_traffic_secret: key_schedule.client_handshake_traffic_secret,
+        server_handshake_traffic_secret: key_schedule.server_handshake_traffic_secret,
+        main_secret: key_schedule.main_secret,
         transcript,
+        handshake_record_protection,
     })
 }
 
@@ -1543,6 +1798,53 @@ fn generate_ephemeral_p256_private_key() -> io::Result<Scalar> {
             return Ok(Scalar::new(candidate));
         }
     }
+}
+
+fn build_tls13_encrypted_extensions(
+    client_hello: &ClientHello,
+) -> Result<(Vec<u8>, Option<Vec<u8>>), TlsServerHandshakeError> {
+    let mut extensions = Vec::new();
+
+    let negotiated_alpn = if client_hello.offers_http11() {
+        let mut protocol_name_list = vec![
+            u8::try_from(ALPN_HTTP_1_1.len())
+                .expect("HTTP/1.1 ALPN protocol identifier must fit in uint8"),
+        ];
+
+        protocol_name_list.extend_from_slice(ALPN_HTTP_1_1);
+
+        let mut alpn_data = Vec::with_capacity(2 + protocol_name_list.len());
+
+        alpn_data.extend_from_slice(
+            &u16::try_from(protocol_name_list.len())
+                .expect("HTTP/1.1 ALPN protocol list must fit in uint16")
+                .to_be_bytes(),
+        );
+        alpn_data.extend_from_slice(&protocol_name_list);
+
+        append_tls_extension(
+            &mut extensions,
+            EXTENSION_APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
+            &alpn_data,
+        );
+
+        Some(ALPN_HTTP_1_1.to_vec())
+    } else {
+        None
+    };
+
+    let mut body = Vec::with_capacity(2 + extensions.len());
+
+    body.extend_from_slice(
+        &u16::try_from(extensions.len())
+            .expect("TLS EncryptedExtensions block must fit in uint16")
+            .to_be_bytes(),
+    );
+    body.extend_from_slice(&extensions);
+
+    let message = encode_handshake_message(HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, &body)?;
+
+    Ok((message, negotiated_alpn))
 }
 
 fn build_tls13_server_hello(
@@ -2330,6 +2632,38 @@ mod tests {
         test_extension(EXTENSION_KEY_SHARE, &data)
     }
 
+    fn test_alpn_extension(protocols: &[&[u8]]) -> Vec<u8> {
+        let mut encoded_protocols = Vec::new();
+
+        for protocol in protocols {
+            assert!(!protocol.is_empty());
+
+            encoded_protocols.push(
+                u8::try_from(protocol.len())
+                    .expect("test ALPN protocol identifier must fit in uint8"),
+            );
+            encoded_protocols.extend_from_slice(protocol);
+        }
+
+        let mut data = Vec::new();
+
+        data.extend_from_slice(
+            &u16::try_from(encoded_protocols.len())
+                .expect("test ALPN protocol list must fit in uint16")
+                .to_be_bytes(),
+        );
+        data.extend_from_slice(&encoded_protocols);
+
+        test_extension(EXTENSION_APPLICATION_LAYER_PROTOCOL_NEGOTIATION, &data)
+    }
+
+    fn test_hex32(input: &str) -> [u8; 32] {
+        crate::crypto::decode_hex(input)
+            .expect("test hex should decode")
+            .try_into()
+            .expect("test value should contain 32 bytes")
+    }
+
     fn test_client_hello(
         legacy_version: u16,
         compression_methods: &[u8],
@@ -2417,6 +2751,7 @@ mod tests {
                 EXTENSION_SIGNATURE_ALGORITHMS,
                 &[TLS_SIGNATURE_ECDSA_SECP256R1_SHA256],
             ),
+            test_alpn_extension(&[&b"h2"[..], &b"http/1.1"[..]]),
             test_supported_versions_extension(&[TLS_VERSION_1_3]),
             test_key_share_extension(TLS_GROUP_SECP256R1, &client_public_key),
         ];
@@ -2691,14 +3026,32 @@ mod tests {
         let client_shared_secret = p256_ecdh(client_private_key, server_public_key)
             .expect("client-side ECDH should succeed");
 
-        assert_eq!(client_shared_secret, flight.shared_secret);
+        let mut hello_transcript_bytes = client_hello.clone();
+        hello_transcript_bytes.extend_from_slice(server_hello);
 
-        let mut transcript_bytes = client_hello.clone();
-        transcript_bytes.extend_from_slice(server_hello);
+        let hello_transcript_hash = crate::crypto::sha256(&hello_transcript_bytes);
+
+        let client_key_schedule =
+            derive_tls13_handshake_key_schedule(&client_shared_secret, &hello_transcript_hash)
+                .expect("client-side TLS key schedule should succeed");
+
+        assert_eq!(
+            client_key_schedule.client_handshake_traffic_secret,
+            flight.client_handshake_traffic_secret
+        );
+
+        assert_eq!(
+            client_key_schedule.server_handshake_traffic_secret,
+            flight.server_handshake_traffic_secret
+        );
+
+        assert_eq!(client_key_schedule.main_secret, flight.main_secret);
+
+        hello_transcript_bytes.extend_from_slice(flight.encrypted_extensions());
 
         assert_eq!(
             flight.transcript_hash(),
-            crate::crypto::sha256(&transcript_bytes)
+            crate::crypto::sha256(&hello_transcript_bytes)
         );
     }
 
@@ -2798,5 +3151,120 @@ mod tests {
                 group: TLS_GROUP_SECP256R1,
             })
         ));
+    }
+
+    #[test]
+    fn tls13_handshake_key_schedule_matches_rfc8448_trace() {
+        let shared_secret =
+            test_hex32("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
+
+        let hello_transcript_hash =
+            test_hex32("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
+
+        let schedule = derive_tls13_handshake_key_schedule(&shared_secret, &hello_transcript_hash)
+            .expect("RFC 8448 key schedule should derive");
+
+        assert_eq!(
+            schedule.client_handshake_traffic_secret,
+            test_hex32("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21")
+        );
+
+        assert_eq!(
+            schedule.server_handshake_traffic_secret,
+            test_hex32("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38")
+        );
+
+        assert_eq!(
+            schedule.main_secret,
+            test_hex32("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919")
+        );
+    }
+
+    #[test]
+    fn encrypted_extensions_selects_and_encrypts_http11_alpn() {
+        let client_private_key = Scalar::new(Uint256::from_limbs([5, 0, 0, 0]));
+
+        let client_hello =
+            p256_negotiation_client_hello(client_private_key, &[TLS_CHACHA20_POLY1305_SHA256]);
+
+        let flight = negotiate_tls13_server_hello(&client_hello)
+            .expect("TLS 1.3 handshake start should succeed");
+
+        assert_eq!(flight.negotiated_alpn(), Some(ALPN_HTTP_1_1));
+
+        let (client_key, client_iv) =
+            derive_tls13_traffic_key_iv(&flight.client_handshake_traffic_secret)
+                .expect("client handshake traffic key should derive");
+
+        let (server_key, server_iv) =
+            derive_tls13_traffic_key_iv(&flight.server_handshake_traffic_secret)
+                .expect("server handshake traffic key should derive");
+
+        let mut client_record_protection =
+            Tls13RecordProtection::new(client_key, client_iv, server_key, server_iv);
+
+        let decrypted = client_record_protection
+            .decrypt_record(flight.encrypted_extensions_record())
+            .expect("client should decrypt server EncryptedExtensions");
+
+        assert_eq!(decrypted.content_type(), ContentType::Handshake);
+        assert_eq!(decrypted.fragment(), flight.encrypted_extensions());
+        assert_eq!(client_record_protection.read_sequence_number(), Some(1));
+
+        let message = decrypted.fragment();
+
+        assert_eq!(message[0], HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS);
+
+        let declared_length = (usize::from(message[1]) << 16)
+            | (usize::from(message[2]) << 8)
+            | usize::from(message[3]);
+
+        assert_eq!(declared_length, message.len() - HANDSHAKE_HEADER_SIZE);
+
+        let mut body = HandshakeReader::new(&message[HANDSHAKE_HEADER_SIZE..]);
+
+        let extension_block = body
+            .read_vector_u16("EncryptedExtensions")
+            .expect("EncryptedExtensions block should parse");
+
+        body.finish("EncryptedExtensions")
+            .expect("EncryptedExtensions should end cleanly");
+
+        let mut extensions = HandshakeReader::new(extension_block);
+
+        assert_eq!(
+            extensions.read_u16().expect("ALPN extension should parse"),
+            EXTENSION_APPLICATION_LAYER_PROTOCOL_NEGOTIATION
+        );
+
+        let alpn_data = extensions
+            .read_vector_u16("ALPN extension data")
+            .expect("ALPN extension data should parse");
+
+        extensions
+            .finish("EncryptedExtensions extensions")
+            .expect("extension list should end cleanly");
+
+        let mut alpn = HandshakeReader::new(alpn_data);
+
+        let protocol_list = alpn
+            .read_vector_u16("ALPN protocol list")
+            .expect("ALPN protocol list should parse");
+
+        alpn.finish("ALPN")
+            .expect("ALPN extension should end cleanly");
+
+        let mut protocols = HandshakeReader::new(protocol_list);
+
+        assert_eq!(
+            protocols
+                .read_vector_u8("ALPN selected protocol")
+                .expect("selected ALPN protocol should parse"),
+            ALPN_HTTP_1_1
+        );
+
+        protocols
+            .finish("ALPN selected protocol list")
+            .expect("ALPN should contain exactly one selected protocol");
     }
 }

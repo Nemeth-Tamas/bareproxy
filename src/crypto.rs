@@ -650,7 +650,7 @@ pub fn hkdf_expand_sha256(prk: &[u8], info: &[u8], length: usize) -> Result<Vec<
     Ok(output)
 }
 
-/// Performs TLS 1.3 HKDF-Expand-Label as specified by RFC 8446 section 7.1.
+/// Performs TLS 1.3 HKDF-Expand-Label as specified by RFC 9846 section 7.1.
 ///
 /// `label` is supplied without the mandatory `tls13 ` prefix.
 pub fn tls13_hkdf_expand_label_sha256(
