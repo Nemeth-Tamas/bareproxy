@@ -1,6 +1,6 @@
 use std::{env, error::Error, fmt, process::ExitCode};
 
-use crate::{config, server};
+use crate::{config, server, tls_probe};
 
 const APP_NAME: &str = "BareProxy";
 const DEFAULT_CONFIG_PATH: &str = "bareproxy.conf";
@@ -9,7 +9,13 @@ const CLI_ERROR_EXIT_CODE: u8 = 2;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
-    Run { config_path: String },
+    Run {
+        config_path: String,
+    },
+    TlsProbe {
+        certificate_path: String,
+        private_key_path: String,
+    },
     Help,
     Version,
 }
@@ -18,6 +24,7 @@ enum Command {
 enum AppError {
     UnknownArgument(String),
     MissingConfigPath,
+    MissingTlsProbeArguments,
     TooManyArguments,
     Config {
         message: String,
@@ -29,6 +36,9 @@ enum AppError {
     Server {
         message: String,
     },
+    TlsProbe {
+        message: String,
+    },
 }
 
 impl fmt::Display for AppError {
@@ -36,12 +46,17 @@ impl fmt::Display for AppError {
         match self {
             Self::UnknownArgument(argument) => write!(formatter, "unknown argument: {argument}"),
             Self::MissingConfigPath => write!(formatter, "--config requires a path"),
+            Self::MissingTlsProbeArguments => write!(
+                formatter,
+                "--tls-probe requires a certificate DER path and private-key hex path"
+            ),
             Self::TooManyArguments => write!(formatter, "too many arguments"),
             Self::Config { message } => write!(formatter, "configuration error: {message}"),
             Self::ListenerBind { address, message } => {
                 write!(formatter, "failed to listen on {address}: {message}")
             }
             Self::Server { message } => write!(formatter, "server error: {message}"),
+            Self::TlsProbe { message } => write!(formatter, "TLS probe error: {message}"),
         }
     }
 }
@@ -51,12 +66,14 @@ impl Error for AppError {}
 impl AppError {
     fn exit_code(&self) -> u8 {
         match self {
-            Self::Config { .. } | Self::ListenerBind { .. } | Self::Server { .. } => {
-                STARTUP_ERROR_EXIT_CODE
-            }
-            Self::UnknownArgument(_) | Self::MissingConfigPath | Self::TooManyArguments => {
-                CLI_ERROR_EXIT_CODE
-            }
+            Self::Config { .. }
+            | Self::ListenerBind { .. }
+            | Self::Server { .. }
+            | Self::TlsProbe { .. } => STARTUP_ERROR_EXIT_CODE,
+            Self::UnknownArgument(_)
+            | Self::MissingConfigPath
+            | Self::MissingTlsProbeArguments
+            | Self::TooManyArguments => CLI_ERROR_EXIT_CODE,
         }
     }
 }
@@ -74,6 +91,16 @@ pub fn main_exit_code() -> ExitCode {
 fn run() -> Result<(), AppError> {
     match parse_args(env::args().skip(1))? {
         Command::Run { config_path } => start_proxy(&config_path)?,
+        Command::TlsProbe {
+            certificate_path,
+            private_key_path,
+        } => {
+            tls_probe::run(&certificate_path, &private_key_path).map_err(|source| {
+                AppError::TlsProbe {
+                    message: source.to_string(),
+                }
+            })?;
+        }
         Command::Help => print_help(),
         Command::Version => println!("{APP_NAME} {}", env!("CARGO_PKG_VERSION")),
     }
@@ -131,6 +158,15 @@ where
             let config_path = args.next().ok_or(AppError::MissingConfigPath)?;
             Command::Run { config_path }
         }
+        Some("--tls-probe") => {
+            let certificate_path = args.next().ok_or(AppError::MissingTlsProbeArguments)?;
+            let private_key_path = args.next().ok_or(AppError::MissingTlsProbeArguments)?;
+
+            Command::TlsProbe {
+                certificate_path,
+                private_key_path,
+            }
+        }
         Some(argument) => return Err(AppError::UnknownArgument(argument.to_owned())),
     };
 
@@ -154,9 +190,10 @@ fn print_help() {
     println!("    bareproxy [OPTIONS]");
     println!();
     println!("OPTIONS:");
-    println!("    -c, --config <PATH>    Use a custom configuration file");
-    println!("    -h, --help             Print help");
-    println!("    -V, --version          Print version");
+    println!("    -c, --config <PATH>              Use a custom configuration file");
+    println!("    --tls-probe <CERT_DER> <KEY_HEX> Run one local TLS interoperability probe");
+    println!("    -h, --help                       Print help");
+    println!("    -V, --version                    Print version");
     println!();
     println!("Default config: {DEFAULT_CONFIG_PATH}");
 }
@@ -200,6 +237,29 @@ mod tests {
         assert_eq!(
             parse_args(vec!["--config".to_owned()]),
             Err(AppError::MissingConfigPath)
+        );
+    }
+
+    #[test]
+    fn tls_probe_selects_certificate_and_private_key() {
+        assert_eq!(
+            parse_args(vec![
+                "--tls-probe".to_owned(),
+                "certificate.der".to_owned(),
+                "private-key.hex".to_owned(),
+            ]),
+            Ok(Command::TlsProbe {
+                certificate_path: "certificate.der".to_owned(),
+                private_key_path: "private-key.hex".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn tls_probe_requires_both_paths() {
+        assert_eq!(
+            parse_args(vec!["--tls-probe".to_owned(), "certificate.der".to_owned(),]),
+            Err(AppError::MissingTlsProbeArguments)
         );
     }
 
