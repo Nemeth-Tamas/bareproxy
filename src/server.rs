@@ -51,6 +51,14 @@ impl ServerCounters {
     }
 }
 
+enum ConnectionOutcome {
+    Complete,
+    Upgraded {
+        session: proxy::Session,
+        buffered_client_bytes: Vec<u8>,
+    },
+}
+
 #[cfg(unix)]
 unsafe extern "C" {
     fn signal(signal: i32, handler: *const ()) -> *const ();
@@ -282,8 +290,40 @@ fn handle_accepted_connection(
 
     stream.set_read_timeout(Some(idle_timeout))?;
 
-    match handle_connection(&mut stream, configuration, counters) {
-        Ok(()) => Ok(()),
+    match handle_connection_io(
+        &mut stream,
+        peer_addr,
+        configuration,
+        counters,
+        proxy::ForwardedProto::Http,
+    ) {
+        Ok(ConnectionOutcome::Complete) => {
+            let _ = stream.shutdown(Shutdown::Both);
+            Ok(())
+        }
+        Ok(ConnectionOutcome::Upgraded {
+            mut session,
+            buffered_client_bytes,
+        }) => {
+            println!("INFO event=upgrade_tunnel_start peer={peer_addr}");
+
+            match session.tunnel_upgraded(&mut stream, buffered_client_bytes) {
+                Ok(()) => {
+                    println!("INFO event=upgrade_tunnel_close peer={peer_addr}");
+                }
+                Err(error) => {
+                    let errors_total = counters.record_error();
+
+                    eprintln!(
+                        "ERROR event=upgrade_tunnel_failure peer={peer_addr} error={error} errors_total={errors_total}"
+                    );
+                }
+            }
+
+            let _ = stream.shutdown(Shutdown::Both);
+
+            Ok(())
+        }
         Err(error) if is_client_idle_timeout(&error) => {
             println!(
                 "WARN event=client_idle_timeout peer={peer_addr} timeout_seconds={}",
@@ -301,7 +341,62 @@ fn handle_accepted_connection(
                 "WARN event=protocol_error peer={peer_addr} phase=request_head error={error} errors_total={errors_total}"
             );
 
-            write_text_response(&mut stream, http::StatusCode::BadRequest, "Bad Request\n")
+            let result =
+                write_text_response(&mut stream, http::StatusCode::BadRequest, "Bad Request\n");
+
+            let _ = stream.shutdown(Shutdown::Both);
+
+            result
+        }
+        Err(error) if is_client_disconnect(&error) => {
+            println!("INFO event=client_disconnect peer={peer_addr} error={error}");
+
+            let _ = stream.shutdown(Shutdown::Both);
+
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn handle_https_connection<S>(
+    stream: &mut S,
+    peer_addr: SocketAddr,
+    configuration: &config::Config,
+) -> io::Result<()>
+where
+    S: Read + Write,
+{
+    let counters = ServerCounters::default();
+
+    match handle_connection_io(
+        stream,
+        peer_addr,
+        configuration,
+        &counters,
+        proxy::ForwardedProto::Https,
+    ) {
+        Ok(ConnectionOutcome::Complete) => Ok(()),
+        Ok(ConnectionOutcome::Upgraded { .. }) => {
+            let errors_total = counters.record_error();
+
+            eprintln!(
+                "WARN event=https_upgrade_unsupported peer={peer_addr} errors_total={errors_total}"
+            );
+
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TLS upgrade tunnelling is not implemented yet",
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            let errors_total = counters.record_error();
+
+            eprintln!(
+                "WARN event=protocol_error peer={peer_addr} phase=request_head error={error} errors_total={errors_total}"
+            );
+
+            write_text_response(stream, http::StatusCode::BadRequest, "Bad Request\n")
         }
         Err(error) if is_client_disconnect(&error) => {
             println!("INFO event=client_disconnect peer={peer_addr} error={error}");
@@ -311,19 +406,23 @@ fn handle_accepted_connection(
     }
 }
 
-fn handle_connection(
-    stream: &mut TcpStream,
+fn handle_connection_io<S>(
+    stream: &mut S,
+    peer_addr: SocketAddr,
     configuration: &config::Config,
     counters: &ServerCounters,
-) -> io::Result<()> {
-    let peer_addr = stream.peer_addr()?;
+    forwarded_proto: proxy::ForwardedProto,
+) -> io::Result<ConnectionOutcome>
+where
+    S: Read + Write,
+{
     let mut buffered = Vec::new();
     let mut proxy_session = proxy::Session::new(configuration.upstream_timeout_seconds());
 
     loop {
         let Some(received) = read_request_head(stream, &buffered)? else {
             println!("INFO event=client_disconnect peer={peer_addr} phase=before_request");
-            return Ok(());
+            return Ok(ConnectionOutcome::Complete);
         };
 
         let ReceivedRequest {
@@ -363,7 +462,10 @@ fn handle_connection(
                 );
 
                 let body = format!("{}\n", status.reason_phrase());
-                return write_text_response(stream, status, &body);
+
+                write_text_response(stream, status, &body)?;
+
+                return Ok(ConnectionOutcome::Complete);
             }
         };
 
@@ -371,26 +473,19 @@ fn handle_connection(
 
         let client_ip = peer_addr.ip();
 
-        match proxy_session.exchange(route, &request, stream, &buffered_body, client_ip) {
+        match proxy_session.exchange_with_proto(
+            route,
+            &request,
+            stream,
+            &buffered_body,
+            client_ip,
+            forwarded_proto,
+        ) {
             Ok(result) if result.upgraded => {
-                println!("INFO event=upgrade_tunnel_start peer={peer_addr}");
-
-                match proxy_session.tunnel_upgraded(stream, result.buffered_client_bytes) {
-                    Ok(()) => {
-                        println!("INFO event=upgrade_tunnel_close peer={peer_addr}");
-                    }
-                    Err(error) => {
-                        let errors_total = counters.record_error();
-
-                        eprintln!(
-                            "ERROR event=upgrade_tunnel_failure peer={peer_addr} error={error} errors_total={errors_total}"
-                        );
-                    }
-                }
-
-                let _ = stream.shutdown(Shutdown::Both);
-
-                return Ok(());
+                return Ok(ConnectionOutcome::Upgraded {
+                    session: proxy_session,
+                    buffered_client_bytes: result.buffered_client_bytes,
+                });
             }
             Ok(result) if request.keep_alive && result.client_reusable => {
                 buffered = result.buffered_client_bytes;
@@ -412,8 +507,7 @@ fn handle_connection(
                     );
                 }
 
-                let _ = stream.shutdown(Shutdown::Both);
-                return Ok(());
+                return Ok(ConnectionOutcome::Complete);
             }
             Err(proxy::ProxyError::InvalidClientBody { message }) => {
                 let errors_total = counters.record_error();
@@ -422,7 +516,9 @@ fn handle_connection(
                     "WARN event=protocol_error peer={peer_addr} phase=request_body error={message} errors_total={errors_total}"
                 );
 
-                return write_text_response(stream, http::StatusCode::BadRequest, "Bad Request\n");
+                write_text_response(stream, http::StatusCode::BadRequest, "Bad Request\n")?;
+
+                return Ok(ConnectionOutcome::Complete);
             }
             Err(proxy::ProxyError::ClientRead { kind, message }) => {
                 return Err(io::Error::new(kind, message));
@@ -434,9 +530,7 @@ fn handle_connection(
                     "ERROR event=upstream_failure peer={peer_addr} phase=response_stream error={message} errors_total={errors_total}"
                 );
 
-                let _ = stream.shutdown(Shutdown::Both);
-
-                return Ok(());
+                return Ok(ConnectionOutcome::Complete);
             }
             Err(error) if error.is_upstream_timeout() => {
                 let errors_total = counters.record_error();
@@ -445,11 +539,13 @@ fn handle_connection(
                     "ERROR event=upstream_failure peer={peer_addr} kind=timeout error={error} errors_total={errors_total}"
                 );
 
-                return write_text_response(
+                write_text_response(
                     stream,
                     http::StatusCode::GatewayTimeout,
                     "Gateway Timeout\n",
-                );
+                )?;
+
+                return Ok(ConnectionOutcome::Complete);
             }
             Err(error) => {
                 let errors_total = counters.record_error();
@@ -458,7 +554,9 @@ fn handle_connection(
                     "ERROR event=upstream_failure peer={peer_addr} error={error} errors_total={errors_total}"
                 );
 
-                return write_text_response(stream, http::StatusCode::BadGateway, "Bad Gateway\n");
+                write_text_response(stream, http::StatusCode::BadGateway, "Bad Gateway\n")?;
+
+                return Ok(ConnectionOutcome::Complete);
             }
         }
     }
@@ -536,7 +634,7 @@ fn select_route<'a>(
 }
 
 fn write_text_response(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     status: http::StatusCode,
     body: &str,
 ) -> io::Result<()> {
@@ -544,11 +642,7 @@ fn write_text_response(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
     stream.write_all(&response)?;
-    stream.flush()?;
-
-    let _ = stream.shutdown(Shutdown::Both);
-
-    Ok(())
+    stream.flush()
 }
 
 fn build_text_response(

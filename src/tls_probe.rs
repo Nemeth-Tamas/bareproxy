@@ -5,11 +5,13 @@ use std::{
 };
 
 use crate::{
+    config, server,
     tls::{
         self, CiphertextRecordDecoder, ContentType, HandshakeDeframer, PlaintextRecordDecoder,
-        TLS_CIPHERTEXT_FRAGMENT_LIMIT, TLS_LEGACY_RECORD_VERSION, TLS_RECORD_HEADER_SIZE,
-        Tls13ApplicationEvent, Tls13ApplicationState, Tls13ServerFirstFlight, TlsAlert,
-        TlsAlertDescription, TlsCiphertextRecord, TlsPlaintextRecord,
+        TLS_CIPHERTEXT_FRAGMENT_LIMIT, TLS_LEGACY_RECORD_VERSION, TLS_PLAINTEXT_FRAGMENT_LIMIT,
+        TLS_RECORD_HEADER_SIZE, Tls13ApplicationEvent, Tls13ApplicationState,
+        Tls13ServerFirstFlight, TlsAlert, TlsAlertDescription, TlsCiphertextRecord,
+        TlsPlaintextRecord,
     },
     tls_identity::{TlsIdentity, TlsIdentityStore},
 };
@@ -38,14 +40,17 @@ pub fn run(certificate_path: &str, private_key_path: &str) -> io::Result<()> {
 
     println!("INFO event=tls_probe_connection_accept peer={peer_addr}");
 
-    handle_connection(&mut stream, &identities)?;
+    handle_connection(&mut stream, &identities, None)?;
 
     println!("INFO event=tls_probe_complete peer={peer_addr}");
 
     Ok(())
 }
 
-pub fn run_configured(identities: TlsIdentityStore) -> io::Result<()> {
+pub fn run_configured(
+    identities: TlsIdentityStore,
+    configuration: config::Config,
+) -> io::Result<()> {
     let listener = TcpListener::bind(DEV_TLS_PROBE_ADDR)?;
 
     println!(
@@ -61,7 +66,7 @@ pub fn run_configured(identities: TlsIdentityStore) -> io::Result<()> {
 
         println!("INFO event=tls_probe_connection_accept peer={peer_addr}");
 
-        match handle_connection(&mut stream, &identities) {
+        match handle_connection(&mut stream, &identities, Some(&configuration)) {
             Ok(()) => {
                 println!("INFO event=tls_probe_complete peer={peer_addr}");
             }
@@ -77,7 +82,11 @@ fn configure_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_write_timeout(Some(PROBE_IO_TIMEOUT))
 }
 
-fn handle_connection(stream: &mut TcpStream, identities: &TlsIdentityStore) -> io::Result<()> {
+fn handle_connection(
+    stream: &mut TcpStream,
+    identities: &TlsIdentityStore,
+    configuration: Option<&config::Config>,
+) -> io::Result<()> {
     let client_hello1 = read_client_hello(stream, false)?;
 
     let parsed_client_hello =
@@ -103,6 +112,18 @@ fn handle_connection(stream: &mut TcpStream, identities: &TlsIdentityStore) -> i
     };
 
     println!("INFO event=tls_probe_identity_selected server_name={server_name}");
+
+    if let Some(configuration) = configuration
+        && configuration.route_for_host(server_name).is_err()
+    {
+        write_fatal_alert(stream, TlsAlertDescription::UnrecognizedName)?;
+
+        println!(
+            "WARN event=tls_probe_sni_rejected server_name={server_name} alert=unrecognized_name reason=no_configured_route"
+        );
+
+        return Ok(());
+    }
 
     let first_flight = tls::negotiate_tls13_server_first_flight(&client_hello1)
         .map_err(|error| invalid_data(error.to_string()))?;
@@ -167,6 +188,20 @@ fn handle_connection(stream: &mut TcpStream, identities: &TlsIdentityStore) -> i
         .unwrap_or("-");
 
     println!("INFO event=tls_probe_handshake_complete alpn={negotiated_alpn}");
+
+    if let Some(configuration) = configuration {
+        let peer_addr = stream.peer_addr()?;
+
+        let mut transport = TlsApplicationTransport::new(stream, application_state);
+
+        server::handle_https_connection(&mut transport, peer_addr, configuration)?;
+
+        transport.send_close_notify()?;
+
+        println!("INFO event=tls_probe_https_proxy_complete peer={peer_addr}");
+
+        return Ok(());
+    }
 
     let request = read_http_request(stream, &mut application_state)?;
 
@@ -298,6 +333,134 @@ fn read_client_finished_record(stream: &mut TcpStream) -> io::Result<TlsCipherte
         }
 
         return decode_ciphertext_record(&wire);
+    }
+}
+
+struct TlsApplicationTransport<'a> {
+    stream: &'a mut TcpStream,
+    application_state: Tls13ApplicationState,
+    read_buffer: Vec<u8>,
+    read_position: usize,
+    peer_closed: bool,
+}
+
+impl<'a> TlsApplicationTransport<'a> {
+    fn new(stream: &'a mut TcpStream, application_state: Tls13ApplicationState) -> Self {
+        Self {
+            stream,
+            application_state,
+            read_buffer: Vec::new(),
+            read_position: 0,
+            peer_closed: false,
+        }
+    }
+
+    fn send_close_notify(&mut self) -> io::Result<()> {
+        let close_notify = self
+            .application_state
+            .encrypt_close_notify()
+            .map_err(|error| invalid_data(error.to_string()))?;
+
+        self.stream.write_all(&close_notify.serialize())?;
+        self.stream.flush()
+    }
+}
+
+impl Read for TlsApplicationTransport<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            if self.read_position < self.read_buffer.len() {
+                let remaining = &self.read_buffer[self.read_position..];
+                let bytes_read = remaining.len().min(output.len());
+
+                output[..bytes_read].copy_from_slice(&remaining[..bytes_read]);
+
+                self.read_position += bytes_read;
+
+                if self.read_position == self.read_buffer.len() {
+                    self.read_buffer.clear();
+                    self.read_position = 0;
+                }
+
+                return Ok(bytes_read);
+            }
+
+            if self.peer_closed {
+                return Ok(0);
+            }
+
+            let wire = read_wire_record(self.stream)?;
+
+            if wire[0] != ContentType::ApplicationData as u8 {
+                return Err(invalid_data(format!(
+                    "expected protected TLS application data, got content type {}",
+                    wire[0]
+                )));
+            }
+
+            let record = decode_ciphertext_record(&wire)?;
+
+            match self
+                .application_state
+                .receive_protected_record(&record)
+                .map_err(|error| invalid_data(error.to_string()))?
+            {
+                Tls13ApplicationEvent::ApplicationData(fragment) => {
+                    if fragment.is_empty() {
+                        continue;
+                    }
+
+                    self.read_buffer = fragment;
+                    self.read_position = 0;
+                }
+                Tls13ApplicationEvent::CloseNotify => {
+                    self.peer_closed = true;
+                    return Ok(0);
+                }
+                Tls13ApplicationEvent::UserCanceled => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "TLS peer canceled the connection",
+                    ));
+                }
+                Tls13ApplicationEvent::FatalAlert(description) => {
+                    return Err(invalid_data(format!(
+                        "TLS peer sent fatal alert {description:?}"
+                    )));
+                }
+                Tls13ApplicationEvent::IgnoredAfterCloseNotify => {
+                    self.peer_closed = true;
+                    return Ok(0);
+                }
+            }
+        }
+    }
+}
+
+impl Write for TlsApplicationTransport<'_> {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if input.is_empty() {
+            return Ok(0);
+        }
+
+        for fragment in input.chunks(TLS_PLAINTEXT_FRAGMENT_LIMIT) {
+            let record = self
+                .application_state
+                .encrypt_application_data_record(fragment)
+                .map_err(|error| invalid_data(error.to_string()))?;
+
+            self.stream.write_all(&record.serialize())?;
+        }
+
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
     }
 }
 

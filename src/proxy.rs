@@ -120,6 +120,21 @@ fn is_timeout_kind(kind: io::ErrorKind) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardedProto {
+    Http,
+    Https,
+}
+
+impl ForwardedProto {
+    fn as_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Http => b"http",
+            Self::Https => b"https",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponseTransferFraming {
     None,
     CloseDelimited,
@@ -250,6 +265,28 @@ impl Session {
     where
         S: Read + Write,
     {
+        self.exchange_with_proto(
+            route,
+            request,
+            client,
+            buffered_body,
+            client_ip,
+            ForwardedProto::Http,
+        )
+    }
+
+    pub fn exchange_with_proto<S>(
+        &mut self,
+        route: &config::Route,
+        request: &http::Request,
+        client: &mut S,
+        buffered_body: &[u8],
+        client_ip: IpAddr,
+        forwarded_proto: ForwardedProto,
+    ) -> Result<ExchangeResult, ProxyError>
+    where
+        S: Read + Write,
+    {
         let requested_upgrade_protocols = request_upgrade_protocols(request)?;
         let address = route.upstream().address();
 
@@ -269,7 +306,7 @@ impl Session {
 
         let upstream = &mut upstream_connection.stream;
 
-        let request_head = serialize_request_head(request, client_ip)?;
+        let request_head = serialize_request_head(request, client_ip, forwarded_proto)?;
 
         upstream
             .write_all(&request_head)
@@ -1810,6 +1847,7 @@ fn response_content_length(headers: &[u8]) -> Result<Option<u64>, ProxyError> {
 fn serialize_request_head(
     request: &http::Request,
     client_ip: IpAddr,
+    forwarded_proto: ForwardedProto,
 ) -> Result<Vec<u8>, ProxyError> {
     let original_host = request.host().ok_or(ProxyError::MissingHost)?;
     let upgrade_protocols = request_upgrade_protocols(request)?;
@@ -1896,7 +1934,9 @@ fn serialize_request_head(
     output.extend_from_slice(original_host.as_bytes());
     output.extend_from_slice(b"\r\n");
 
-    output.extend_from_slice(b"X-Forwarded-Proto: http\r\n");
+    output.extend_from_slice(b"X-Forwarded-Proto: ");
+    output.extend_from_slice(forwarded_proto.as_bytes());
+    output.extend_from_slice(b"\r\n");
     output.extend_from_slice(b"\r\n");
 
     Ok(output)
@@ -2154,10 +2194,17 @@ mod tests {
     use crate::{config, http};
 
     use super::{
-        ProxyError, exchange, response_content_length, sanitize_response_head,
-        serialize_request_head, stream_chunked_request_body, stream_chunked_response_body,
-        stream_close_delimited_response_body,
+        ForwardedProto, ProxyError, exchange, response_content_length, sanitize_response_head,
+        serialize_request_head as serialize_request_head_with_proto, stream_chunked_request_body,
+        stream_chunked_response_body, stream_close_delimited_response_body,
     };
+
+    fn serialize_request_head(
+        request: &http::Request,
+        client_ip: IpAddr,
+    ) -> Result<Vec<u8>, ProxyError> {
+        serialize_request_head_with_proto(request, client_ip, ForwardedProto::Http)
+    }
 
     struct FragmentedReader {
         data: Vec<u8>,

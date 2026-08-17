@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from tls_interop import (
@@ -18,6 +19,44 @@ from tls_interop import (
 
 
 TLS_PROBE_ADDRESS = "127.0.0.1:8443"
+
+
+def start_upstream(label):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            forwarded_proto = self.headers.get(
+                "X-Forwarded-Proto",
+                "-",
+            )
+
+            body = (
+                f"{label} upstream "
+                f"x-forwarded-proto={forwarded_proto}\n"
+            ).encode("ascii")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        Handler,
+    )
+
+    thread = threading.Thread(
+        target=server.serve_forever,
+        daemon=True,
+    )
+
+    thread.start()
+
+    return server, thread
 
 
 def generate_identity(openssl, directory, hostname):
@@ -104,10 +143,15 @@ def run_client(openssl, ca_bundle, hostname, groups):
         "-ign_eof",
     ]
 
+    http_request = HTTP_REQUEST.replace(
+        "Host: localhost",
+        f"Host: {hostname}",
+    )
+
     return subprocess.run(
         command,
         cwd=ROOT,
-        input=HTTP_REQUEST,
+        input=http_request,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -184,6 +228,17 @@ def main():
             encoding="ascii",
         )
 
+        alpha_upstream, alpha_upstream_thread = start_upstream(
+            "alpha"
+        )
+
+        beta_upstream, beta_upstream_thread = start_upstream(
+            "beta"
+        )
+
+        alpha_port = alpha_upstream.server_address[1]
+        beta_port = beta_upstream.server_address[1]
+
         config_path = directory / "bareproxy-sni.conf"
 
         config_path.write_text(
@@ -191,8 +246,8 @@ def main():
             f"{alpha_cert.name} | {alpha_key.name}\n"
             "tls_identity = "
             f"{beta_cert.name} | {beta_key.name}\n"
-            "alpha.localhost -> 127.0.0.1:3000\n"
-            "beta.localhost -> 127.0.0.1:3001\n",
+            f"alpha.localhost -> 127.0.0.1:{alpha_port}\n"
+            f"beta.localhost -> 127.0.0.1:{beta_port}\n",
             encoding="utf-8",
         )
 
@@ -274,8 +329,12 @@ def main():
                     alpha_event,
                 ),
                 (
-                    "encrypted HTTP round-tripped",
-                    "BareProxy TLS probe OK." in alpha.stdout,
+                    "request reached alpha upstream",
+                    "alpha upstream" in alpha.stdout,
+                ),
+                (
+                    "alpha received X-Forwarded-Proto https",
+                    "x-forwarded-proto=https" in alpha.stdout,
                 ),
                 (
                     "direct ServerHello path used",
@@ -317,8 +376,12 @@ def main():
                     beta_event,
                 ),
                 (
-                    "encrypted HTTP round-tripped",
-                    "BareProxy TLS probe OK." in beta.stdout,
+                    "request reached beta upstream",
+                    "beta upstream" in beta.stdout,
+                ),
+                (
+                    "beta received X-Forwarded-Proto https",
+                    "x-forwarded-proto=https" in beta.stdout,
                 ),
                 (
                     "HelloRetryRequest path used",
@@ -374,6 +437,15 @@ def main():
 
         collector.join(timeout=1)
 
+        alpha_upstream.shutdown()
+        beta_upstream.shutdown()
+
+        alpha_upstream.server_close()
+        beta_upstream.server_close()
+
+        alpha_upstream_thread.join(timeout=1)
+        beta_upstream_thread.join(timeout=1)
+
         passed = alpha_passed and beta_passed and unknown_passed
 
         if not passed:
@@ -398,8 +470,8 @@ def main():
 
     if passed:
         print(
-            "PASS: one BareProxy TLS socket served two configured "
-            "SNI certificates and rejected an unknown name :D"
+            "PASS: one BareProxy TLS socket selected two certificates, "
+            "reverse-proxied both HTTPS sites, and rejected an unknown name :D"
         )
         return 0
 

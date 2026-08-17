@@ -110,7 +110,7 @@ fn run() -> Result<(), AppError> {
             })?;
         }
         Command::TlsConfigProbe { config_path } => {
-            let (_, tls_identity_files) =
+            let (configuration, tls_identity_files) =
                 config::load_with_tls(&config_path).map_err(|source| AppError::Config {
                     message: source.to_string(),
                 })?;
@@ -123,8 +123,10 @@ fn run() -> Result<(), AppError> {
                     message: "configured TLS probe requires at least one tls_identity".to_owned(),
                 })?;
 
-            tls_probe::run_configured(identities).map_err(|source| AppError::TlsProbe {
-                message: source.to_string(),
+            tls_probe::run_configured(identities, configuration).map_err(|source| {
+                AppError::TlsProbe {
+                    message: source.to_string(),
+                }
             })?;
         }
         Command::Help => print_help(),
