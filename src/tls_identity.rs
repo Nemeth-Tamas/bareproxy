@@ -2,6 +2,7 @@ use std::{collections::HashSet, fs, io, path::Path};
 
 use crate::{
     asn1,
+    config::TlsIdentityFiles,
     crypto::wipe_bytes,
     p256::{Scalar, p256_generator_multiply},
 };
@@ -96,6 +97,23 @@ pub struct TlsIdentityStore {
 }
 
 impl TlsIdentityStore {
+    pub fn load_files(identity_files: &[TlsIdentityFiles]) -> io::Result<Option<Self>> {
+        if identity_files.is_empty() {
+            return Ok(None);
+        }
+
+        let mut identities = Vec::with_capacity(identity_files.len());
+
+        for identity_files in identity_files {
+            identities.push(TlsIdentity::load_pem_files(
+                identity_files.certificate_path(),
+                identity_files.private_key_path(),
+            )?);
+        }
+
+        Self::new(identities).map(Some)
+    }
+
     pub fn new(identities: Vec<TlsIdentity>) -> io::Result<Self> {
         if identities.is_empty() {
             return Err(invalid_input(

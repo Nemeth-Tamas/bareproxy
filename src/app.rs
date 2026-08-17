@@ -1,6 +1,6 @@
 use std::{env, error::Error, fmt, process::ExitCode};
 
-use crate::{config, server, tls_probe};
+use crate::{config, server, tls_identity::TlsIdentityStore, tls_probe};
 
 const APP_NAME: &str = "BareProxy";
 const DEFAULT_CONFIG_PATH: &str = "bareproxy.conf";
@@ -111,11 +111,23 @@ fn run() -> Result<(), AppError> {
 fn start_proxy(config_path: &str) -> Result<(), AppError> {
     print_startup_banner(config_path);
 
-    let config = config::load(config_path).map_err(|source| AppError::Config {
-        message: source.to_string(),
-    })?;
+    let (config, tls_identity_files) =
+        config::load_with_tls(config_path).map_err(|source| AppError::Config {
+            message: source.to_string(),
+        })?;
+
+    let tls_identities =
+        TlsIdentityStore::load_files(&tls_identity_files).map_err(|source| AppError::Config {
+            message: format!("TLS identity error: {source}"),
+        })?;
 
     println!("Loaded {} route(s)", config.routes().len());
+    println!(
+        "Loaded {} TLS identity(s)",
+        tls_identities
+            .as_ref()
+            .map_or(0, |identities| identities.identities().len())
+    );
     println!("Max connections: {}", config.max_connections());
     println!(
         "Client idle timeout: {}s",

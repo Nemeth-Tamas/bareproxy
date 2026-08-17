@@ -499,6 +499,7 @@ Goal: select the correct certificate and proxy route during TLS setup.
 * [ ] Reject or safely handle unknown SNI names.
 * [x] Keep certificate material separate from route configuration.
 * [x] Allow multiple certificates in memory.
+* [x] Load configured PEM certificate/key identities at startup.
 * [ ] Serve different certificates from one listening socket.
 * [ ] Make TLS connection state available to the HTTP layer.
 * [ ] Set `X-Forwarded-Proto: https`.

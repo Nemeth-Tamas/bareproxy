@@ -1,4 +1,10 @@
-use std::{collections::HashSet, error::Error, fmt, fs, net::IpAddr};
+use std::{
+    collections::HashSet,
+    error::Error,
+    fmt, fs,
+    net::IpAddr,
+    path::{Path, PathBuf},
+};
 
 const DEFAULT_MAX_CONNECTIONS: usize = 128;
 const DEFAULT_CLIENT_IDLE_TIMEOUT_SECONDS: u64 = 30;
@@ -36,6 +42,32 @@ impl Config {
             .iter()
             .find(|route| route.hostname == hostname)
             .ok_or(RouteLookupError::NotFound(hostname))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsIdentityFiles {
+    certificate_path: PathBuf,
+    private_key_path: PathBuf,
+}
+
+impl TlsIdentityFiles {
+    pub fn certificate_path(&self) -> &Path {
+        &self.certificate_path
+    }
+
+    pub fn private_key_path(&self) -> &Path {
+        &self.private_key_path
+    }
+
+    fn resolve_against(&mut self, base_directory: &Path) {
+        if self.certificate_path.is_relative() {
+            self.certificate_path = base_directory.join(&self.certificate_path);
+        }
+
+        if self.private_key_path.is_relative() {
+            self.private_key_path = base_directory.join(&self.private_key_path);
+        }
     }
 }
 
@@ -116,16 +148,33 @@ impl fmt::Display for ConfigError {
 impl Error for ConfigError {}
 
 pub fn load(path: &str) -> Result<Config, ConfigError> {
+    load_with_tls(path).map(|(configuration, _)| configuration)
+}
+
+pub fn load_with_tls(path: &str) -> Result<(Config, Vec<TlsIdentityFiles>), ConfigError> {
     let contents = fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.to_owned(),
         message: source.to_string(),
     })?;
 
-    parse(&contents)
+    let (configuration, mut tls_identity_files) = parse_with_tls(&contents)?;
+
+    let base_directory = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
+
+    for identity_files in &mut tls_identity_files {
+        identity_files.resolve_against(base_directory);
+    }
+
+    Ok((configuration, tls_identity_files))
 }
 
 pub fn parse(input: &str) -> Result<Config, ConfigError> {
+    parse_with_tls(input).map(|(configuration, _)| configuration)
+}
+
+fn parse_with_tls(input: &str) -> Result<(Config, Vec<TlsIdentityFiles>), ConfigError> {
     let mut routes = Vec::new();
+    let mut tls_identity_files = Vec::new();
     let mut hostnames = HashSet::new();
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
     let mut max_connections_set = false;
@@ -139,6 +188,26 @@ pub fn parse(input: &str) -> Result<Config, ConfigError> {
         let line = strip_comment(raw_line).trim();
 
         if line.is_empty() {
+            continue;
+        }
+
+        if let Some((directive, value)) = line.split_once('=')
+            && directive.trim() == "tls_identity"
+        {
+            let identity_files =
+                parse_tls_identity_files(value.trim()).map_err(|message| ConfigError::Line {
+                    line: line_number,
+                    message,
+                })?;
+
+            if tls_identity_files.contains(&identity_files) {
+                return Err(ConfigError::Line {
+                    line: line_number,
+                    message: "duplicate tls_identity certificate/key pair".to_owned(),
+                });
+            }
+
+            tls_identity_files.push(identity_files);
             continue;
         }
 
@@ -238,17 +307,42 @@ pub fn parse(input: &str) -> Result<Config, ConfigError> {
         routes.push(Route { hostname, upstream });
     }
 
-    Ok(Config {
-        routes,
-        max_connections,
-        client_idle_timeout_seconds,
-        upstream_timeout_seconds,
-    })
+    Ok((
+        Config {
+            routes,
+            max_connections,
+            client_idle_timeout_seconds,
+            upstream_timeout_seconds,
+        },
+        tls_identity_files,
+    ))
 }
 
 fn strip_comment(line: &str) -> &str {
     line.split_once('#')
         .map_or(line, |(before_comment, _)| before_comment)
+}
+
+fn parse_tls_identity_files(input: &str) -> Result<TlsIdentityFiles, String> {
+    let syntax_error = || "tls_identity must use `certificate.pem | private-key.pem`".to_owned();
+
+    let (certificate_path, private_key_path) = input.split_once('|').ok_or_else(syntax_error)?;
+
+    if private_key_path.contains('|') {
+        return Err(syntax_error());
+    }
+
+    let certificate_path = certificate_path.trim();
+    let private_key_path = private_key_path.trim();
+
+    if certificate_path.is_empty() || private_key_path.is_empty() {
+        return Err(syntax_error());
+    }
+
+    Ok(TlsIdentityFiles {
+        certificate_path: PathBuf::from(certificate_path),
+        private_key_path: PathBuf::from(private_key_path),
+    })
 }
 
 fn normalize_hostname(hostname: &str) -> Option<String> {
@@ -437,8 +531,11 @@ fn parse_upstream_timeout_seconds(value: &str) -> Result<u64, String> {
 mod tests {
     use super::{
         Config, ConfigError, DEFAULT_CLIENT_IDLE_TIMEOUT_SECONDS, DEFAULT_MAX_CONNECTIONS,
-        DEFAULT_UPSTREAM_TIMEOUT_SECONDS, Route, RouteLookupError, Upstream, parse,
+        DEFAULT_UPSTREAM_TIMEOUT_SECONDS, Route, RouteLookupError, TlsIdentityFiles, Upstream,
+        parse, parse_with_tls,
     };
+
+    use std::path::PathBuf;
 
     #[test]
     fn parses_route() {
@@ -517,6 +614,61 @@ example.test -> 127.0.0.1:3000",
         .unwrap();
 
         assert_eq!(config.upstream_timeout_seconds(), 3);
+    }
+
+    #[test]
+    fn parses_tls_identities_separately_from_routes() {
+        let (config, identities) = parse_with_tls(
+            "tls_identity = certs/one.pem | certs/one-key.pem\n\
+tls_identity = certs/two.pem | certs/two-key.pem\n\
+example.test -> 127.0.0.1:3000",
+        )
+        .unwrap();
+
+        assert_eq!(config.routes().len(), 1);
+
+        assert_eq!(
+            identities,
+            vec![
+                TlsIdentityFiles {
+                    certificate_path: PathBuf::from("certs/one.pem"),
+                    private_key_path: PathBuf::from("certs/one-key.pem"),
+                },
+                TlsIdentityFiles {
+                    certificate_path: PathBuf::from("certs/two.pem"),
+                    private_key_path: PathBuf::from("certs/two-key.pem"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_tls_identity_pair() {
+        assert_eq!(
+            parse_with_tls(
+                "tls_identity = certs/site.pem | certs/site-key.pem\n\
+tls_identity = certs/site.pem | certs/site-key.pem\n\
+example.test -> 127.0.0.1:3000"
+            ),
+            Err(ConfigError::Line {
+                line: 2,
+                message: "duplicate tls_identity certificate/key pair".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_tls_identity() {
+        assert_eq!(
+            parse_with_tls(
+                "tls_identity = certs/site.pem\n\
+example.test -> 127.0.0.1:3000"
+            ),
+            Err(ConfigError::Line {
+                line: 1,
+                message: "tls_identity must use `certificate.pem | private-key.pem`".to_owned(),
+            })
+        );
     }
 
     #[test]
