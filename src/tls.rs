@@ -9,14 +9,15 @@
 //! learns to negotiate and authenticate real TLS connections.
 
 use crate::{
+    asn1::{der_integer_unsigned, der_sequence},
     crypto::{
         ChaCha20Poly1305Error, HkdfError, Sha256, chacha20_poly1305_decrypt,
-        chacha20_poly1305_encrypt, fill_random, hkdf_extract_sha256, sha256,
+        chacha20_poly1305_encrypt, fill_random, hkdf_extract_sha256, hmac_sha256, sha256,
         tls13_hkdf_expand_label_sha256, wipe_bytes,
     },
     p256::{
-        P256_GROUP_ORDER, P256EcdhError, P256Point, P256PointError, Scalar, Uint256, p256_ecdh,
-        p256_generator_multiply,
+        P256_GROUP_ORDER, P256EcdhError, P256EcdsaError, P256Point, P256PointError, P256Signature,
+        Scalar, Uint256, p256_ecdh, p256_ecdsa_sign_sha256, p256_generator_multiply,
     },
 };
 
@@ -37,6 +38,12 @@ const HANDSHAKE_HEADER_SIZE: usize = 4;
 const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 1;
 const HANDSHAKE_TYPE_SERVER_HELLO: u8 = 2;
 const HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS: u8 = 8;
+const HANDSHAKE_TYPE_CERTIFICATE: u8 = 11;
+const HANDSHAKE_TYPE_CERTIFICATE_VERIFY: u8 = 15;
+const HANDSHAKE_TYPE_FINISHED: u8 = 20;
+
+const TLS_UINT24_MAX: usize = 0x00ff_ffff;
+const TLS_SERVER_CERTIFICATE_VERIFY_CONTEXT: &[u8] = b"TLS 1.3, server CertificateVerify";
 
 const EXTENSION_SERVER_NAME: u16 = 0;
 const EXTENSION_SUPPORTED_GROUPS: u16 = 10;
@@ -339,8 +346,14 @@ pub enum TlsServerHandshakeError {
     ServerPublicKey(P256PointError),
     Random(io::Error),
     Ecdh(P256EcdhError),
+    Signing(P256EcdsaError),
     KeySchedule(HkdfError),
     RecordProtection(TlsRecordError),
+    EmptyCertificateChain,
+    EmptyCertificate { index: usize },
+    CertificateTooLong { index: usize, length: usize },
+    CertificateListTooLong { length: usize },
+    AuthenticationAlreadyStarted,
     HandshakeMessageTooLong { length: usize },
 }
 
@@ -379,11 +392,38 @@ impl fmt::Display for TlsServerHandshakeError {
                 )
             }
             Self::Ecdh(error) => write!(formatter, "P-256 ECDH failed: {error}"),
+            Self::Signing(error) => {
+                write!(formatter, "TLS CertificateVerify signing failed: {error}")
+            }
             Self::KeySchedule(error) => {
                 write!(formatter, "TLS 1.3 key schedule failed: {error}")
             }
             Self::RecordProtection(error) => {
                 write!(formatter, "TLS handshake record protection failed: {error}")
+            }
+            Self::EmptyCertificateChain => {
+                formatter.write_str("TLS server certificate chain cannot be empty")
+            }
+            Self::EmptyCertificate { index } => {
+                write!(
+                    formatter,
+                    "TLS certificate chain entry {index} contains no DER certificate bytes"
+                )
+            }
+            Self::CertificateTooLong { index, length } => {
+                write!(
+                    formatter,
+                    "TLS certificate chain entry {index} is {length} bytes and exceeds uint24"
+                )
+            }
+            Self::CertificateListTooLong { length } => {
+                write!(
+                    formatter,
+                    "TLS Certificate certificate_list is {length} bytes and exceeds uint24"
+                )
+            }
+            Self::AuthenticationAlreadyStarted => {
+                formatter.write_str("TLS server authentication flight was already started")
             }
             Self::HandshakeMessageTooLong { length } => {
                 write!(
@@ -402,6 +442,7 @@ impl Error for TlsServerHandshakeError {
             Self::InvalidP256KeyShare(error) | Self::ServerPublicKey(error) => Some(error),
             Self::Random(error) => Some(error),
             Self::Ecdh(error) => Some(error),
+            Self::Signing(error) => Some(error),
             Self::KeySchedule(error) => Some(error),
             Self::RecordProtection(error) => Some(error),
             _ => None,
@@ -465,6 +506,42 @@ pub struct Tls13ServerHelloFlight {
     main_secret: [u8; TLS_SHA256_HASH_SIZE],
     transcript: TlsTranscript,
     handshake_record_protection: Tls13RecordProtection,
+    server_authentication_started: bool,
+}
+
+pub struct Tls13ServerAuthenticationFlight {
+    certificate: Vec<u8>,
+    certificate_records: Vec<TlsCiphertextRecord>,
+    certificate_verify: Vec<u8>,
+    certificate_verify_records: Vec<TlsCiphertextRecord>,
+    finished: Vec<u8>,
+    finished_records: Vec<TlsCiphertextRecord>,
+}
+
+impl Tls13ServerAuthenticationFlight {
+    pub fn certificate(&self) -> &[u8] {
+        &self.certificate
+    }
+
+    pub fn certificate_records(&self) -> &[TlsCiphertextRecord] {
+        &self.certificate_records
+    }
+
+    pub fn certificate_verify(&self) -> &[u8] {
+        &self.certificate_verify
+    }
+
+    pub fn certificate_verify_records(&self) -> &[TlsCiphertextRecord] {
+        &self.certificate_verify_records
+    }
+
+    pub fn finished(&self) -> &[u8] {
+        &self.finished
+    }
+
+    pub fn finished_records(&self) -> &[TlsCiphertextRecord] {
+        &self.finished_records
+    }
 }
 
 impl Tls13ServerHelloFlight {
@@ -494,6 +571,58 @@ impl Tls13ServerHelloFlight {
 
     pub fn handshake_record_protection_mut(&mut self) -> &mut Tls13RecordProtection {
         &mut self.handshake_record_protection
+    }
+
+    pub fn authenticate_server(
+        &mut self,
+        certificate_chain: &[Vec<u8>],
+        signing_key: Scalar,
+    ) -> Result<Tls13ServerAuthenticationFlight, TlsServerHandshakeError> {
+        if self.server_authentication_started {
+            return Err(TlsServerHandshakeError::AuthenticationAlreadyStarted);
+        }
+
+        let certificate = build_tls13_certificate(certificate_chain)?;
+
+        let mut next_transcript = self.transcript.clone();
+
+        next_transcript.update_handshake_message(&certificate);
+
+        let certificate_verify =
+            build_tls13_server_certificate_verify(signing_key, &next_transcript.hash())?;
+
+        next_transcript.update_handshake_message(&certificate_verify);
+
+        let finished = build_tls13_server_finished(
+            &self.server_handshake_traffic_secret,
+            &next_transcript.hash(),
+        )?;
+
+        next_transcript.update_handshake_message(&finished);
+
+        self.server_authentication_started = true;
+
+        let certificate_records =
+            encrypt_handshake_message_records(&mut self.handshake_record_protection, &certificate)?;
+
+        let certificate_verify_records = encrypt_handshake_message_records(
+            &mut self.handshake_record_protection,
+            &certificate_verify,
+        )?;
+
+        let finished_records =
+            encrypt_handshake_message_records(&mut self.handshake_record_protection, &finished)?;
+
+        self.transcript = next_transcript;
+
+        Ok(Tls13ServerAuthenticationFlight {
+            certificate,
+            certificate_records,
+            certificate_verify,
+            certificate_verify_records,
+            finished,
+            finished_records,
+        })
     }
 }
 
@@ -1781,7 +1910,140 @@ pub fn negotiate_tls13_server_hello(
         main_secret: key_schedule.main_secret,
         transcript,
         handshake_record_protection,
+        server_authentication_started: false,
     })
+}
+
+fn build_tls13_certificate(
+    certificate_chain: &[Vec<u8>],
+) -> Result<Vec<u8>, TlsServerHandshakeError> {
+    if certificate_chain.is_empty() {
+        return Err(TlsServerHandshakeError::EmptyCertificateChain);
+    }
+
+    let mut certificate_list = Vec::new();
+
+    for (index, certificate) in certificate_chain.iter().enumerate() {
+        if certificate.is_empty() {
+            return Err(TlsServerHandshakeError::EmptyCertificate { index });
+        }
+
+        if certificate.len() > TLS_UINT24_MAX {
+            return Err(TlsServerHandshakeError::CertificateTooLong {
+                index,
+                length: certificate.len(),
+            });
+        }
+
+        append_uint24(&mut certificate_list, certificate.len());
+        certificate_list.extend_from_slice(certificate);
+
+        certificate_list.extend_from_slice(&0_u16.to_be_bytes());
+
+        if certificate_list.len() > TLS_UINT24_MAX {
+            return Err(TlsServerHandshakeError::CertificateListTooLong {
+                length: certificate_list.len(),
+            });
+        }
+    }
+
+    let mut body = Vec::with_capacity(1 + 3 + certificate_list.len());
+
+    body.push(0);
+    append_uint24(&mut body, certificate_list.len());
+    body.extend_from_slice(&certificate_list);
+
+    encode_handshake_message(HANDSHAKE_TYPE_CERTIFICATE, &body)
+}
+
+fn build_tls13_server_certificate_verify(
+    signing_key: Scalar,
+    transcript_hash: &[u8; TLS_SHA256_HASH_SIZE],
+) -> Result<Vec<u8>, TlsServerHandshakeError> {
+    let signed_content = tls13_server_certificate_verify_content(transcript_hash);
+
+    let signature = p256_ecdsa_sign_sha256(signing_key, &signed_content)
+        .map_err(TlsServerHandshakeError::Signing)?;
+
+    let signature = encode_tls_p256_signature_der(signature);
+
+    let mut body = Vec::with_capacity(4 + signature.len());
+
+    body.extend_from_slice(&TLS_SIGNATURE_ECDSA_SECP256R1_SHA256.to_be_bytes());
+
+    body.extend_from_slice(
+        &u16::try_from(signature.len())
+            .expect("P-256 ECDSA DER signature must fit in uint16")
+            .to_be_bytes(),
+    );
+
+    body.extend_from_slice(&signature);
+
+    encode_handshake_message(HANDSHAKE_TYPE_CERTIFICATE_VERIFY, &body)
+}
+
+fn tls13_server_certificate_verify_content(
+    transcript_hash: &[u8; TLS_SHA256_HASH_SIZE],
+) -> Vec<u8> {
+    let mut content = Vec::with_capacity(
+        64 + TLS_SERVER_CERTIFICATE_VERIFY_CONTEXT.len() + 1 + transcript_hash.len(),
+    );
+
+    content.extend_from_slice(&[0x20_u8; 64]);
+    content.extend_from_slice(TLS_SERVER_CERTIFICATE_VERIFY_CONTEXT);
+    content.push(0);
+    content.extend_from_slice(transcript_hash);
+
+    content
+}
+
+fn encode_tls_p256_signature_der(signature: P256Signature) -> Vec<u8> {
+    let (r, s) = signature.components();
+
+    der_sequence(&[
+        der_integer_unsigned(&r.to_be_bytes()),
+        der_integer_unsigned(&s.to_be_bytes()),
+    ])
+}
+
+fn build_tls13_server_finished(
+    server_handshake_traffic_secret: &[u8; TLS_SHA256_HASH_SIZE],
+    transcript_hash: &[u8; TLS_SHA256_HASH_SIZE],
+) -> Result<Vec<u8>, TlsServerHandshakeError> {
+    let finished_key = SecretArray(tls13_expand_label_array::<TLS_SHA256_HASH_SIZE>(
+        server_handshake_traffic_secret,
+        "finished",
+        &[],
+    )?);
+
+    let verify_data = hmac_sha256(&finished_key.0, transcript_hash);
+
+    encode_handshake_message(HANDSHAKE_TYPE_FINISHED, &verify_data)
+}
+
+fn encrypt_handshake_message_records(
+    record_protection: &mut Tls13RecordProtection,
+    message: &[u8],
+) -> Result<Vec<TlsCiphertextRecord>, TlsServerHandshakeError> {
+    let mut records = Vec::new();
+
+    for fragment in message.chunks(TLS_PLAINTEXT_FRAGMENT_LIMIT) {
+        let plaintext = TlsPlaintextRecord::new(ContentType::Handshake, fragment.to_vec())?;
+
+        records.push(record_protection.encrypt_record(&plaintext, 0)?);
+    }
+
+    Ok(records)
+}
+
+fn append_uint24(output: &mut Vec<u8>, value: usize) {
+    debug_assert!(value <= TLS_UINT24_MAX);
+
+    output.extend_from_slice(&[
+        ((value >> 16) & 0xff) as u8,
+        ((value >> 8) & 0xff) as u8,
+        (value & 0xff) as u8,
+    ]);
 }
 
 fn generate_ephemeral_p256_private_key() -> io::Result<Scalar> {
@@ -1908,7 +2170,7 @@ fn encode_handshake_message(
     message_type: u8,
     body: &[u8],
 ) -> Result<Vec<u8>, TlsServerHandshakeError> {
-    if body.len() > 0x00ff_ffff {
+    if body.len() > TLS_UINT24_MAX {
         return Err(TlsServerHandshakeError::HandshakeMessageTooLong { length: body.len() });
     }
 
@@ -1951,6 +2213,12 @@ impl<'a> HandshakeReader<'a> {
         Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
+    fn read_u24(&mut self) -> Result<usize, TlsHandshakeError> {
+        let bytes = self.read_exact(3)?;
+
+        Ok((usize::from(bytes[0]) << 16) | (usize::from(bytes[1]) << 8) | usize::from(bytes[2]))
+    }
+
     fn read_exact(&mut self, length: usize) -> Result<&'a [u8], TlsHandshakeError> {
         let end = self
             .offset
@@ -1976,6 +2244,13 @@ impl<'a> HandshakeReader<'a> {
 
     fn read_vector_u16(&mut self, field: &'static str) -> Result<&'a [u8], TlsHandshakeError> {
         let length = usize::from(self.read_u16()?);
+
+        self.read_exact(length)
+            .map_err(|_| TlsHandshakeError::MalformedVector { field })
+    }
+
+    fn read_vector_u24(&mut self, field: &'static str) -> Result<&'a [u8], TlsHandshakeError> {
+        let length = self.read_u24()?;
 
         self.read_exact(length)
             .map_err(|_| TlsHandshakeError::MalformedVector { field })
@@ -2759,6 +3034,25 @@ mod tests {
         test_client_hello(TLS_LEGACY_RECORD_VERSION, &[0], cipher_suites, &extensions)
     }
 
+    fn decrypt_handshake_records(
+        record_protection: &mut Tls13RecordProtection,
+        records: &[TlsCiphertextRecord],
+    ) -> Vec<u8> {
+        let mut message = Vec::new();
+
+        for record in records {
+            let plaintext = record_protection
+                .decrypt_record(record)
+                .expect("test handshake record should decrypt");
+
+            assert_eq!(plaintext.content_type(), ContentType::Handshake);
+
+            message.extend_from_slice(plaintext.fragment());
+        }
+
+        message
+    }
+
     #[test]
     fn client_hello_parser_extracts_tls13_negotiation_inputs() {
         let message = test_client_hello(
@@ -3266,5 +3560,241 @@ mod tests {
         protocols
             .finish("ALPN selected protocol list")
             .expect("ALPN should contain exactly one selected protocol");
+    }
+
+    #[test]
+    fn server_authentication_builds_signs_finishes_and_encrypts() {
+        let client_private_key = Scalar::new(Uint256::from_limbs([6, 0, 0, 0]));
+
+        let client_hello =
+            p256_negotiation_client_hello(client_private_key, &[TLS_CHACHA20_POLY1305_SHA256]);
+
+        let signing_key = Scalar::new(Uint256::from_limbs([7, 0, 0, 0]));
+
+        let certificate_chain = vec![
+            vec![0x30, 0x03, 0x02, 0x01, 0x01],
+            vec![0x30, 0x03, 0x02, 0x01, 0x02],
+        ];
+
+        let mut flight = negotiate_tls13_server_hello(&client_hello)
+            .expect("TLS 1.3 handshake start should succeed");
+
+        let (client_key, client_iv) =
+            derive_tls13_traffic_key_iv(&flight.client_handshake_traffic_secret)
+                .expect("client handshake traffic key should derive");
+
+        let (server_key, server_iv) =
+            derive_tls13_traffic_key_iv(&flight.server_handshake_traffic_secret)
+                .expect("server handshake traffic key should derive");
+
+        let mut client_record_protection =
+            Tls13RecordProtection::new(client_key, client_iv, server_key, server_iv);
+
+        let decrypted_extensions = client_record_protection
+            .decrypt_record(flight.encrypted_extensions_record())
+            .expect("client should decrypt EncryptedExtensions");
+
+        assert_eq!(
+            decrypted_extensions.fragment(),
+            flight.encrypted_extensions()
+        );
+
+        let authentication = flight
+            .authenticate_server(&certificate_chain, signing_key)
+            .expect("server authentication flight should succeed");
+
+        let certificate = decrypt_handshake_records(
+            &mut client_record_protection,
+            authentication.certificate_records(),
+        );
+
+        let certificate_verify = decrypt_handshake_records(
+            &mut client_record_protection,
+            authentication.certificate_verify_records(),
+        );
+
+        let finished = decrypt_handshake_records(
+            &mut client_record_protection,
+            authentication.finished_records(),
+        );
+
+        assert_eq!(certificate, authentication.certificate());
+        assert_eq!(certificate_verify, authentication.certificate_verify());
+        assert_eq!(finished, authentication.finished());
+
+        assert_eq!(certificate[0], HANDSHAKE_TYPE_CERTIFICATE);
+        assert_eq!(certificate_verify[0], HANDSHAKE_TYPE_CERTIFICATE_VERIFY);
+        assert_eq!(finished[0], HANDSHAKE_TYPE_FINISHED);
+
+        let mut certificate_body = HandshakeReader::new(&certificate[HANDSHAKE_HEADER_SIZE..]);
+
+        assert!(
+            certificate_body
+                .read_vector_u8("certificate_request_context")
+                .expect("certificate request context should parse")
+                .is_empty()
+        );
+
+        let encoded_certificate_list = certificate_body
+            .read_vector_u24("certificate_list")
+            .expect("certificate list should parse");
+
+        certificate_body
+            .finish("Certificate")
+            .expect("Certificate should end cleanly");
+
+        let mut certificates = HandshakeReader::new(encoded_certificate_list);
+
+        for expected_certificate in &certificate_chain {
+            assert_eq!(
+                certificates
+                    .read_vector_u24("cert_data")
+                    .expect("certificate DER should parse"),
+                expected_certificate
+            );
+
+            assert!(
+                certificates
+                    .read_vector_u16("certificate extensions")
+                    .expect("certificate extensions should parse")
+                    .is_empty()
+            );
+        }
+
+        certificates
+            .finish("certificate_list")
+            .expect("certificate list should contain exactly the supplied chain");
+
+        let mut transcript_before_certificate_verify = client_hello.clone();
+
+        transcript_before_certificate_verify.extend_from_slice(flight.server_hello());
+        transcript_before_certificate_verify.extend_from_slice(flight.encrypted_extensions());
+        transcript_before_certificate_verify.extend_from_slice(&certificate);
+
+        let certificate_transcript_hash =
+            crate::crypto::sha256(&transcript_before_certificate_verify);
+
+        let expected_signature = p256_ecdsa_sign_sha256(
+            signing_key,
+            &tls13_server_certificate_verify_content(&certificate_transcript_hash),
+        )
+        .expect("expected CertificateVerify signature should succeed");
+
+        let expected_signature = encode_tls_p256_signature_der(expected_signature);
+
+        let mut certificate_verify_body =
+            HandshakeReader::new(&certificate_verify[HANDSHAKE_HEADER_SIZE..]);
+
+        assert_eq!(
+            certificate_verify_body
+                .read_u16()
+                .expect("CertificateVerify algorithm should parse"),
+            TLS_SIGNATURE_ECDSA_SECP256R1_SHA256
+        );
+
+        assert_eq!(
+            certificate_verify_body
+                .read_vector_u16("CertificateVerify signature")
+                .expect("CertificateVerify signature should parse"),
+            expected_signature
+        );
+
+        certificate_verify_body
+            .finish("CertificateVerify")
+            .expect("CertificateVerify should end cleanly");
+
+        transcript_before_certificate_verify.extend_from_slice(&certificate_verify);
+
+        let transcript_before_finished =
+            crate::crypto::sha256(&transcript_before_certificate_verify);
+
+        let finished_key = tls13_expand_label_array::<TLS_SHA256_HASH_SIZE>(
+            &flight.server_handshake_traffic_secret,
+            "finished",
+            &[],
+        )
+        .expect("server Finished key should derive");
+
+        let expected_verify_data = hmac_sha256(&finished_key, &transcript_before_finished);
+
+        assert_eq!(
+            &finished[HANDSHAKE_HEADER_SIZE..],
+            expected_verify_data.as_slice()
+        );
+
+        transcript_before_certificate_verify.extend_from_slice(&finished);
+
+        assert_eq!(
+            flight.transcript_hash(),
+            crate::crypto::sha256(&transcript_before_certificate_verify)
+        );
+
+        assert_eq!(client_record_protection.read_sequence_number(), Some(4));
+
+        assert_eq!(
+            flight.handshake_record_protection.write_sequence_number(),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn large_certificate_message_is_fragmented_across_encrypted_records() {
+        let client_private_key = Scalar::new(Uint256::from_limbs([8, 0, 0, 0]));
+
+        let client_hello =
+            p256_negotiation_client_hello(client_private_key, &[TLS_CHACHA20_POLY1305_SHA256]);
+
+        let signing_key = Scalar::new(Uint256::from_limbs([9, 0, 0, 0]));
+
+        let large_certificate = vec![0x42_u8; TLS_PLAINTEXT_FRAGMENT_LIMIT + 128];
+
+        let mut flight = negotiate_tls13_server_hello(&client_hello)
+            .expect("TLS 1.3 handshake start should succeed");
+
+        let (client_key, client_iv) =
+            derive_tls13_traffic_key_iv(&flight.client_handshake_traffic_secret)
+                .expect("client handshake traffic key should derive");
+
+        let (server_key, server_iv) =
+            derive_tls13_traffic_key_iv(&flight.server_handshake_traffic_secret)
+                .expect("server handshake traffic key should derive");
+
+        let mut client_record_protection =
+            Tls13RecordProtection::new(client_key, client_iv, server_key, server_iv);
+
+        client_record_protection
+            .decrypt_record(flight.encrypted_extensions_record())
+            .expect("client should decrypt EncryptedExtensions");
+
+        let authentication = flight
+            .authenticate_server(&[large_certificate], signing_key)
+            .expect("large certificate handshake should succeed");
+
+        assert!(authentication.certificate_records().len() > 1);
+
+        let reassembled_certificate = decrypt_handshake_records(
+            &mut client_record_protection,
+            authentication.certificate_records(),
+        );
+
+        assert_eq!(reassembled_certificate, authentication.certificate());
+    }
+
+    #[test]
+    fn server_authentication_rejects_empty_certificate_chain() {
+        let client_private_key = Scalar::new(Uint256::from_limbs([10, 0, 0, 0]));
+
+        let client_hello =
+            p256_negotiation_client_hello(client_private_key, &[TLS_CHACHA20_POLY1305_SHA256]);
+
+        let mut flight = negotiate_tls13_server_hello(&client_hello)
+            .expect("TLS 1.3 handshake start should succeed");
+
+        let signing_key = Scalar::new(Uint256::from_limbs([11, 0, 0, 0]));
+
+        assert!(matches!(
+            flight.authenticate_server(&[], signing_key),
+            Err(TlsServerHandshakeError::EmptyCertificateChain)
+        ));
     }
 }

@@ -473,9 +473,9 @@ Goal: establish HTTPS with a manually supplied certificate before touching ACME.
 * [x] Derive TLS handshake secrets using HKDF.
 * [x] Produce `EncryptedExtensions`.
 * [x] Process ALPN sufficiently to select HTTP/1.1 when offered.
-* [ ] Produce the TLS `Certificate` message.
-* [ ] Produce `CertificateVerify`.
-* [ ] Produce server `Finished`.
+* [x] Produce the TLS `Certificate` message.
+* [x] Produce `CertificateVerify`.
+* [x] Produce server `Finished`.
 * [ ] Verify client `Finished`.
 * [ ] Derive application traffic secrets.
 * [ ] Transition into encrypted application data.
