@@ -48,7 +48,7 @@ impl fmt::Display for AppError {
             Self::MissingConfigPath => write!(formatter, "--config requires a path"),
             Self::MissingTlsProbeArguments => write!(
                 formatter,
-                "--tls-probe requires a certificate DER path and private-key hex path"
+                "--tls-probe requires a certificate-chain PEM path and EC private-key PEM path"
             ),
             Self::TooManyArguments => write!(formatter, "too many arguments"),
             Self::Config { message } => write!(formatter, "configuration error: {message}"),
@@ -191,7 +191,7 @@ fn print_help() {
     println!();
     println!("OPTIONS:");
     println!("    -c, --config <PATH>              Use a custom configuration file");
-    println!("    --tls-probe <CERT_DER> <KEY_HEX> Run one local TLS interoperability probe");
+    println!("    --tls-probe <CERT_PEM> <KEY_PEM> Run one local TLS interoperability probe");
     println!("    -h, --help                       Print help");
     println!("    -V, --version                    Print version");
     println!();
@@ -245,12 +245,12 @@ mod tests {
         assert_eq!(
             parse_args(vec![
                 "--tls-probe".to_owned(),
-                "certificate.der".to_owned(),
-                "private-key.hex".to_owned(),
+                "certificate.pem".to_owned(),
+                "private-key.pem".to_owned(),
             ]),
             Ok(Command::TlsProbe {
-                certificate_path: "certificate.der".to_owned(),
-                private_key_path: "private-key.hex".to_owned(),
+                certificate_path: "certificate.pem".to_owned(),
+                private_key_path: "private-key.pem".to_owned(),
             })
         );
     }
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn tls_probe_requires_both_paths() {
         assert_eq!(
-            parse_args(vec!["--tls-probe".to_owned(), "certificate.der".to_owned(),]),
+            parse_args(vec!["--tls-probe".to_owned(), "certificate.pem".to_owned(),]),
             Err(AppError::MissingTlsProbeArguments)
         );
     }

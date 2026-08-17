@@ -1,20 +1,17 @@
 use std::{
-    fs,
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
     time::Duration,
 };
 
 use crate::{
-    asn1,
-    crypto::{decode_hex, wipe_bytes},
-    p256::{P256_GROUP_ORDER, Scalar, Uint256, p256_generator_multiply},
     tls::{
         self, CiphertextRecordDecoder, ContentType, HandshakeDeframer, PlaintextRecordDecoder,
         TLS_CIPHERTEXT_FRAGMENT_LIMIT, TLS_LEGACY_RECORD_VERSION, TLS_RECORD_HEADER_SIZE,
         Tls13ApplicationEvent, Tls13ApplicationState, Tls13ServerFirstFlight, TlsCiphertextRecord,
         TlsPlaintextRecord,
     },
+    tls_identity::TlsIdentity,
 };
 
 pub const DEV_TLS_PROBE_ADDR: &str = "127.0.0.1:8443";
@@ -23,11 +20,7 @@ const PROBE_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PROBE_HTTP_REQUEST: usize = 32 * 1024;
 
 pub fn run(certificate_path: &str, private_key_path: &str) -> io::Result<()> {
-    let certificate_der = fs::read(certificate_path)?;
-
-    let signing_key = load_private_key(private_key_path)?;
-
-    validate_certificate_key(&certificate_der, signing_key)?;
+    let identity = TlsIdentity::load_pem_files(certificate_path, private_key_path)?;
 
     let listener = TcpListener::bind(DEV_TLS_PROBE_ADDR)?;
 
@@ -41,67 +34,14 @@ pub fn run(certificate_path: &str, private_key_path: &str) -> io::Result<()> {
 
     println!("INFO event=tls_probe_connection_accept peer={peer_addr}");
 
-    handle_connection(&mut stream, &certificate_der, signing_key)?;
+    handle_connection(&mut stream, &identity)?;
 
     println!("INFO event=tls_probe_complete peer={peer_addr}");
 
     Ok(())
 }
 
-fn load_private_key(path: &str) -> io::Result<Scalar> {
-    let encoded = fs::read_to_string(path)?;
-
-    let mut decoded =
-        decode_hex(encoded.trim()).map_err(|error| invalid_data(error.to_string()))?;
-
-    if decoded.len() != 32 {
-        let length = decoded.len();
-
-        wipe_bytes(&mut decoded);
-
-        return Err(invalid_data(format!(
-            "TLS probe private key must contain exactly 32 bytes, got {length}"
-        )));
-    }
-
-    let mut private_bytes = [0_u8; 32];
-    private_bytes.copy_from_slice(&decoded);
-
-    wipe_bytes(&mut decoded);
-
-    let private_value = Uint256::from_be_bytes(private_bytes);
-
-    wipe_bytes(&mut private_bytes);
-
-    if private_value == Uint256::ZERO || private_value >= P256_GROUP_ORDER {
-        return Err(invalid_data(
-            "TLS probe private key is outside the P-256 scalar range",
-        ));
-    }
-
-    Ok(Scalar::new(private_value))
-}
-
-fn validate_certificate_key(certificate_der: &[u8], signing_key: Scalar) -> io::Result<()> {
-    let certificate = asn1::parse_x509_certificate_der(certificate_der)
-        .map_err(|error| invalid_data(error.to_string()))?;
-
-    let expected_public_key = p256_generator_multiply(signing_key);
-
-    if certificate.public_key.p256_public_key != Some(expected_public_key) {
-        return Err(invalid_data(
-            "TLS probe certificate does not contain the public key matching the supplied private key",
-        ));
-    }
-
-    Ok(())
-}
-
-fn handle_connection(
-    stream: &mut TcpStream,
-    certificate_der: &[u8],
-    signing_key: Scalar,
-) -> io::Result<()> {
+fn handle_connection(stream: &mut TcpStream, identity: &TlsIdentity) -> io::Result<()> {
     let client_hello1 = read_client_hello(stream, false)?;
 
     let parsed_client_hello =
@@ -150,10 +90,8 @@ fn handle_connection(
         }
     };
 
-    let certificate_chain = vec![certificate_der.to_vec()];
-
     let authentication = flight
-        .authenticate_server(&certificate_chain, signing_key)
+        .authenticate_server(identity.certificate_chain(), identity.signing_key())
         .map_err(|error| invalid_data(error.to_string()))?;
 
     write_ciphertext_record(stream, flight.encrypted_extensions_record())?;

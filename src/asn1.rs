@@ -8,7 +8,9 @@
 
 use crate::{
     crypto::{encode_base64, wipe_bytes},
-    p256::{P256Point, P256Signature, Scalar, p256_ecdsa_sign_sha256, p256_generator_multiply},
+    p256::{
+        P256Point, P256Signature, Scalar, Uint256, p256_ecdsa_sign_sha256, p256_generator_multiply,
+    },
 };
 
 use std::{error::Error, fmt, io, path::Path};
@@ -551,6 +553,97 @@ pub fn encode_p256_sec1_private_key_pem(private_key: Scalar) -> Result<String, D
     result
 }
 
+/// Decodes an RFC 5915 ECPrivateKey restricted to the P-256 named curve.
+pub fn decode_p256_sec1_private_key_der(der: &[u8]) -> Result<Scalar, DerError> {
+    let mut outer = DerReader::new(der);
+
+    let sequence = outer.read_expected(DER_TAG_SEQUENCE)?;
+
+    outer.finish()?;
+
+    let mut key = sequence.reader();
+
+    if key.read_integer_unsigned()? != [1] {
+        return Err(DerError::InvalidP256PrivateKey);
+    }
+
+    let private_key = key.read_expected(DER_TAG_OCTET_STRING)?;
+
+    let private_bytes: [u8; 32] = private_key
+        .content
+        .try_into()
+        .map_err(|_| DerError::InvalidP256PrivateKey)?;
+
+    let private_value = Uint256::from_be_bytes(private_bytes);
+    let private_key = Scalar::new(private_value);
+
+    if private_key == Scalar::ZERO || private_key.value() != private_value {
+        return Err(DerError::InvalidP256PrivateKey);
+    }
+
+    let mut parameters_seen = false;
+    let mut public_key_seen = false;
+
+    while !key.is_empty() {
+        let optional = key.read_tlv()?;
+
+        match optional.tag {
+            0xa0 if !parameters_seen => {
+                parameters_seen = true;
+
+                let mut parameters = optional.reader();
+
+                let curve = parameters.read_expected(DER_TAG_OBJECT_IDENTIFIER)?;
+
+                parameters.finish()?;
+
+                if curve.content != OID_SECP256R1_CONTENT {
+                    return Err(DerError::InvalidP256PrivateKey);
+                }
+            }
+            0xa1 if !public_key_seen => {
+                public_key_seen = true;
+
+                let mut encoded_public_key_reader = optional.reader();
+
+                let encoded_public_key =
+                    encoded_public_key_reader.read_expected(DER_TAG_BIT_STRING)?;
+
+                encoded_public_key_reader.finish()?;
+
+                if encoded_public_key.content.first() != Some(&0) {
+                    return Err(DerError::InvalidP256PublicKey);
+                }
+
+                let public_key =
+                    P256Point::from_sec1_uncompressed(&encoded_public_key.content[1..])
+                        .map_err(|_| DerError::InvalidP256PublicKey)?;
+
+                if public_key != p256_generator_multiply(private_key) {
+                    return Err(DerError::InvalidP256PublicKey);
+                }
+            }
+            _ => {
+                return Err(DerError::InvalidP256PrivateKey);
+            }
+        }
+    }
+
+    Ok(private_key)
+}
+
+/// Decodes a conventional RFC 7468 `EC PRIVATE KEY` containing RFC 5915
+/// P-256 key material.
+pub fn decode_p256_sec1_private_key_pem(input: &str) -> Result<Scalar, DerError> {
+    let mut der = pem_decode("EC PRIVATE KEY", input)?;
+
+    let result = decode_p256_sec1_private_key_der(&der);
+
+    wipe_bytes(&mut der);
+
+    result
+}
+
 /// Encodes a P-256 SubjectPublicKeyInfo structure following RFC 5480.
 pub fn encode_p256_spki_der(public_key: P256Point) -> Result<Vec<u8>, DerError> {
     let encoded_point = public_key
@@ -835,8 +928,9 @@ pub fn parse_x509_certificate_der(der: &[u8]) -> Result<X509CertificateInfo, Der
     })
 }
 
-/// Parses every RFC 7468 `CERTIFICATE` instance in a PEM certificate chain.
-pub fn parse_x509_certificate_chain_pem(input: &str) -> Result<Vec<X509CertificateInfo>, DerError> {
+/// Decodes every RFC 7468 `CERTIFICATE` instance in a PEM certificate chain,
+/// preserving the DER bytes in leaf-first input order.
+pub fn decode_x509_certificate_chain_pem(input: &str) -> Result<Vec<Vec<u8>>, DerError> {
     const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
 
     const END: &str = "-----END CERTIFICATE-----";
@@ -859,9 +953,7 @@ pub fn parse_x509_certificate_chain_pem(input: &str) -> Result<Vec<X509Certifica
         }
 
         if line == END {
-            let der = decode_base64(&base64)?;
-
-            certificates.push(parse_x509_certificate_der(&der)?);
+            certificates.push(decode_base64(&base64)?);
 
             inside_certificate = false;
             base64.clear();
@@ -889,6 +981,14 @@ pub fn parse_x509_certificate_chain_pem(input: &str) -> Result<Vec<X509Certifica
     }
 
     Ok(certificates)
+}
+
+/// Parses every RFC 7468 `CERTIFICATE` instance in a PEM certificate chain.
+pub fn parse_x509_certificate_chain_pem(input: &str) -> Result<Vec<X509CertificateInfo>, DerError> {
+    decode_x509_certificate_chain_pem(input)?
+        .iter()
+        .map(|der| parse_x509_certificate_der(der))
+        .collect()
 }
 
 fn parse_x509_validity(validity: DerValue<'_>) -> Result<X509Validity, DerError> {
@@ -1351,12 +1451,14 @@ mod tests {
     use super::{
         DER_TAG_BIT_STRING, DER_TAG_GENERALIZED_TIME, DER_TAG_INTEGER, DER_TAG_OBJECT_IDENTIFIER,
         DER_TAG_OCTET_STRING, DER_TAG_SEQUENCE, DER_TAG_SET, DER_TAG_UTC_TIME, DerError, DerReader,
-        OID_SUBJECT_ALT_NAME, X509Time, der_bit_string, der_context_specific, der_integer_unsigned,
-        der_object_identifier, der_octet_string, der_sequence, der_set, der_wrap,
-        ecdsa_sha256_algorithm_identifier, encode_p256_csr_der, encode_p256_csr_pem,
-        encode_p256_sec1_private_key_der, encode_p256_sec1_private_key_pem, encode_p256_spki_der,
-        encode_p256_spki_pem, encode_subject_alt_name_dns, parse_x509_certificate_chain_pem,
-        parse_x509_certificate_der, pem_decode, pem_encode, persist_p256_private_key_pem,
+        OID_SUBJECT_ALT_NAME, X509Time, decode_p256_sec1_private_key_der,
+        decode_p256_sec1_private_key_pem, decode_x509_certificate_chain_pem, der_bit_string,
+        der_context_specific, der_integer_unsigned, der_object_identifier, der_octet_string,
+        der_sequence, der_set, der_wrap, ecdsa_sha256_algorithm_identifier, encode_p256_csr_der,
+        encode_p256_csr_pem, encode_p256_sec1_private_key_der, encode_p256_sec1_private_key_pem,
+        encode_p256_spki_der, encode_p256_spki_pem, encode_subject_alt_name_dns,
+        parse_x509_certificate_chain_pem, parse_x509_certificate_der, pem_decode, pem_encode,
+        persist_p256_private_key_pem,
     };
 
     use crate::p256::{
@@ -1754,12 +1856,20 @@ mod tests {
     fn p256_sec1_private_key_pem_round_trips() {
         let pem = encode_p256_sec1_private_key_pem(Scalar::ONE).unwrap();
 
-        let decoded = pem_decode("EC PRIVATE KEY", &pem).unwrap();
+        assert_eq!(decode_p256_sec1_private_key_pem(&pem).unwrap(), Scalar::ONE);
+    }
 
-        assert_eq!(
-            decoded,
-            encode_p256_sec1_private_key_der(Scalar::ONE,).unwrap()
-        );
+    #[test]
+    fn p256_sec1_private_key_decoder_accepts_optional_public_key_absence() {
+        let parameters = der_object_identifier(&[1, 2, 840, 10045, 3, 1, 7]).unwrap();
+
+        let der = der_sequence(&[
+            der_integer_unsigned(&[1]),
+            der_octet_string(&Scalar::ONE.value().to_be_bytes()),
+            der_context_specific(0, true, &parameters).unwrap(),
+        ]);
+
+        assert_eq!(decode_p256_sec1_private_key_der(&der).unwrap(), Scalar::ONE);
     }
 
     #[test]
@@ -2171,6 +2281,20 @@ mod tests {
         .unwrap();
 
         let chain = format!("certificate chain\n{first}\n{second}");
+
+        let certificate_der = decode_x509_certificate_chain_pem(&chain).unwrap();
+
+        assert_eq!(certificate_der.len(), 2);
+
+        assert_eq!(
+            certificate_der[0],
+            test_x509_certificate_der(1, "leaf.example.com")
+        );
+
+        assert_eq!(
+            certificate_der[1],
+            test_x509_certificate_der(2, "issuer.example.com")
+        );
 
         let certificates = parse_x509_certificate_chain_pem(&chain).unwrap();
 

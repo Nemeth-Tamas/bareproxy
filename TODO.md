@@ -484,7 +484,7 @@ Goal: establish HTTPS with a manually supplied certificate before touching ACME.
 * [x] Reject unsupported cipher suites cleanly.
 * [x] Reject unsupported curves cleanly.
 * [x] Reject malformed handshake messages.
-* [ ] Compare handshake behavior against real browser/OpenSSL clients.
+* [x] Compare handshake behavior against real browser/OpenSSL clients.
 
 **Milestone complete when:** Firefox/Chrome/`openssl s_client` can establish TLS 1.3 with BareProxy using a manually trusted certificate.
 
@@ -497,8 +497,8 @@ Goal: select the correct certificate and proxy route during TLS setup.
 * [ ] Map SNI hostnames to configured sites.
 * [ ] Select certificates by SNI.
 * [ ] Reject or safely handle unknown SNI names.
-* [ ] Keep certificate material separate from route configuration.
-* [ ] Allow multiple certificates in memory.
+* [x] Keep certificate material separate from route configuration.
+* [x] Allow multiple certificates in memory.
 * [ ] Serve different certificates from one listening socket.
 * [ ] Make TLS connection state available to the HTTP layer.
 * [ ] Set `X-Forwarded-Proto: https`.

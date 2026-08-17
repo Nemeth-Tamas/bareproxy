@@ -84,20 +84,15 @@ def generate_certificate_material(openssl, directory):
     private_bytes = generate_p256_private_scalar()
 
     key_pem = directory / "localhost-key.pem"
-    key_hex = directory / "localhost-key.hex"
     cert_pem = directory / "localhost-cert.pem"
-    cert_der = directory / "localhost-cert.der"
 
     key_pem.write_text(
         encode_sec1_p256_private_key(private_bytes),
         encoding="ascii",
     )
 
-    key_hex.write_text(private_bytes.hex() + "\n", encoding="ascii")
-
     try:
         os.chmod(key_pem, 0o600)
-        os.chmod(key_hex, 0o600)
     except OSError:
         pass
 
@@ -123,22 +118,7 @@ def generate_certificate_material(openssl, directory):
         check=True,
     )
 
-    subprocess.run(
-        [
-            openssl,
-            "x509",
-            "-in",
-            str(cert_pem),
-            "-outform",
-            "DER",
-            "-out",
-            str(cert_der),
-        ],
-        cwd=ROOT,
-        check=True,
-    )
-
-    return cert_pem, cert_der, key_hex
+    return cert_pem, key_pem
 
 
 def wait_for_probe(server, server_lines, ready_event):
@@ -161,8 +141,7 @@ def run_probe_case(
     binary,
     openssl,
     cert_pem,
-    cert_der,
-    key_hex,
+    key_pem,
     groups,
     expect_retry,
 ):
@@ -174,8 +153,8 @@ def run_probe_case(
         [
             str(binary),
             "--tls-probe",
-            str(cert_der),
-            str(key_hex),
+            str(cert_pem),
+            str(key_pem),
         ],
         cwd=ROOT,
         stdout=subprocess.PIPE,
@@ -360,7 +339,7 @@ def main():
         return 1
 
     with tempfile.TemporaryDirectory(prefix="bareproxy-tls-interop-") as directory:
-        cert_pem, cert_der, key_hex = generate_certificate_material(
+        cert_pem, key_pem = generate_certificate_material(
             openssl,
             directory,
         )
@@ -370,8 +349,7 @@ def main():
             binary=binary,
             openssl=openssl,
             cert_pem=cert_pem,
-            cert_der=cert_der,
-            key_hex=key_hex,
+            key_pem=key_pem,
             groups="P-256",
             expect_retry=False,
         )
@@ -381,8 +359,7 @@ def main():
             binary=binary,
             openssl=openssl,
             cert_pem=cert_pem,
-            cert_der=cert_der,
-            key_hex=key_hex,
+            key_pem=key_pem,
             groups="X25519:P-256",
             expect_retry=True,
         )
