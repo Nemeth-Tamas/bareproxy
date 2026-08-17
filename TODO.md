@@ -476,9 +476,9 @@ Goal: establish HTTPS with a manually supplied certificate before touching ACME.
 * [x] Produce the TLS `Certificate` message.
 * [x] Produce `CertificateVerify`.
 * [x] Produce server `Finished`.
-* [ ] Verify client `Finished`.
-* [ ] Derive application traffic secrets.
-* [ ] Transition into encrypted application data.
+* [x] Verify client `Finished`.
+* [x] Derive application traffic secrets.
+* [x] Transition into encrypted application data.
 * [ ] Support TLS alerts.
 * [ ] Support `close_notify`.
 * [x] Reject unsupported cipher suites cleanly.

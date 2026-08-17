@@ -12,8 +12,8 @@ use crate::{
     asn1::{der_integer_unsigned, der_sequence},
     crypto::{
         ChaCha20Poly1305Error, HkdfError, Sha256, chacha20_poly1305_decrypt,
-        chacha20_poly1305_encrypt, fill_random, hkdf_extract_sha256, hmac_sha256, sha256,
-        tls13_hkdf_expand_label_sha256, wipe_bytes,
+        chacha20_poly1305_encrypt, constant_time_eq, fill_random, hkdf_extract_sha256, hmac_sha256,
+        sha256, tls13_hkdf_expand_label_sha256, wipe_bytes,
     },
     p256::{
         P256_GROUP_ORDER, P256EcdhError, P256EcdsaError, P256Point, P256PointError, P256Signature,
@@ -354,6 +354,10 @@ pub enum TlsServerHandshakeError {
     CertificateTooLong { index: usize, length: usize },
     CertificateListTooLong { length: usize },
     AuthenticationAlreadyStarted,
+    ServerAuthenticationRequired,
+    UnexpectedClientFinishedContentType { content_type: ContentType },
+    InvalidClientFinished,
+    ClientFinishedMismatch,
     HandshakeMessageTooLong { length: usize },
 }
 
@@ -424,6 +428,21 @@ impl fmt::Display for TlsServerHandshakeError {
             }
             Self::AuthenticationAlreadyStarted => {
                 formatter.write_str("TLS server authentication flight was already started")
+            }
+            Self::ServerAuthenticationRequired => {
+                formatter.write_str("TLS server authentication must finish before client Finished")
+            }
+            Self::UnexpectedClientFinishedContentType { content_type } => {
+                write!(
+                    formatter,
+                    "expected encrypted client Finished handshake data, got {content_type:?}"
+                )
+            }
+            Self::InvalidClientFinished => {
+                formatter.write_str("malformed TLS client Finished message")
+            }
+            Self::ClientFinishedMismatch => {
+                formatter.write_str("TLS client Finished verification failed")
             }
             Self::HandshakeMessageTooLong { length } => {
                 write!(
@@ -544,6 +563,51 @@ impl Tls13ServerAuthenticationFlight {
     }
 }
 
+pub struct Tls13ApplicationState {
+    negotiated_alpn: Option<Vec<u8>>,
+    client_application_traffic_secret: [u8; TLS_SHA256_HASH_SIZE],
+    server_application_traffic_secret: [u8; TLS_SHA256_HASH_SIZE],
+    transcript_hash: [u8; TLS_SHA256_HASH_SIZE],
+    record_protection: Tls13RecordProtection,
+}
+
+impl Tls13ApplicationState {
+    pub fn negotiated_alpn(&self) -> Option<&[u8]> {
+        self.negotiated_alpn.as_deref()
+    }
+
+    pub fn transcript_hash(&self) -> [u8; TLS_SHA256_HASH_SIZE] {
+        self.transcript_hash
+    }
+
+    pub fn encrypt_application_data_record(
+        &mut self,
+        fragment: &[u8],
+    ) -> Result<TlsCiphertextRecord, TlsRecordError> {
+        let plaintext = TlsPlaintextRecord::new(ContentType::ApplicationData, fragment.to_vec())?;
+
+        self.record_protection.encrypt_record(&plaintext, 0)
+    }
+
+    pub fn decrypt_protected_record(
+        &mut self,
+        record: &TlsCiphertextRecord,
+    ) -> Result<TlsPlaintextRecord, TlsRecordError> {
+        self.record_protection.decrypt_record(record)
+    }
+
+    pub fn record_protection_mut(&mut self) -> &mut Tls13RecordProtection {
+        &mut self.record_protection
+    }
+}
+
+impl Drop for Tls13ApplicationState {
+    fn drop(&mut self) {
+        wipe_bytes(&mut self.client_application_traffic_secret);
+        wipe_bytes(&mut self.server_application_traffic_secret);
+    }
+}
+
 impl Tls13ServerHelloFlight {
     pub fn server_hello(&self) -> &[u8] {
         &self.server_hello
@@ -593,7 +657,7 @@ impl Tls13ServerHelloFlight {
 
         next_transcript.update_handshake_message(&certificate_verify);
 
-        let finished = build_tls13_server_finished(
+        let finished = build_tls13_finished(
             &self.server_handshake_traffic_secret,
             &next_transcript.hash(),
         )?;
@@ -622,6 +686,60 @@ impl Tls13ServerHelloFlight {
             certificate_verify_records,
             finished,
             finished_records,
+        })
+    }
+
+    pub fn complete_handshake(
+        mut self,
+        client_finished_records: &[TlsCiphertextRecord],
+    ) -> Result<Tls13ApplicationState, TlsServerHandshakeError> {
+        if !self.server_authentication_started {
+            return Err(TlsServerHandshakeError::ServerAuthenticationRequired);
+        }
+
+        let server_finished_transcript_hash = self.transcript.hash();
+
+        let application_key_schedule = derive_tls13_application_key_schedule(
+            &self.main_secret,
+            &server_finished_transcript_hash,
+        )?;
+
+        let client_finished = decrypt_tls13_client_finished(
+            &mut self.handshake_record_protection,
+            client_finished_records,
+        )?;
+
+        let expected_verify_data = tls13_finished_verify_data(
+            &self.client_handshake_traffic_secret,
+            &server_finished_transcript_hash,
+        )?;
+
+        if !constant_time_eq(
+            &client_finished[HANDSHAKE_HEADER_SIZE..],
+            &expected_verify_data,
+        ) {
+            return Err(TlsServerHandshakeError::ClientFinishedMismatch);
+        }
+
+        self.transcript.update_handshake_message(&client_finished);
+
+        let transcript_hash = self.transcript.hash();
+
+        let record_protection = Tls13RecordProtection::new(
+            application_key_schedule.server_key,
+            application_key_schedule.server_iv,
+            application_key_schedule.client_key,
+            application_key_schedule.client_iv,
+        );
+
+        Ok(Tls13ApplicationState {
+            negotiated_alpn: self.negotiated_alpn.clone(),
+            client_application_traffic_secret: application_key_schedule
+                .client_application_traffic_secret,
+            server_application_traffic_secret: application_key_schedule
+                .server_application_traffic_secret,
+            transcript_hash,
+            record_protection,
         })
     }
 }
@@ -662,6 +780,60 @@ impl Drop for Tls13HandshakeKeySchedule {
         wipe_bytes(&mut self.server_key);
         wipe_bytes(&mut self.server_iv);
     }
+}
+
+struct Tls13ApplicationKeySchedule {
+    client_application_traffic_secret: [u8; TLS_SHA256_HASH_SIZE],
+    server_application_traffic_secret: [u8; TLS_SHA256_HASH_SIZE],
+    client_key: [u8; TLS_CHACHA20_POLY1305_KEY_SIZE],
+    client_iv: [u8; TLS_CHACHA20_POLY1305_IV_SIZE],
+    server_key: [u8; TLS_CHACHA20_POLY1305_KEY_SIZE],
+    server_iv: [u8; TLS_CHACHA20_POLY1305_IV_SIZE],
+}
+
+impl Drop for Tls13ApplicationKeySchedule {
+    fn drop(&mut self) {
+        wipe_bytes(&mut self.client_application_traffic_secret);
+        wipe_bytes(&mut self.server_application_traffic_secret);
+        wipe_bytes(&mut self.client_key);
+        wipe_bytes(&mut self.client_iv);
+        wipe_bytes(&mut self.server_key);
+        wipe_bytes(&mut self.server_iv);
+    }
+}
+
+fn derive_tls13_application_key_schedule(
+    main_secret: &[u8; TLS_SHA256_HASH_SIZE],
+    server_finished_transcript_hash: &[u8; TLS_SHA256_HASH_SIZE],
+) -> Result<Tls13ApplicationKeySchedule, HkdfError> {
+    let client_application_traffic_secret =
+        SecretArray(tls13_expand_label_array::<TLS_SHA256_HASH_SIZE>(
+            main_secret,
+            "c ap traffic",
+            server_finished_transcript_hash,
+        )?);
+
+    let server_application_traffic_secret =
+        SecretArray(tls13_expand_label_array::<TLS_SHA256_HASH_SIZE>(
+            main_secret,
+            "s ap traffic",
+            server_finished_transcript_hash,
+        )?);
+
+    let (client_key, client_iv) =
+        derive_tls13_traffic_key_iv(&client_application_traffic_secret.0)?;
+
+    let (server_key, server_iv) =
+        derive_tls13_traffic_key_iv(&server_application_traffic_secret.0)?;
+
+    Ok(Tls13ApplicationKeySchedule {
+        client_application_traffic_secret: client_application_traffic_secret.0,
+        server_application_traffic_secret: server_application_traffic_secret.0,
+        client_key,
+        client_iv,
+        server_key,
+        server_iv,
+    })
 }
 
 fn derive_tls13_handshake_key_schedule(
@@ -2006,19 +2178,70 @@ fn encode_tls_p256_signature_der(signature: P256Signature) -> Vec<u8> {
     ])
 }
 
-fn build_tls13_server_finished(
-    server_handshake_traffic_secret: &[u8; TLS_SHA256_HASH_SIZE],
+fn build_tls13_finished(
+    handshake_traffic_secret: &[u8; TLS_SHA256_HASH_SIZE],
     transcript_hash: &[u8; TLS_SHA256_HASH_SIZE],
 ) -> Result<Vec<u8>, TlsServerHandshakeError> {
+    let verify_data = tls13_finished_verify_data(handshake_traffic_secret, transcript_hash)?;
+
+    encode_handshake_message(HANDSHAKE_TYPE_FINISHED, &verify_data)
+}
+
+fn tls13_finished_verify_data(
+    handshake_traffic_secret: &[u8; TLS_SHA256_HASH_SIZE],
+    transcript_hash: &[u8; TLS_SHA256_HASH_SIZE],
+) -> Result<[u8; TLS_SHA256_HASH_SIZE], HkdfError> {
     let finished_key = SecretArray(tls13_expand_label_array::<TLS_SHA256_HASH_SIZE>(
-        server_handshake_traffic_secret,
+        handshake_traffic_secret,
         "finished",
         &[],
     )?);
 
-    let verify_data = hmac_sha256(&finished_key.0, transcript_hash);
+    Ok(hmac_sha256(&finished_key.0, transcript_hash))
+}
 
-    encode_handshake_message(HANDSHAKE_TYPE_FINISHED, &verify_data)
+fn decrypt_tls13_client_finished(
+    record_protection: &mut Tls13RecordProtection,
+    records: &[TlsCiphertextRecord],
+) -> Result<Vec<u8>, TlsServerHandshakeError> {
+    if records.is_empty() {
+        return Err(TlsServerHandshakeError::InvalidClientFinished);
+    }
+
+    let mut message = Vec::new();
+
+    for record in records {
+        let plaintext = record_protection.decrypt_record(record)?;
+
+        if plaintext.content_type() != ContentType::Handshake {
+            return Err(
+                TlsServerHandshakeError::UnexpectedClientFinishedContentType {
+                    content_type: plaintext.content_type(),
+                },
+            );
+        }
+
+        message.extend_from_slice(plaintext.fragment());
+
+        if message.len() > HANDSHAKE_HEADER_SIZE + TLS_SHA256_HASH_SIZE {
+            return Err(TlsServerHandshakeError::InvalidClientFinished);
+        }
+    }
+
+    if message.len() != HANDSHAKE_HEADER_SIZE + TLS_SHA256_HASH_SIZE
+        || message[0] != HANDSHAKE_TYPE_FINISHED
+    {
+        return Err(TlsServerHandshakeError::InvalidClientFinished);
+    }
+
+    let declared_length =
+        (usize::from(message[1]) << 16) | (usize::from(message[2]) << 8) | usize::from(message[3]);
+
+    if declared_length != TLS_SHA256_HASH_SIZE {
+        return Err(TlsServerHandshakeError::InvalidClientFinished);
+    }
+
+    Ok(message)
 }
 
 fn encrypt_handshake_message_records(
@@ -2213,6 +2436,7 @@ impl<'a> HandshakeReader<'a> {
         Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
+    #[cfg(test)]
     fn read_u24(&mut self) -> Result<usize, TlsHandshakeError> {
         let bytes = self.read_exact(3)?;
 
@@ -2249,6 +2473,7 @@ impl<'a> HandshakeReader<'a> {
             .map_err(|_| TlsHandshakeError::MalformedVector { field })
     }
 
+    #[cfg(test)]
     fn read_vector_u24(&mut self, field: &'static str) -> Result<&'a [u8], TlsHandshakeError> {
         let length = self.read_u24()?;
 
@@ -3053,6 +3278,56 @@ mod tests {
         message
     }
 
+    fn authenticated_test_handshake() -> (Tls13ServerHelloFlight, Tls13RecordProtection) {
+        let client_private_key = Scalar::new(Uint256::from_limbs([12, 0, 0, 0]));
+
+        let client_hello =
+            p256_negotiation_client_hello(client_private_key, &[TLS_CHACHA20_POLY1305_SHA256]);
+
+        let signing_key = Scalar::new(Uint256::from_limbs([13, 0, 0, 0]));
+
+        let certificate_chain = vec![vec![0x30, 0x03, 0x02, 0x01, 0x01]];
+
+        let mut flight = negotiate_tls13_server_hello(&client_hello)
+            .expect("TLS 1.3 handshake start should succeed");
+
+        let (client_key, client_iv) =
+            derive_tls13_traffic_key_iv(&flight.client_handshake_traffic_secret)
+                .expect("client handshake traffic key should derive");
+
+        let (server_key, server_iv) =
+            derive_tls13_traffic_key_iv(&flight.server_handshake_traffic_secret)
+                .expect("server handshake traffic key should derive");
+
+        let mut client_record_protection =
+            Tls13RecordProtection::new(client_key, client_iv, server_key, server_iv);
+
+        client_record_protection
+            .decrypt_record(flight.encrypted_extensions_record())
+            .expect("client should decrypt EncryptedExtensions");
+
+        let authentication = flight
+            .authenticate_server(&certificate_chain, signing_key)
+            .expect("server authentication flight should succeed");
+
+        decrypt_handshake_records(
+            &mut client_record_protection,
+            authentication.certificate_records(),
+        );
+
+        decrypt_handshake_records(
+            &mut client_record_protection,
+            authentication.certificate_verify_records(),
+        );
+
+        decrypt_handshake_records(
+            &mut client_record_protection,
+            authentication.finished_records(),
+        );
+
+        (flight, client_record_protection)
+    }
+
     #[test]
     fn client_hello_parser_extracts_tls13_negotiation_inputs() {
         let message = test_client_hello(
@@ -3795,6 +4070,162 @@ mod tests {
         assert!(matches!(
             flight.authenticate_server(&[], signing_key),
             Err(TlsServerHandshakeError::EmptyCertificateChain)
+        ));
+    }
+
+    #[test]
+    fn tls13_application_traffic_secrets_match_rfc8448_trace() {
+        let main_secret =
+            test_hex32("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919");
+
+        let server_finished_transcript_hash =
+            test_hex32("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
+
+        let schedule =
+            derive_tls13_application_key_schedule(&main_secret, &server_finished_transcript_hash)
+                .expect("RFC 8448 application key schedule should derive");
+
+        assert_eq!(
+            schedule.client_application_traffic_secret,
+            test_hex32("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5")
+        );
+
+        assert_eq!(
+            schedule.server_application_traffic_secret,
+            test_hex32("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643")
+        );
+    }
+
+    #[test]
+    fn client_finished_completes_handshake_and_switches_to_application_keys() {
+        let (flight, mut client_handshake_record_protection) = authenticated_test_handshake();
+
+        let server_finished_transcript_hash = flight.transcript_hash();
+
+        let expected_application_schedule = derive_tls13_application_key_schedule(
+            &flight.main_secret,
+            &server_finished_transcript_hash,
+        )
+        .expect("application traffic secrets should derive");
+
+        let client_finished = build_tls13_finished(
+            &flight.client_handshake_traffic_secret,
+            &server_finished_transcript_hash,
+        )
+        .expect("client Finished should build");
+
+        let client_finished_plaintext =
+            TlsPlaintextRecord::new(ContentType::Handshake, client_finished)
+                .expect("client Finished plaintext should be valid");
+
+        let client_finished_record = client_handshake_record_protection
+            .encrypt_record(&client_finished_plaintext, 0)
+            .expect("client Finished should encrypt");
+
+        let mut application_state = flight
+            .complete_handshake(&[client_finished_record])
+            .expect("valid client Finished should complete the handshake");
+
+        assert_eq!(
+            application_state.client_application_traffic_secret,
+            expected_application_schedule.client_application_traffic_secret
+        );
+
+        assert_eq!(
+            application_state.server_application_traffic_secret,
+            expected_application_schedule.server_application_traffic_secret
+        );
+
+        assert_eq!(application_state.negotiated_alpn(), Some(ALPN_HTTP_1_1));
+
+        let mut client_application_record_protection = Tls13RecordProtection::new(
+            expected_application_schedule.client_key,
+            expected_application_schedule.client_iv,
+            expected_application_schedule.server_key,
+            expected_application_schedule.server_iv,
+        );
+
+        let server_application_record = application_state
+            .encrypt_application_data_record(b"hello client")
+            .expect("server application data should encrypt");
+
+        let server_application_plaintext = client_application_record_protection
+            .decrypt_record(&server_application_record)
+            .expect("client should decrypt server application data");
+
+        assert_eq!(
+            server_application_plaintext.content_type(),
+            ContentType::ApplicationData
+        );
+
+        assert_eq!(server_application_plaintext.fragment(), b"hello client");
+
+        let client_application_plaintext =
+            TlsPlaintextRecord::new(ContentType::ApplicationData, b"hello server".to_vec())
+                .expect("client application plaintext should be valid");
+
+        let client_application_record = client_application_record_protection
+            .encrypt_record(&client_application_plaintext, 0)
+            .expect("client application data should encrypt");
+
+        let client_application_plaintext = application_state
+            .decrypt_protected_record(&client_application_record)
+            .expect("server should decrypt client application data");
+
+        assert_eq!(
+            client_application_plaintext.content_type(),
+            ContentType::ApplicationData
+        );
+
+        assert_eq!(client_application_plaintext.fragment(), b"hello server");
+
+        assert_eq!(
+            application_state.record_protection.write_sequence_number(),
+            Some(1)
+        );
+
+        assert_eq!(
+            application_state.record_protection.read_sequence_number(),
+            Some(1)
+        );
+
+        assert_eq!(
+            client_application_record_protection.write_sequence_number(),
+            Some(1)
+        );
+
+        assert_eq!(
+            client_application_record_protection.read_sequence_number(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn incorrect_client_finished_is_rejected() {
+        let (flight, mut client_handshake_record_protection) = authenticated_test_handshake();
+
+        let server_finished_transcript_hash = flight.transcript_hash();
+
+        let mut client_finished = build_tls13_finished(
+            &flight.client_handshake_traffic_secret,
+            &server_finished_transcript_hash,
+        )
+        .expect("client Finished should build");
+
+        let last_index = client_finished.len() - 1;
+        client_finished[last_index] ^= 0x01;
+
+        let client_finished_plaintext =
+            TlsPlaintextRecord::new(ContentType::Handshake, client_finished)
+                .expect("tampered client Finished should remain structurally valid");
+
+        let client_finished_record = client_handshake_record_protection
+            .encrypt_record(&client_finished_plaintext, 0)
+            .expect("tampered client Finished should still AEAD-encrypt");
+
+        assert!(matches!(
+            flight.complete_handshake(&[client_finished_record]),
+            Err(TlsServerHandshakeError::ClientFinishedMismatch)
         ));
     }
 }
