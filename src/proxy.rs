@@ -254,6 +254,7 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
     pub fn exchange<S>(
         &mut self,
         route: &config::Route,

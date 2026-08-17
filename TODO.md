@@ -505,7 +505,9 @@ Goal: select the correct certificate and proxy route during TLS setup.
 * [x] Set `X-Forwarded-Proto: https`.
 * [x] Preserve ordinary host-based proxy routing inside TLS.
 * [x] Add multi-domain localhost tests.
-* [ ] Promote the configured TLS path from the development probe to the normal HTTPS listener.
+* [x] Promote the configured TLS path from the development probe to the normal HTTPS listener.
+* [ ] Integrate HTTPS into the shared reload, connection-limit, and graceful-shutdown runtime loop.
+* [ ] Make the production HTTPS listen address configurable, including port 443.
 
 **Milestone complete when:** multiple HTTPS names can share port 443 and route to different upstreams.
 

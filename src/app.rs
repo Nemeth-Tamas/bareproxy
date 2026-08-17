@@ -1,4 +1,4 @@
-use std::{env, error::Error, fmt, process::ExitCode};
+use std::{env, error::Error, fmt, net::TcpListener, process::ExitCode, thread};
 
 use crate::{config, server, tls_identity::TlsIdentityStore, tls_probe};
 
@@ -167,6 +167,19 @@ fn start_proxy(config_path: &str) -> Result<(), AppError> {
         println!("Route: {route}");
     }
 
+    let tls_listener = if tls_identities.is_some() {
+        Some(
+            TcpListener::bind(tls_probe::DEV_HTTPS_LISTEN_ADDR).map_err(|source| {
+                AppError::ListenerBind {
+                    address: tls_probe::DEV_HTTPS_LISTEN_ADDR,
+                    message: source.to_string(),
+                }
+            })?,
+        )
+    } else {
+        None
+    };
+
     let listener = server::bind_listener().map_err(|source| AppError::ListenerBind {
         address: server::DEV_LISTEN_ADDR,
         message: source.to_string(),
@@ -176,6 +189,21 @@ fn start_proxy(config_path: &str) -> Result<(), AppError> {
         "INFO event=listener_start address=http://{}",
         server::DEV_LISTEN_ADDR
     );
+
+    let _tls_worker = match (tls_listener, tls_identities) {
+        (Some(tls_listener), Some(tls_identities)) => {
+            let tls_configuration = config.clone();
+
+            Some(thread::spawn(move || {
+                if let Err(error) =
+                    tls_probe::serve_configured(tls_listener, tls_identities, tls_configuration)
+                {
+                    eprintln!("ERROR event=https_listener_failure error={error}");
+                }
+            }))
+        }
+        _ => None,
+    };
 
     server::serve(listener, config, config_path).map_err(|source| AppError::Server {
         message: source.to_string(),

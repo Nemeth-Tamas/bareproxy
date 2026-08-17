@@ -16,7 +16,8 @@ use crate::{
     tls_identity::{TlsIdentity, TlsIdentityStore},
 };
 
-pub const DEV_TLS_PROBE_ADDR: &str = "127.0.0.1:8443";
+pub const DEV_HTTPS_LISTEN_ADDR: &str = "127.0.0.1:8443";
+pub const DEV_TLS_PROBE_ADDR: &str = DEV_HTTPS_LISTEN_ADDR;
 
 const PROBE_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PROBE_HTTP_REQUEST: usize = 32 * 1024;
@@ -36,7 +37,7 @@ pub fn run(certificate_path: &str, private_key_path: &str) -> io::Result<()> {
 
     let (mut stream, peer_addr) = listener.accept()?;
 
-    configure_stream(&stream)?;
+    configure_stream(&stream, PROBE_IO_TIMEOUT)?;
 
     println!("INFO event=tls_probe_connection_accept peer={peer_addr}");
 
@@ -59,27 +60,44 @@ pub fn run_configured(
     );
     io::stdout().flush()?;
 
+    serve_configured(listener, identities, configuration)
+}
+
+pub fn serve_configured(
+    listener: TcpListener,
+    identities: TlsIdentityStore,
+    configuration: config::Config,
+) -> io::Result<()> {
+    let local_addr = listener.local_addr()?;
+    let io_timeout = Duration::from_secs(configuration.client_idle_timeout_seconds());
+
+    println!(
+        "INFO event=https_listener_start address=https://{local_addr} identities={}",
+        identities.identities().len()
+    );
+    io::stdout().flush()?;
+
     loop {
         let (mut stream, peer_addr) = listener.accept()?;
 
-        configure_stream(&stream)?;
+        configure_stream(&stream, io_timeout)?;
 
-        println!("INFO event=tls_probe_connection_accept peer={peer_addr}");
+        println!("INFO event=https_connection_accept peer={peer_addr}");
 
         match handle_connection(&mut stream, &identities, Some(&configuration)) {
             Ok(()) => {
-                println!("INFO event=tls_probe_complete peer={peer_addr}");
+                println!("INFO event=https_connection_complete peer={peer_addr}");
             }
             Err(error) => {
-                eprintln!("WARN event=tls_probe_connection_failure peer={peer_addr} error={error}");
+                eprintln!("WARN event=https_connection_failure peer={peer_addr} error={error}");
             }
         }
     }
 }
 
-fn configure_stream(stream: &TcpStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(PROBE_IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(PROBE_IO_TIMEOUT))
+fn configure_stream(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))
 }
 
 fn handle_connection(

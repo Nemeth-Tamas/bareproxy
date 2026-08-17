@@ -254,7 +254,7 @@ def main():
         server = subprocess.Popen(
             [
                 str(binary),
-                "--tls-config-probe",
+                "--config",
                 str(config_path),
             ],
             cwd=ROOT,
@@ -274,7 +274,7 @@ def main():
             for line in server.stdout:
                 server_lines.append(line)
 
-                if "event=tls_probe_listener_start" in line:
+                if "event=https_listener_start" in line:
                     ready_event.set()
 
         collector = threading.Thread(
@@ -295,7 +295,7 @@ def main():
             server.wait(timeout=2)
             collector.join(timeout=1)
 
-            print("FAIL: configured TLS probe did not become ready")
+            print("FAIL: normal BareProxy HTTPS listener did not become ready")
             print("".join(server_lines))
 
             return 1
