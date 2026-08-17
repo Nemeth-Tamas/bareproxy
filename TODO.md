@@ -466,7 +466,7 @@ Goal: establish HTTPS with a manually supplied certificate before touching ACME.
 * [x] Parse offered cipher suites.
 * [x] Recognize `TLS_CHACHA20_POLY1305_SHA256`.
 * [x] Negotiate P-256 key exchange.
-* [ ] Produce `HelloRetryRequest` when P-256 is supported but not initially shared.
+* [x] Produce `HelloRetryRequest` when P-256 is supported but not initially shared.
 * [x] Generate an ephemeral server key.
 * [x] Produce `ServerHello`.
 * [x] Maintain the TLS transcript hash.

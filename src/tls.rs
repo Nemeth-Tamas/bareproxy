@@ -41,16 +41,24 @@ const HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS: u8 = 8;
 const HANDSHAKE_TYPE_CERTIFICATE: u8 = 11;
 const HANDSHAKE_TYPE_CERTIFICATE_VERIFY: u8 = 15;
 const HANDSHAKE_TYPE_FINISHED: u8 = 20;
+const HANDSHAKE_TYPE_MESSAGE_HASH: u8 = 254;
 
 const TLS_UINT24_MAX: usize = 0x00ff_ffff;
 const TLS_SERVER_CERTIFICATE_VERIFY_CONTEXT: &[u8] = b"TLS 1.3, server CertificateVerify";
+const TLS13_HELLO_RETRY_REQUEST_RANDOM: [u8; 32] = [
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+];
 
 const EXTENSION_SERVER_NAME: u16 = 0;
 const EXTENSION_SUPPORTED_GROUPS: u16 = 10;
 const EXTENSION_SIGNATURE_ALGORITHMS: u16 = 13;
 const EXTENSION_APPLICATION_LAYER_PROTOCOL_NEGOTIATION: u16 = 16;
+const EXTENSION_PADDING: u16 = 21;
 const EXTENSION_PRE_SHARED_KEY: u16 = 41;
+const EXTENSION_EARLY_DATA: u16 = 42;
 const EXTENSION_SUPPORTED_VERSIONS: u16 = 43;
+const EXTENSION_COOKIE: u16 = 44;
 const EXTENSION_KEY_SHARE: u16 = 51;
 
 const TLS_SHA256_HASH_SIZE: usize = 32;
@@ -584,6 +592,8 @@ pub enum TlsServerHandshakeError {
     UnsupportedSignatureAlgorithm,
     NoApplicationProtocol,
     HelloRetryRequired { group: u16 },
+    InvalidRetryClientHello,
+    InvalidRetryKeyShare,
     InvalidP256KeyShare(P256PointError),
     ServerPublicKey(P256PointError),
     Random(io::Error),
@@ -625,6 +635,11 @@ impl fmt::Display for TlsServerHandshakeError {
                     "client supports group 0x{group:04x} but did not provide a usable key share; HelloRetryRequest is required"
                 )
             }
+            Self::InvalidRetryClientHello => formatter.write_str(
+                "retried TLS ClientHello changed fields not permitted after HelloRetryRequest",
+            ),
+            Self::InvalidRetryKeyShare => formatter
+                .write_str("retried TLS ClientHello does not contain exactly one P-256 key share"),
             Self::InvalidP256KeyShare(error) => {
                 write!(formatter, "invalid client P-256 key share: {error}")
             }
@@ -723,6 +738,9 @@ impl TlsServerHandshakeError {
             | Self::UnsupportedSignatureAlgorithm
             | Self::HelloRetryRequired { .. } => TlsAlertDescription::HandshakeFailure,
             Self::NoApplicationProtocol => TlsAlertDescription::NoApplicationProtocol,
+            Self::InvalidRetryClientHello | Self::InvalidRetryKeyShare => {
+                TlsAlertDescription::IllegalParameter
+            }
             Self::InvalidP256KeyShare(_) => TlsAlertDescription::IllegalParameter,
             Self::RecordProtection(error) => error.alert_description(),
             Self::UnexpectedClientFinishedContentType { .. } => {
@@ -776,6 +794,23 @@ impl TlsTranscript {
         }
     }
 
+    fn after_hello_retry(
+        client_hello_message: &[u8],
+        hello_retry_request: &[u8],
+    ) -> Result<Self, TlsServerHandshakeError> {
+        let client_hello_hash = sha256(client_hello_message);
+
+        let message_hash =
+            encode_handshake_message(HANDSHAKE_TYPE_MESSAGE_HASH, &client_hello_hash)?;
+
+        let mut transcript = Self::new();
+
+        transcript.update_handshake_message(&message_hash);
+        transcript.update_handshake_message(hello_retry_request);
+
+        Ok(transcript)
+    }
+
     pub fn update_handshake_message(&mut self, message: &[u8]) {
         self.sha256.update(message);
     }
@@ -788,6 +823,43 @@ impl TlsTranscript {
 impl Default for TlsTranscript {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub enum Tls13ServerFirstFlight {
+    ServerHello(Tls13ServerHelloFlight),
+    HelloRetry(Tls13HelloRetryFlight),
+}
+
+pub struct Tls13HelloRetryFlight {
+    hello_retry_request: Vec<u8>,
+    client_hello: ClientHello,
+    transcript: TlsTranscript,
+}
+
+impl Tls13HelloRetryFlight {
+    pub fn hello_retry_request(&self) -> &[u8] {
+        &self.hello_retry_request
+    }
+
+    pub fn selected_group(&self) -> u16 {
+        TLS_GROUP_SECP256R1
+    }
+
+    pub fn continue_with_client_hello(
+        self,
+        client_hello_message: &[u8],
+    ) -> Result<Tls13ServerHelloFlight, TlsServerHandshakeError> {
+        let client_hello = parse_client_hello(client_hello_message)?;
+
+        validate_tls13_server_client_hello(&client_hello)?;
+        validate_retry_client_hello(&self.client_hello, &client_hello)?;
+
+        negotiate_tls13_server_hello_from_client_hello(
+            client_hello_message,
+            client_hello,
+            self.transcript,
+        )
     }
 }
 
@@ -1339,6 +1411,7 @@ pub struct ClientHello {
     key_shares: Vec<TlsKeyShareEntry>,
     signature_algorithms: Vec<u16>,
     alpn_protocols: Vec<Vec<u8>>,
+    raw_extensions: Vec<(u16, Vec<u8>)>,
     pre_shared_key_present: bool,
 }
 
@@ -1377,6 +1450,12 @@ impl ClientHello {
 
     pub fn alpn_protocols(&self) -> &[Vec<u8>] {
         &self.alpn_protocols
+    }
+
+    fn has_extension(&self, extension_type: u16) -> bool {
+        self.raw_extensions
+            .iter()
+            .any(|(candidate, _)| *candidate == extension_type)
     }
 
     pub fn offers_http11(&self) -> bool {
@@ -2082,6 +2161,7 @@ pub fn parse_client_hello(message: &[u8]) -> Result<ClientHello, TlsHandshakeErr
         key_shares,
         signature_algorithms,
         alpn_protocols,
+        raw_extensions,
         pre_shared_key_present,
     } = parse_client_hello_extensions(extension_block)?;
 
@@ -2135,6 +2215,7 @@ pub fn parse_client_hello(message: &[u8]) -> Result<ClientHello, TlsHandshakeErr
         key_shares: key_shares.unwrap_or_default(),
         signature_algorithms: signature_algorithms.unwrap_or_default(),
         alpn_protocols: alpn_protocols.unwrap_or_default(),
+        raw_extensions,
         pre_shared_key_present,
     })
 }
@@ -2147,6 +2228,7 @@ struct ParsedClientHelloExtensions {
     key_shares: Option<Vec<TlsKeyShareEntry>>,
     signature_algorithms: Option<Vec<u16>>,
     alpn_protocols: Option<Vec<Vec<u8>>>,
+    raw_extensions: Vec<(u16, Vec<u8>)>,
     pre_shared_key_present: bool,
 }
 
@@ -2166,6 +2248,10 @@ fn parse_client_hello_extensions(
         }
 
         seen_extensions.push(extension_type);
+
+        parsed
+            .raw_extensions
+            .push((extension_type, extension_data.to_vec()));
 
         let is_last_extension = reader.remaining() == 0;
 
@@ -2389,11 +2475,51 @@ fn validate_key_share_groups(
     Ok(())
 }
 
+pub fn negotiate_tls13_server_first_flight(
+    client_hello_message: &[u8],
+) -> Result<Tls13ServerFirstFlight, TlsServerHandshakeError> {
+    let client_hello = parse_client_hello(client_hello_message)?;
+
+    validate_tls13_server_client_hello(&client_hello)?;
+
+    if client_hello.secp256r1_key_share().is_some() {
+        let flight = negotiate_tls13_server_hello_from_client_hello(
+            client_hello_message,
+            client_hello,
+            TlsTranscript::new(),
+        )?;
+
+        return Ok(Tls13ServerFirstFlight::ServerHello(flight));
+    }
+
+    let hello_retry_request = build_tls13_hello_retry_request(&client_hello)?;
+
+    let transcript = TlsTranscript::after_hello_retry(client_hello_message, &hello_retry_request)?;
+
+    Ok(Tls13ServerFirstFlight::HelloRetry(Tls13HelloRetryFlight {
+        hello_retry_request,
+        client_hello,
+        transcript,
+    }))
+}
+
 pub fn negotiate_tls13_server_hello(
     client_hello_message: &[u8],
 ) -> Result<Tls13ServerHelloFlight, TlsServerHandshakeError> {
     let client_hello = parse_client_hello(client_hello_message)?;
 
+    validate_tls13_server_client_hello(&client_hello)?;
+
+    negotiate_tls13_server_hello_from_client_hello(
+        client_hello_message,
+        client_hello,
+        TlsTranscript::new(),
+    )
+}
+
+fn validate_tls13_server_client_hello(
+    client_hello: &ClientHello,
+) -> Result<(), TlsServerHandshakeError> {
     if !client_hello.offers_chacha20_poly1305_sha256() {
         return Err(TlsServerHandshakeError::UnsupportedCipherSuite);
     }
@@ -2406,6 +2532,14 @@ pub fn negotiate_tls13_server_hello(
         return Err(TlsServerHandshakeError::UnsupportedSignatureAlgorithm);
     }
 
+    Ok(())
+}
+
+fn negotiate_tls13_server_hello_from_client_hello(
+    client_hello_message: &[u8],
+    client_hello: ClientHello,
+    mut transcript: TlsTranscript,
+) -> Result<Tls13ServerHelloFlight, TlsServerHandshakeError> {
     let encoded_client_key_share =
         client_hello
             .secp256r1_key_share()
@@ -2433,8 +2567,6 @@ pub fn negotiate_tls13_server_hello(
     fill_random(&mut server_random).map_err(TlsServerHandshakeError::Random)?;
 
     let server_hello = build_tls13_server_hello(&client_hello, &server_random, &server_key_share)?;
-
-    let mut transcript = TlsTranscript::new();
 
     transcript.update_handshake_message(client_hello_message);
     transcript.update_handshake_message(&server_hello);
@@ -2478,6 +2610,105 @@ pub fn negotiate_tls13_server_hello(
         handshake_record_protection,
         server_authentication_started: false,
     })
+}
+
+fn validate_retry_client_hello(
+    original: &ClientHello,
+    retry: &ClientHello,
+) -> Result<(), TlsServerHandshakeError> {
+    if original.random != retry.random
+        || original.legacy_session_id != retry.legacy_session_id
+        || original.cipher_suites != retry.cipher_suites
+    {
+        return Err(TlsServerHandshakeError::InvalidRetryClientHello);
+    }
+
+    if !original.pre_shared_key_present && retry.pre_shared_key_present {
+        return Err(TlsServerHandshakeError::InvalidRetryClientHello);
+    }
+
+    if retry.has_extension(EXTENSION_EARLY_DATA) || retry.has_extension(EXTENSION_COOKIE) {
+        return Err(TlsServerHandshakeError::InvalidRetryClientHello);
+    }
+
+    if retry.key_shares.len() != 1 || retry.key_shares[0].group != TLS_GROUP_SECP256R1 {
+        return Err(TlsServerHandshakeError::InvalidRetryKeyShare);
+    }
+
+    if retry_invariant_extensions(original) != retry_invariant_extensions(retry) {
+        return Err(TlsServerHandshakeError::InvalidRetryClientHello);
+    }
+
+    Ok(())
+}
+
+fn retry_invariant_extensions(client_hello: &ClientHello) -> Vec<(u16, &[u8])> {
+    client_hello
+        .raw_extensions
+        .iter()
+        .filter_map(|(extension_type, extension_data)| {
+            if matches!(
+                *extension_type,
+                EXTENSION_KEY_SHARE
+                    | EXTENSION_PADDING
+                    | EXTENSION_PRE_SHARED_KEY
+                    | EXTENSION_EARLY_DATA
+            ) {
+                None
+            } else {
+                Some((*extension_type, extension_data.as_slice()))
+            }
+        })
+        .collect()
+}
+
+fn build_tls13_hello_retry_request(
+    client_hello: &ClientHello,
+) -> Result<Vec<u8>, TlsServerHandshakeError> {
+    let mut extensions = Vec::new();
+
+    append_tls_extension(
+        &mut extensions,
+        EXTENSION_SUPPORTED_VERSIONS,
+        &TLS_VERSION_1_3.to_be_bytes(),
+    );
+
+    append_tls_extension(
+        &mut extensions,
+        EXTENSION_KEY_SHARE,
+        &TLS_GROUP_SECP256R1.to_be_bytes(),
+    );
+
+    let mut body = Vec::with_capacity(
+        2 + TLS13_HELLO_RETRY_REQUEST_RANDOM.len()
+            + 1
+            + client_hello.legacy_session_id.len()
+            + 2
+            + 1
+            + 2
+            + extensions.len(),
+    );
+
+    body.extend_from_slice(&TLS_LEGACY_RECORD_VERSION.to_be_bytes());
+    body.extend_from_slice(&TLS13_HELLO_RETRY_REQUEST_RANDOM);
+
+    body.push(
+        u8::try_from(client_hello.legacy_session_id.len())
+            .expect("validated TLS legacy session ID must fit in uint8"),
+    );
+    body.extend_from_slice(&client_hello.legacy_session_id);
+
+    body.extend_from_slice(&TLS_CHACHA20_POLY1305_SHA256.to_be_bytes());
+    body.push(0);
+
+    body.extend_from_slice(
+        &u16::try_from(extensions.len())
+            .expect("TLS HelloRetryRequest extensions must fit in uint16")
+            .to_be_bytes(),
+    );
+    body.extend_from_slice(&extensions);
+
+    encode_handshake_message(HANDSHAKE_TYPE_SERVER_HELLO, &body)
 }
 
 fn build_tls13_certificate(
@@ -3655,6 +3886,53 @@ mod tests {
         test_client_hello(TLS_LEGACY_RECORD_VERSION, &[0], cipher_suites, &extensions)
     }
 
+    fn p256_retry_client_hellos(second_private_key: Scalar) -> (Vec<u8>, Vec<u8>) {
+        const X25519: u16 = 0x001d;
+
+        let second_public_key = p256_generator_multiply(second_private_key)
+            .to_sec1_uncompressed()
+            .expect("retry P-256 public key should encode");
+
+        let first_extensions = vec![
+            test_server_name_extension("example.test"),
+            test_u16_list_extension(EXTENSION_SUPPORTED_GROUPS, &[TLS_GROUP_SECP256R1, X25519]),
+            test_u16_list_extension(
+                EXTENSION_SIGNATURE_ALGORITHMS,
+                &[TLS_SIGNATURE_ECDSA_SECP256R1_SHA256],
+            ),
+            test_alpn_extension(&[&b"h2"[..], &b"http/1.1"[..]]),
+            test_supported_versions_extension(&[TLS_VERSION_1_3]),
+            test_key_share_extension(X25519, &[0x22_u8; 32]),
+        ];
+
+        let second_extensions = vec![
+            test_server_name_extension("example.test"),
+            test_u16_list_extension(EXTENSION_SUPPORTED_GROUPS, &[TLS_GROUP_SECP256R1, X25519]),
+            test_u16_list_extension(
+                EXTENSION_SIGNATURE_ALGORITHMS,
+                &[TLS_SIGNATURE_ECDSA_SECP256R1_SHA256],
+            ),
+            test_alpn_extension(&[&b"h2"[..], &b"http/1.1"[..]]),
+            test_supported_versions_extension(&[TLS_VERSION_1_3]),
+            test_key_share_extension(TLS_GROUP_SECP256R1, &second_public_key),
+        ];
+
+        (
+            test_client_hello(
+                TLS_LEGACY_RECORD_VERSION,
+                &[0],
+                &[TLS_CHACHA20_POLY1305_SHA256],
+                &first_extensions,
+            ),
+            test_client_hello(
+                TLS_LEGACY_RECORD_VERSION,
+                &[0],
+                &[TLS_CHACHA20_POLY1305_SHA256],
+                &second_extensions,
+            ),
+        )
+    }
+
     fn decrypt_handshake_records(
         record_protection: &mut Tls13RecordProtection,
         records: &[TlsCiphertextRecord],
@@ -4154,6 +4432,163 @@ mod tests {
             Err(TlsServerHandshakeError::HelloRetryRequired {
                 group: TLS_GROUP_SECP256R1,
             })
+        ));
+    }
+
+    #[test]
+    fn hello_retry_request_selects_p256_and_rewrites_transcript() {
+        let second_private_key = Scalar::new(Uint256::from_limbs([15, 0, 0, 0]));
+
+        let (client_hello1, client_hello2) = p256_retry_client_hellos(second_private_key);
+
+        let first_flight = negotiate_tls13_server_first_flight(&client_hello1)
+            .expect("initial ClientHello should negotiate");
+
+        let retry = match first_flight {
+            Tls13ServerFirstFlight::HelloRetry(retry) => retry,
+            Tls13ServerFirstFlight::ServerHello(_) => {
+                panic!("initial ClientHello should require HelloRetryRequest")
+            }
+        };
+
+        assert_eq!(retry.selected_group(), TLS_GROUP_SECP256R1);
+
+        let hello_retry_request = retry.hello_retry_request().to_vec();
+
+        assert_eq!(hello_retry_request[0], HANDSHAKE_TYPE_SERVER_HELLO);
+
+        let mut body = HandshakeReader::new(&hello_retry_request[HANDSHAKE_HEADER_SIZE..]);
+
+        assert_eq!(
+            body.read_u16().expect("HRR legacy version should parse"),
+            TLS_LEGACY_RECORD_VERSION
+        );
+
+        assert_eq!(
+            body.read_exact(32).expect("HRR random should exist"),
+            &TLS13_HELLO_RETRY_REQUEST_RANDOM
+        );
+
+        assert!(
+            body.read_vector_u8("legacy_session_id_echo")
+                .expect("HRR session ID should parse")
+                .is_empty()
+        );
+
+        assert_eq!(
+            body.read_u16().expect("HRR cipher suite should parse"),
+            TLS_CHACHA20_POLY1305_SHA256
+        );
+
+        assert_eq!(
+            body.read_u8().expect("HRR compression method should parse"),
+            0
+        );
+
+        let extension_block = body
+            .read_vector_u16("HelloRetryRequest extensions")
+            .expect("HRR extensions should parse");
+
+        body.finish("HelloRetryRequest")
+            .expect("HRR body should end cleanly");
+
+        let mut extensions = HandshakeReader::new(extension_block);
+
+        assert_eq!(
+            extensions
+                .read_u16()
+                .expect("supported_versions extension should parse"),
+            EXTENSION_SUPPORTED_VERSIONS
+        );
+
+        assert_eq!(
+            extensions
+                .read_vector_u16("supported_versions")
+                .expect("supported_versions data should parse"),
+            TLS_VERSION_1_3.to_be_bytes()
+        );
+
+        assert_eq!(
+            extensions
+                .read_u16()
+                .expect("HRR key_share extension should parse"),
+            EXTENSION_KEY_SHARE
+        );
+
+        assert_eq!(
+            extensions
+                .read_vector_u16("HRR key_share")
+                .expect("HRR selected group should parse"),
+            TLS_GROUP_SECP256R1.to_be_bytes()
+        );
+
+        extensions
+            .finish("HelloRetryRequest extensions")
+            .expect("HRR should contain only the required extensions");
+
+        let flight = retry
+            .continue_with_client_hello(&client_hello2)
+            .expect("valid retry ClientHello should continue the handshake");
+
+        let client_hello1_hash = sha256(&client_hello1);
+
+        let message_hash =
+            encode_handshake_message(HANDSHAKE_TYPE_MESSAGE_HASH, &client_hello1_hash)
+                .expect("synthetic message_hash should encode");
+
+        let mut expected_transcript = message_hash;
+
+        expected_transcript.extend_from_slice(&hello_retry_request);
+        expected_transcript.extend_from_slice(&client_hello2);
+        expected_transcript.extend_from_slice(flight.server_hello());
+        expected_transcript.extend_from_slice(flight.encrypted_extensions());
+
+        assert_eq!(flight.transcript_hash(), sha256(&expected_transcript));
+    }
+
+    #[test]
+    fn hello_retry_rejects_modified_client_hello2() {
+        let second_private_key = Scalar::new(Uint256::from_limbs([16, 0, 0, 0]));
+
+        let (client_hello1, mut client_hello2) = p256_retry_client_hellos(second_private_key);
+
+        let first_flight = negotiate_tls13_server_first_flight(&client_hello1)
+            .expect("initial ClientHello should negotiate");
+
+        let retry = match first_flight {
+            Tls13ServerFirstFlight::HelloRetry(retry) => retry,
+            Tls13ServerFirstFlight::ServerHello(_) => {
+                panic!("initial ClientHello should require HelloRetryRequest")
+            }
+        };
+
+        client_hello2[HANDSHAKE_HEADER_SIZE + 2] ^= 0x01;
+
+        assert!(matches!(
+            retry.continue_with_client_hello(&client_hello2),
+            Err(TlsServerHandshakeError::InvalidRetryClientHello)
+        ));
+    }
+
+    #[test]
+    fn hello_retry_requires_exactly_one_requested_p256_share() {
+        let second_private_key = Scalar::new(Uint256::from_limbs([17, 0, 0, 0]));
+
+        let (client_hello1, _) = p256_retry_client_hellos(second_private_key);
+
+        let first_flight = negotiate_tls13_server_first_flight(&client_hello1)
+            .expect("initial ClientHello should negotiate");
+
+        let retry = match first_flight {
+            Tls13ServerFirstFlight::HelloRetry(retry) => retry,
+            Tls13ServerFirstFlight::ServerHello(_) => {
+                panic!("initial ClientHello should require HelloRetryRequest")
+            }
+        };
+
+        assert!(matches!(
+            retry.continue_with_client_hello(&client_hello1),
+            Err(TlsServerHandshakeError::InvalidRetryKeyShare)
         ));
     }
 
