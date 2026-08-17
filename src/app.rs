@@ -16,6 +16,9 @@ enum Command {
         certificate_path: String,
         private_key_path: String,
     },
+    TlsConfigProbe {
+        config_path: String,
+    },
     Help,
     Version,
 }
@@ -25,6 +28,7 @@ enum AppError {
     UnknownArgument(String),
     MissingConfigPath,
     MissingTlsProbeArguments,
+    MissingTlsConfigProbePath,
     TooManyArguments,
     Config {
         message: String,
@@ -50,6 +54,9 @@ impl fmt::Display for AppError {
                 formatter,
                 "--tls-probe requires a certificate-chain PEM path and EC private-key PEM path"
             ),
+            Self::MissingTlsConfigProbePath => {
+                formatter.write_str("--tls-config-probe requires a configuration path")
+            }
             Self::TooManyArguments => write!(formatter, "too many arguments"),
             Self::Config { message } => write!(formatter, "configuration error: {message}"),
             Self::ListenerBind { address, message } => {
@@ -73,6 +80,7 @@ impl AppError {
             Self::UnknownArgument(_)
             | Self::MissingConfigPath
             | Self::MissingTlsProbeArguments
+            | Self::MissingTlsConfigProbePath
             | Self::TooManyArguments => CLI_ERROR_EXIT_CODE,
         }
     }
@@ -99,6 +107,24 @@ fn run() -> Result<(), AppError> {
                 AppError::TlsProbe {
                     message: source.to_string(),
                 }
+            })?;
+        }
+        Command::TlsConfigProbe { config_path } => {
+            let (_, tls_identity_files) =
+                config::load_with_tls(&config_path).map_err(|source| AppError::Config {
+                    message: source.to_string(),
+                })?;
+
+            let identities = TlsIdentityStore::load_files(&tls_identity_files)
+                .map_err(|source| AppError::TlsProbe {
+                    message: source.to_string(),
+                })?
+                .ok_or_else(|| AppError::TlsProbe {
+                    message: "configured TLS probe requires at least one tls_identity".to_owned(),
+                })?;
+
+            tls_probe::run_configured(identities).map_err(|source| AppError::TlsProbe {
+                message: source.to_string(),
             })?;
         }
         Command::Help => print_help(),
@@ -179,6 +205,11 @@ where
                 private_key_path,
             }
         }
+        Some("--tls-config-probe") => {
+            let config_path = args.next().ok_or(AppError::MissingTlsConfigProbePath)?;
+
+            Command::TlsConfigProbe { config_path }
+        }
         Some(argument) => return Err(AppError::UnknownArgument(argument.to_owned())),
     };
 
@@ -204,6 +235,7 @@ fn print_help() {
     println!("OPTIONS:");
     println!("    -c, --config <PATH>              Use a custom configuration file");
     println!("    --tls-probe <CERT_PEM> <KEY_PEM> Run one local TLS interoperability probe");
+    println!("    --tls-config-probe <PATH>        Run configured multi-SNI TLS probes");
     println!("    -h, --help                       Print help");
     println!("    -V, --version                    Print version");
     println!();
@@ -272,6 +304,24 @@ mod tests {
         assert_eq!(
             parse_args(vec!["--tls-probe".to_owned(), "certificate.pem".to_owned(),]),
             Err(AppError::MissingTlsProbeArguments)
+        );
+    }
+
+    #[test]
+    fn tls_config_probe_selects_configuration() {
+        assert_eq!(
+            parse_args(vec!["--tls-config-probe".to_owned(), "tls.conf".to_owned(),]),
+            Ok(Command::TlsConfigProbe {
+                config_path: "tls.conf".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn tls_config_probe_requires_configuration() {
+        assert_eq!(
+            parse_args(vec!["--tls-config-probe".to_owned()]),
+            Err(AppError::MissingTlsConfigProbePath)
         );
     }
 

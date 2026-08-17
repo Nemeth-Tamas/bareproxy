@@ -8,8 +8,8 @@ use crate::{
     tls::{
         self, CiphertextRecordDecoder, ContentType, HandshakeDeframer, PlaintextRecordDecoder,
         TLS_CIPHERTEXT_FRAGMENT_LIMIT, TLS_LEGACY_RECORD_VERSION, TLS_RECORD_HEADER_SIZE,
-        Tls13ApplicationEvent, Tls13ApplicationState, Tls13ServerFirstFlight, TlsCiphertextRecord,
-        TlsPlaintextRecord,
+        Tls13ApplicationEvent, Tls13ApplicationState, Tls13ServerFirstFlight, TlsAlert,
+        TlsAlertDescription, TlsCiphertextRecord, TlsPlaintextRecord,
     },
     tls_identity::{TlsIdentity, TlsIdentityStore},
 };
@@ -34,8 +34,7 @@ pub fn run(certificate_path: &str, private_key_path: &str) -> io::Result<()> {
 
     let (mut stream, peer_addr) = listener.accept()?;
 
-    stream.set_read_timeout(Some(PROBE_IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(PROBE_IO_TIMEOUT))?;
+    configure_stream(&stream)?;
 
     println!("INFO event=tls_probe_connection_accept peer={peer_addr}");
 
@@ -44,6 +43,38 @@ pub fn run(certificate_path: &str, private_key_path: &str) -> io::Result<()> {
     println!("INFO event=tls_probe_complete peer={peer_addr}");
 
     Ok(())
+}
+
+pub fn run_configured(identities: TlsIdentityStore) -> io::Result<()> {
+    let listener = TcpListener::bind(DEV_TLS_PROBE_ADDR)?;
+
+    println!(
+        "INFO event=tls_probe_listener_start address={DEV_TLS_PROBE_ADDR} identities={} mode=configured",
+        identities.identities().len()
+    );
+    io::stdout().flush()?;
+
+    loop {
+        let (mut stream, peer_addr) = listener.accept()?;
+
+        configure_stream(&stream)?;
+
+        println!("INFO event=tls_probe_connection_accept peer={peer_addr}");
+
+        match handle_connection(&mut stream, &identities) {
+            Ok(()) => {
+                println!("INFO event=tls_probe_complete peer={peer_addr}");
+            }
+            Err(error) => {
+                eprintln!("WARN event=tls_probe_connection_failure peer={peer_addr} error={error}");
+            }
+        }
+    }
+}
+
+fn configure_stream(stream: &TcpStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(PROBE_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(PROBE_IO_TIMEOUT))
 }
 
 fn handle_connection(stream: &mut TcpStream, identities: &TlsIdentityStore) -> io::Result<()> {
@@ -58,11 +89,18 @@ fn handle_connection(stream: &mut TcpStream, identities: &TlsIdentityStore) -> i
         .server_name()
         .ok_or_else(|| invalid_data("TLS probe ClientHello contains no SNI hostname"))?;
 
-    let identity = identities.select(server_name).ok_or_else(|| {
-        invalid_data(format!(
-            "TLS probe has no certificate identity matching SNI hostname {server_name}"
-        ))
-    })?;
+    let identity = match identities.select(server_name) {
+        Some(identity) => identity,
+        None => {
+            write_fatal_alert(stream, TlsAlertDescription::UnrecognizedName)?;
+
+            println!(
+                "WARN event=tls_probe_sni_rejected server_name={server_name} alert=unrecognized_name"
+            );
+
+            return Ok(());
+        }
+    };
 
     println!("INFO event=tls_probe_identity_selected server_name={server_name}");
 
@@ -321,6 +359,21 @@ fn read_http_request(
             return Ok(request);
         }
     }
+}
+
+fn write_fatal_alert(stream: &mut TcpStream, description: TlsAlertDescription) -> io::Result<()> {
+    let alert = TlsAlert::fatal(description).map_err(|error| invalid_data(error.to_string()))?;
+
+    let record = alert
+        .plaintext_record()
+        .map_err(|error| invalid_data(error.to_string()))?;
+
+    let wire = record
+        .serialize()
+        .map_err(|error| invalid_data(error.to_string()))?;
+
+    stream.write_all(&wire)?;
+    stream.flush()
 }
 
 fn write_handshake_message(stream: &mut TcpStream, message: &[u8]) -> io::Result<()> {

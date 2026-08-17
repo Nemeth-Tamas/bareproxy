@@ -495,16 +495,16 @@ Goal: establish HTTPS with a manually supplied certificate before touching ACME.
 Goal: select the correct certificate and proxy route during TLS setup.
 
 * [ ] Map SNI hostnames to configured sites.
-* [ ] Select certificates by SNI.
-* [ ] Reject or safely handle unknown SNI names.
+* [x] Select certificates by SNI.
+* [x] Reject or safely handle unknown SNI names.
 * [x] Keep certificate material separate from route configuration.
 * [x] Allow multiple certificates in memory.
 * [x] Load configured PEM certificate/key identities at startup.
-* [ ] Serve different certificates from one listening socket.
+* [x] Serve different certificates from one listening socket.
 * [ ] Make TLS connection state available to the HTTP layer.
 * [ ] Set `X-Forwarded-Proto: https`.
 * [ ] Preserve ordinary host-based proxy routing inside TLS.
-* [ ] Add multi-domain localhost tests.
+* [x] Add multi-domain localhost tests.
 
 **Milestone complete when:** multiple HTTPS names can share port 443 and route to different upstreams.
 

@@ -168,6 +168,7 @@ pub fn load_with_tls(path: &str) -> Result<(Config, Vec<TlsIdentityFiles>), Conf
     Ok((configuration, tls_identity_files))
 }
 
+#[cfg(test)]
 pub fn parse(input: &str) -> Result<Config, ConfigError> {
     parse_with_tls(input).map(|(configuration, _)| configuration)
 }
