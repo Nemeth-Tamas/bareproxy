@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import signal
 import subprocess
 import tempfile
 import threading
@@ -119,12 +120,18 @@ def wait_for_server_event(server, server_lines, needle):
     return False
 
 
-def run_client(openssl, ca_bundle, hostname, groups):
+def run_client(
+    openssl,
+    ca_bundle,
+    hostname,
+    groups,
+    address=TLS_PROBE_ADDRESS,
+):
     command = [
         openssl,
         "s_client",
         "-connect",
-        TLS_PROBE_ADDRESS,
+        address,
         "-servername",
         hostname,
         "-tls1_3",
@@ -428,6 +435,138 @@ def main():
             ]
         )
 
+        print()
+        print("=== rejected SIGHUP preserves live HTTPS state ===")
+
+        config_path.write_text(
+            "https_listen = 127.0.0.1:8444\n"
+            "tls_identity = missing-cert.pem | missing-key.pem\n"
+            f"alpha.localhost -> 127.0.0.1:{alpha_port}\n"
+            f"beta.localhost -> 127.0.0.1:{beta_port}\n",
+            encoding="utf-8",
+        )
+
+        os.kill(server.pid, signal.SIGHUP)
+
+        rejected_reload_event = wait_for_server_event(
+            server,
+            server_lines,
+            "event=config_reload_rejected",
+        )
+
+        alpha_after_rejected_reload = run_client(
+            openssl,
+            ca_bundle,
+            "alpha.localhost",
+            "P-256",
+        )
+
+        rejected_reload_passed = print_checks(
+            [
+                (
+                    "invalid reload was rejected",
+                    rejected_reload_event,
+                ),
+                (
+                    "old HTTPS listener remained live",
+                    alpha_after_rejected_reload.returncode == 0,
+                ),
+                (
+                    "old TLS identity remained live",
+                    "Verification: OK"
+                    in alpha_after_rejected_reload.stdout
+                    or "Verify return code: 0 (ok)"
+                    in alpha_after_rejected_reload.stdout,
+                ),
+                (
+                    "old route remained live",
+                    "alpha upstream"
+                    in alpha_after_rejected_reload.stdout,
+                ),
+            ]
+        )
+
+        print()
+        print("=== atomic SIGHUP routes + certificate + listener reload ===")
+
+        alpha_reload_upstream, alpha_reload_upstream_thread = (
+            start_upstream("alpha reloaded")
+        )
+
+        alpha_reload_port = alpha_reload_upstream.server_address[1]
+
+        alpha_cert, alpha_key = generate_identity(
+            openssl,
+            directory,
+            "alpha.localhost",
+        )
+
+        ca_bundle.write_text(
+            alpha_cert.read_text(encoding="ascii")
+            + beta_cert.read_text(encoding="ascii"),
+            encoding="ascii",
+        )
+
+        config_path.write_text(
+            "https_listen = 127.0.0.1:8444\n"
+            "tls_identity = "
+            f"{alpha_cert.name} | {alpha_key.name}\n"
+            "tls_identity = "
+            f"{beta_cert.name} | {beta_key.name}\n"
+            f"alpha.localhost -> 127.0.0.1:{alpha_reload_port}\n"
+            f"beta.localhost -> 127.0.0.1:{beta_port}\n",
+            encoding="utf-8",
+        )
+
+        os.kill(server.pid, signal.SIGHUP)
+
+        valid_reload_event = wait_for_server_event(
+            server,
+            server_lines,
+            (
+                "https_listen=127.0.0.1:8444 "
+                "tls_identities=2"
+            ),
+        )
+
+        alpha_after_valid_reload = run_client(
+            openssl,
+            ca_bundle,
+            "alpha.localhost",
+            "P-256",
+            address="127.0.0.1:8444",
+        )
+
+        valid_reload_passed = print_checks(
+            [
+                (
+                    "valid reload activated",
+                    valid_reload_event,
+                ),
+                (
+                    "replacement HTTPS listener accepted connections",
+                    alpha_after_valid_reload.returncode == 0,
+                ),
+                (
+                    "replacement TLS certificate verified",
+                    "Verification: OK"
+                    in alpha_after_valid_reload.stdout
+                    or "Verify return code: 0 (ok)"
+                    in alpha_after_valid_reload.stdout,
+                ),
+                (
+                    "replacement route reached new upstream",
+                    "alpha reloaded upstream"
+                    in alpha_after_valid_reload.stdout,
+                ),
+                (
+                    "reloaded HTTPS route kept X-Forwarded-Proto",
+                    "x-forwarded-proto=https"
+                    in alpha_after_valid_reload.stdout,
+                ),
+            ]
+        )
+
         server.terminate()
 
         try:
@@ -440,14 +579,23 @@ def main():
 
         alpha_upstream.shutdown()
         beta_upstream.shutdown()
+        alpha_reload_upstream.shutdown()
 
         alpha_upstream.server_close()
         beta_upstream.server_close()
+        alpha_reload_upstream.server_close()
 
         alpha_upstream_thread.join(timeout=1)
         beta_upstream_thread.join(timeout=1)
+        alpha_reload_upstream_thread.join(timeout=1)
 
-        passed = alpha_passed and beta_passed and unknown_passed
+        passed = (
+            alpha_passed
+            and beta_passed
+            and unknown_passed
+            and rejected_reload_passed
+            and valid_reload_passed
+        )
 
         if not passed:
             print()
@@ -471,8 +619,8 @@ def main():
 
     if passed:
         print(
-            "PASS: one BareProxy TLS socket selected two certificates, "
-            "reverse-proxied both HTTPS sites, and rejected an unknown name :D"
+            "PASS: BareProxy multi-SNI HTTPS proxying and atomic TLS reload "
+            "interoperate with OpenSSL :D"
         )
         return 0
 

@@ -508,7 +508,7 @@ Goal: select the correct certificate and proxy route during TLS setup.
 * [x] Promote the configured TLS path from the development probe to the normal HTTPS listener.
 * [x] Share HTTP/HTTPS connection limits, counters, worker draining, and graceful shutdown.
 * [x] Make the production HTTPS listen address configurable, including port 443.
-* [ ] Reload routes, TLS identities, and HTTPS listener changes atomically on SIGHUP.
+* [x] Reload routes, TLS identities, and HTTPS listener changes atomically on SIGHUP.
 
 **Milestone complete when:** multiple HTTPS names can share port 443 and route to different upstreams.
 

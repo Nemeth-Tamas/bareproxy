@@ -136,8 +136,8 @@ fn serve_until(
 
 fn serve_until_with_tls(
     listener: TcpListener,
-    https_listener: Option<TcpListener>,
-    tls_identities: Option<TlsIdentityStore>,
+    mut https_listener: Option<TcpListener>,
+    mut tls_identities: Option<TlsIdentityStore>,
     mut configuration: config::Config,
     config_path: Option<&str>,
     shutdown_requested: &AtomicBool,
@@ -169,7 +169,12 @@ fn serve_until_with_tls(
         if reload_requested.swap(false, Ordering::AcqRel) {
             match config_path {
                 Some(config_path) => {
-                    let _ = reload_configuration(config_path, &mut configuration);
+                    let _ = reload_runtime_configuration(
+                        config_path,
+                        &mut configuration,
+                        &mut https_listener,
+                        &mut tls_identities,
+                    );
                 }
                 None => {
                     println!("WARN event=config_reload_ignored reason=no_config_path");
@@ -254,8 +259,26 @@ fn serve_until_with_tls(
     Ok(())
 }
 
+#[cfg(test)]
 fn reload_configuration(config_path: &str, configuration: &mut config::Config) -> bool {
-    let replacement = match config::load(config_path) {
+    let mut https_listener = None;
+    let mut tls_identities = None;
+
+    reload_runtime_configuration(
+        config_path,
+        configuration,
+        &mut https_listener,
+        &mut tls_identities,
+    )
+}
+
+fn reload_runtime_configuration(
+    config_path: &str,
+    configuration: &mut config::Config,
+    https_listener: &mut Option<TcpListener>,
+    tls_identities: &mut Option<TlsIdentityStore>,
+) -> bool {
+    let (replacement, tls_identity_files) = match config::load_with_tls(config_path) {
         Ok(replacement) => replacement,
         Err(error) => {
             eprintln!("WARN event=config_reload_rejected path=\"{config_path}\" error={error}");
@@ -264,15 +287,68 @@ fn reload_configuration(config_path: &str, configuration: &mut config::Config) -
         }
     };
 
+    let replacement_tls_identities = match TlsIdentityStore::load_files(&tls_identity_files) {
+        Ok(replacement) => replacement,
+        Err(error) => {
+            eprintln!(
+                "WARN event=config_reload_rejected path=\"{config_path}\" error=\"TLS identity error: {error}\""
+            );
+
+            return false;
+        }
+    };
+
+    let https_listener_changed = replacement_tls_identities.is_some()
+        && (https_listener.is_none()
+            || configuration.https_listen_addr() != replacement.https_listen_addr());
+
+    let replacement_https_listener = if https_listener_changed {
+        let listener = match TcpListener::bind(replacement.https_listen_addr()) {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!(
+                    "WARN event=config_reload_rejected path=\"{config_path}\" error=\"failed to bind HTTPS listener {}: {error}\"",
+                    replacement.https_listen_addr()
+                );
+
+                return false;
+            }
+        };
+
+        if let Err(error) = listener.set_nonblocking(true) {
+            eprintln!(
+                "WARN event=config_reload_rejected path=\"{config_path}\" error=\"failed to configure HTTPS listener {}: {error}\"",
+                replacement.https_listen_addr()
+            );
+
+            return false;
+        }
+
+        Some(listener)
+    } else {
+        None
+    };
+
     let route_count = replacement.routes().len();
     let max_connections = replacement.max_connections();
     let client_idle_timeout_seconds = replacement.client_idle_timeout_seconds();
     let upstream_timeout_seconds = replacement.upstream_timeout_seconds();
+    let https_listen_addr = replacement.https_listen_addr().to_owned();
+    let tls_identity_count = replacement_tls_identities
+        .as_ref()
+        .map_or(0, |identities| identities.identities().len());
 
+    if replacement_tls_identities.is_none() {
+        *https_listener = None;
+    } else if let Some(replacement_https_listener) = replacement_https_listener {
+        *https_listener = Some(replacement_https_listener);
+    }
+
+    *tls_identities = replacement_tls_identities;
     *configuration = replacement;
 
     println!(
-        "INFO event=config_reload path=\"{config_path}\" routes={route_count} max_connections={max_connections} client_idle_timeout_seconds={client_idle_timeout_seconds} upstream_timeout_seconds={upstream_timeout_seconds}"
+        "INFO event=config_reload path=\"{config_path}\" routes={route_count} max_connections={max_connections} client_idle_timeout_seconds={client_idle_timeout_seconds} upstream_timeout_seconds={upstream_timeout_seconds} https_listen={https_listen_addr} tls_identities={tls_identity_count}"
     );
 
     true
