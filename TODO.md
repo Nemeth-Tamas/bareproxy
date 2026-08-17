@@ -479,11 +479,11 @@ Goal: establish HTTPS with a manually supplied certificate before touching ACME.
 * [x] Verify client `Finished`.
 * [x] Derive application traffic secrets.
 * [x] Transition into encrypted application data.
-* [ ] Support TLS alerts.
-* [ ] Support `close_notify`.
+* [x] Support TLS alerts.
+* [x] Support `close_notify`.
 * [x] Reject unsupported cipher suites cleanly.
 * [x] Reject unsupported curves cleanly.
-* [ ] Reject malformed handshake messages.
+* [x] Reject malformed handshake messages.
 * [ ] Compare handshake behavior against real browser/OpenSSL clients.
 
 **Milestone complete when:** Firefox/Chrome/`openssl s_client` can establish TLS 1.3 with BareProxy using a manually trusted certificate.

@@ -86,6 +86,167 @@ impl TryFrom<u8> for ContentType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsAlertDescription {
+    CloseNotify,
+    UnexpectedMessage,
+    BadRecordMac,
+    RecordOverflow,
+    HandshakeFailure,
+    BadCertificate,
+    UnsupportedCertificate,
+    CertificateRevoked,
+    CertificateExpired,
+    CertificateUnknown,
+    IllegalParameter,
+    UnknownCa,
+    AccessDenied,
+    DecodeError,
+    DecryptError,
+    ProtocolVersion,
+    InsufficientSecurity,
+    InternalError,
+    InappropriateFallback,
+    UserCanceled,
+    MissingExtension,
+    UnsupportedExtension,
+    UnrecognizedName,
+    BadCertificateStatusResponse,
+    UnknownPskIdentity,
+    CertificateRequired,
+    GeneralError,
+    NoApplicationProtocol,
+    Unknown(u8),
+}
+
+impl TlsAlertDescription {
+    pub fn from_code(value: u8) -> Self {
+        match value {
+            0 => Self::CloseNotify,
+            10 => Self::UnexpectedMessage,
+            20 => Self::BadRecordMac,
+            22 => Self::RecordOverflow,
+            40 => Self::HandshakeFailure,
+            42 => Self::BadCertificate,
+            43 => Self::UnsupportedCertificate,
+            44 => Self::CertificateRevoked,
+            45 => Self::CertificateExpired,
+            46 => Self::CertificateUnknown,
+            47 => Self::IllegalParameter,
+            48 => Self::UnknownCa,
+            49 => Self::AccessDenied,
+            50 => Self::DecodeError,
+            51 => Self::DecryptError,
+            70 => Self::ProtocolVersion,
+            71 => Self::InsufficientSecurity,
+            80 => Self::InternalError,
+            86 => Self::InappropriateFallback,
+            90 => Self::UserCanceled,
+            109 => Self::MissingExtension,
+            110 => Self::UnsupportedExtension,
+            112 => Self::UnrecognizedName,
+            113 => Self::BadCertificateStatusResponse,
+            115 => Self::UnknownPskIdentity,
+            116 => Self::CertificateRequired,
+            117 => Self::GeneralError,
+            120 => Self::NoApplicationProtocol,
+            unknown => Self::Unknown(unknown),
+        }
+    }
+
+    pub fn code(self) -> u8 {
+        match self {
+            Self::CloseNotify => 0,
+            Self::UnexpectedMessage => 10,
+            Self::BadRecordMac => 20,
+            Self::RecordOverflow => 22,
+            Self::HandshakeFailure => 40,
+            Self::BadCertificate => 42,
+            Self::UnsupportedCertificate => 43,
+            Self::CertificateRevoked => 44,
+            Self::CertificateExpired => 45,
+            Self::CertificateUnknown => 46,
+            Self::IllegalParameter => 47,
+            Self::UnknownCa => 48,
+            Self::AccessDenied => 49,
+            Self::DecodeError => 50,
+            Self::DecryptError => 51,
+            Self::ProtocolVersion => 70,
+            Self::InsufficientSecurity => 71,
+            Self::InternalError => 80,
+            Self::InappropriateFallback => 86,
+            Self::UserCanceled => 90,
+            Self::MissingExtension => 109,
+            Self::UnsupportedExtension => 110,
+            Self::UnrecognizedName => 112,
+            Self::BadCertificateStatusResponse => 113,
+            Self::UnknownPskIdentity => 115,
+            Self::CertificateRequired => 116,
+            Self::GeneralError => 117,
+            Self::NoApplicationProtocol => 120,
+            Self::Unknown(value) => value,
+        }
+    }
+
+    fn is_closure(self) -> bool {
+        matches!(self, Self::CloseNotify | Self::UserCanceled)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsAlert {
+    level: u8,
+    description: TlsAlertDescription,
+}
+
+impl TlsAlert {
+    pub fn close_notify() -> Self {
+        Self {
+            level: 1,
+            description: TlsAlertDescription::CloseNotify,
+        }
+    }
+
+    pub fn fatal(description: TlsAlertDescription) -> Result<Self, TlsRecordError> {
+        if description.is_closure() {
+            return Err(TlsRecordError::InvalidFatalAlertDescription { description });
+        }
+
+        Ok(Self {
+            level: 2,
+            description,
+        })
+    }
+
+    pub fn parse(fragment: &[u8]) -> Result<Self, TlsRecordError> {
+        if fragment.len() != 2 {
+            return Err(TlsRecordError::InvalidAlertLength {
+                length: fragment.len(),
+            });
+        }
+
+        Ok(Self {
+            level: fragment[0],
+            description: TlsAlertDescription::from_code(fragment[1]),
+        })
+    }
+
+    pub fn level(&self) -> u8 {
+        self.level
+    }
+
+    pub fn description(&self) -> TlsAlertDescription {
+        self.description
+    }
+
+    pub fn plaintext_record(self) -> Result<TlsPlaintextRecord, TlsRecordError> {
+        TlsPlaintextRecord::new(
+            ContentType::Alert,
+            vec![self.level, self.description.code()],
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordDirection {
     Read,
     Write,
@@ -110,6 +271,11 @@ pub enum TlsRecordError {
     InvalidInnerContentType(u8),
     SequenceNumberExhausted { direction: RecordDirection },
     Aead(ChaCha20Poly1305Error),
+    InvalidFatalAlertDescription { description: TlsAlertDescription },
+    WriteAfterCloseNotify,
+    CloseNotifyAlreadySent,
+    ConnectionFailed,
+    UnexpectedProtectedContentType { content_type: ContentType },
 }
 
 impl fmt::Display for TlsRecordError {
@@ -202,6 +368,27 @@ impl fmt::Display for TlsRecordError {
                 )
             }
             Self::Aead(error) => write!(formatter, "TLS record AEAD failure: {error}"),
+            Self::InvalidFatalAlertDescription { description } => {
+                write!(
+                    formatter,
+                    "TLS closure alert {description:?} cannot be sent as a fatal error alert"
+                )
+            }
+            Self::WriteAfterCloseNotify => {
+                formatter.write_str("TLS write side is closed after close_notify")
+            }
+            Self::CloseNotifyAlreadySent => {
+                formatter.write_str("TLS close_notify was already sent")
+            }
+            Self::ConnectionFailed => {
+                formatter.write_str("TLS connection is closed after a fatal alert")
+            }
+            Self::UnexpectedProtectedContentType { content_type } => {
+                write!(
+                    formatter,
+                    "unexpected protected TLS content type {content_type:?} in application state"
+                )
+            }
         }
     }
 }
@@ -218,6 +405,34 @@ impl Error for TlsRecordError {
 impl From<ChaCha20Poly1305Error> for TlsRecordError {
     fn from(error: ChaCha20Poly1305Error) -> Self {
         Self::Aead(error)
+    }
+}
+
+impl TlsRecordError {
+    pub fn alert_description(&self) -> TlsAlertDescription {
+        match self {
+            Self::UnknownContentType(_)
+            | Self::EmptyHandshakeFragment
+            | Self::InvalidChangeCipherSpec
+            | Self::InterleavedHandshake { .. }
+            | Self::HandshakeNotAligned { .. }
+            | Self::MissingInnerContentType
+            | Self::InvalidInnerContentType(_)
+            | Self::InvalidCiphertextContentType { .. }
+            | Self::UnexpectedProtectedContentType { .. } => TlsAlertDescription::UnexpectedMessage,
+            Self::RecordOverflow { .. }
+            | Self::CiphertextOverflow { .. }
+            | Self::InnerPlaintextOverflow { .. } => TlsAlertDescription::RecordOverflow,
+            Self::InvalidAlertLength { .. } => TlsAlertDescription::DecodeError,
+            Self::CiphertextTooShort { .. } | Self::Aead(_) => TlsAlertDescription::BadRecordMac,
+            Self::InvalidCiphertextVersion { .. } => TlsAlertDescription::ProtocolVersion,
+            Self::UnprotectedApplicationData
+            | Self::SequenceNumberExhausted { .. }
+            | Self::InvalidFatalAlertDescription { .. }
+            | Self::WriteAfterCloseNotify
+            | Self::CloseNotifyAlreadySent
+            | Self::ConnectionFailed => TlsAlertDescription::InternalError,
+        }
     }
 }
 
@@ -335,12 +550,39 @@ impl fmt::Display for TlsHandshakeError {
 
 impl Error for TlsHandshakeError {}
 
+impl TlsHandshakeError {
+    pub fn alert_description(&self) -> TlsAlertDescription {
+        match self {
+            Self::Truncated
+            | Self::HandshakeLengthMismatch { .. }
+            | Self::InvalidSessionIdLength { .. }
+            | Self::InvalidCipherSuiteVector { .. }
+            | Self::MissingExtensions
+            | Self::MalformedVector { .. }
+            | Self::InvalidAlpn => TlsAlertDescription::DecodeError,
+            Self::InvalidLegacyVersion { .. }
+            | Self::InvalidCompressionMethods
+            | Self::DuplicateExtension { .. }
+            | Self::PreSharedKeyNotLast
+            | Self::InvalidServerName
+            | Self::DuplicateServerName
+            | Self::DuplicateKeyShareGroup { .. }
+            | Self::KeyShareGroupNotOffered { .. }
+            | Self::KeyShareOrderMismatch => TlsAlertDescription::IllegalParameter,
+            Self::Tls13Required => TlsAlertDescription::ProtocolVersion,
+            Self::MissingRequiredExtension { .. } => TlsAlertDescription::MissingExtension,
+            Self::UnexpectedHandshakeType { .. } => TlsAlertDescription::UnexpectedMessage,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum TlsServerHandshakeError {
     ClientHello(TlsHandshakeError),
     UnsupportedCipherSuite,
     UnsupportedGroup,
     UnsupportedSignatureAlgorithm,
+    NoApplicationProtocol,
     HelloRetryRequired { group: u16 },
     InvalidP256KeyShare(P256PointError),
     ServerPublicKey(P256PointError),
@@ -373,6 +615,9 @@ impl fmt::Display for TlsServerHandshakeError {
             }
             Self::UnsupportedSignatureAlgorithm => {
                 formatter.write_str("client does not support ecdsa_secp256r1_sha256")
+            }
+            Self::NoApplicationProtocol => {
+                formatter.write_str("client ALPN list contains no protocol supported by BareProxy")
             }
             Self::HelloRetryRequired { group } => {
                 write!(
@@ -465,6 +710,38 @@ impl Error for TlsServerHandshakeError {
             Self::KeySchedule(error) => Some(error),
             Self::RecordProtection(error) => Some(error),
             _ => None,
+        }
+    }
+}
+
+impl TlsServerHandshakeError {
+    pub fn alert_description(&self) -> TlsAlertDescription {
+        match self {
+            Self::ClientHello(error) => error.alert_description(),
+            Self::UnsupportedCipherSuite
+            | Self::UnsupportedGroup
+            | Self::UnsupportedSignatureAlgorithm
+            | Self::HelloRetryRequired { .. } => TlsAlertDescription::HandshakeFailure,
+            Self::NoApplicationProtocol => TlsAlertDescription::NoApplicationProtocol,
+            Self::InvalidP256KeyShare(_) => TlsAlertDescription::IllegalParameter,
+            Self::RecordProtection(error) => error.alert_description(),
+            Self::UnexpectedClientFinishedContentType { .. } => {
+                TlsAlertDescription::UnexpectedMessage
+            }
+            Self::InvalidClientFinished => TlsAlertDescription::DecodeError,
+            Self::ClientFinishedMismatch => TlsAlertDescription::DecryptError,
+            Self::ServerPublicKey(_)
+            | Self::Random(_)
+            | Self::Ecdh(_)
+            | Self::Signing(_)
+            | Self::KeySchedule(_)
+            | Self::EmptyCertificateChain
+            | Self::EmptyCertificate { .. }
+            | Self::CertificateTooLong { .. }
+            | Self::CertificateListTooLong { .. }
+            | Self::AuthenticationAlreadyStarted
+            | Self::ServerAuthenticationRequired
+            | Self::HandshakeMessageTooLong { .. } => TlsAlertDescription::InternalError,
         }
     }
 }
@@ -563,12 +840,24 @@ impl Tls13ServerAuthenticationFlight {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Tls13ApplicationEvent {
+    ApplicationData(Vec<u8>),
+    CloseNotify,
+    UserCanceled,
+    FatalAlert(TlsAlertDescription),
+    IgnoredAfterCloseNotify,
+}
+
 pub struct Tls13ApplicationState {
     negotiated_alpn: Option<Vec<u8>>,
     client_application_traffic_secret: [u8; TLS_SHA256_HASH_SIZE],
     server_application_traffic_secret: [u8; TLS_SHA256_HASH_SIZE],
     transcript_hash: [u8; TLS_SHA256_HASH_SIZE],
     record_protection: Tls13RecordProtection,
+    close_notify_sent: bool,
+    close_notify_received: bool,
+    failed: bool,
 }
 
 impl Tls13ApplicationState {
@@ -584,20 +873,113 @@ impl Tls13ApplicationState {
         &mut self,
         fragment: &[u8],
     ) -> Result<TlsCiphertextRecord, TlsRecordError> {
+        if self.failed {
+            return Err(TlsRecordError::ConnectionFailed);
+        }
+
+        if self.close_notify_sent {
+            return Err(TlsRecordError::WriteAfterCloseNotify);
+        }
+
         let plaintext = TlsPlaintextRecord::new(ContentType::ApplicationData, fragment.to_vec())?;
 
         self.record_protection.encrypt_record(&plaintext, 0)
+    }
+
+    pub fn encrypt_close_notify(&mut self) -> Result<TlsCiphertextRecord, TlsRecordError> {
+        if self.failed {
+            return Err(TlsRecordError::ConnectionFailed);
+        }
+
+        if self.close_notify_sent {
+            return Err(TlsRecordError::CloseNotifyAlreadySent);
+        }
+
+        let plaintext = TlsAlert::close_notify().plaintext_record()?;
+        let encrypted = self.record_protection.encrypt_record(&plaintext, 0)?;
+
+        self.close_notify_sent = true;
+
+        Ok(encrypted)
+    }
+
+    pub fn encrypt_fatal_alert(
+        &mut self,
+        description: TlsAlertDescription,
+    ) -> Result<TlsCiphertextRecord, TlsRecordError> {
+        if self.failed {
+            return Err(TlsRecordError::ConnectionFailed);
+        }
+
+        let plaintext = TlsAlert::fatal(description)?.plaintext_record()?;
+        let encrypted = self.record_protection.encrypt_record(&plaintext, 0)?;
+
+        self.fail();
+
+        Ok(encrypted)
+    }
+
+    pub fn receive_protected_record(
+        &mut self,
+        record: &TlsCiphertextRecord,
+    ) -> Result<Tls13ApplicationEvent, TlsRecordError> {
+        if self.failed {
+            return Err(TlsRecordError::ConnectionFailed);
+        }
+
+        let plaintext = self.record_protection.decrypt_record(record)?;
+
+        if self.close_notify_received {
+            return Ok(Tls13ApplicationEvent::IgnoredAfterCloseNotify);
+        }
+
+        match plaintext.content_type() {
+            ContentType::ApplicationData => Ok(Tls13ApplicationEvent::ApplicationData(
+                plaintext.fragment().to_vec(),
+            )),
+            ContentType::Alert => {
+                let alert = TlsAlert::parse(plaintext.fragment())?;
+
+                match alert.description() {
+                    TlsAlertDescription::CloseNotify => {
+                        self.close_notify_received = true;
+
+                        Ok(Tls13ApplicationEvent::CloseNotify)
+                    }
+                    TlsAlertDescription::UserCanceled => Ok(Tls13ApplicationEvent::UserCanceled),
+                    description => {
+                        self.fail();
+
+                        Ok(Tls13ApplicationEvent::FatalAlert(description))
+                    }
+                }
+            }
+            content_type => Err(TlsRecordError::UnexpectedProtectedContentType { content_type }),
+        }
     }
 
     pub fn decrypt_protected_record(
         &mut self,
         record: &TlsCiphertextRecord,
     ) -> Result<TlsPlaintextRecord, TlsRecordError> {
+        if self.failed {
+            return Err(TlsRecordError::ConnectionFailed);
+        }
+
         self.record_protection.decrypt_record(record)
     }
 
     pub fn record_protection_mut(&mut self) -> &mut Tls13RecordProtection {
         &mut self.record_protection
+    }
+
+    fn fail(&mut self) {
+        wipe_bytes(&mut self.client_application_traffic_secret);
+        wipe_bytes(&mut self.server_application_traffic_secret);
+
+        self.record_protection.erase();
+
+        self.failed = true;
     }
 }
 
@@ -740,6 +1122,9 @@ impl Tls13ServerHelloFlight {
                 .server_application_traffic_secret,
             transcript_hash,
             record_protection,
+            close_notify_sent: false,
+            close_notify_received: false,
+            failed: false,
         })
     }
 }
@@ -1318,12 +1703,21 @@ impl Tls13RecordProtection {
     }
 }
 
-impl Drop for Tls13RecordProtection {
-    fn drop(&mut self) {
+impl Tls13RecordProtection {
+    fn erase(&mut self) {
         wipe_bytes(&mut self.write_key);
         wipe_bytes(&mut self.write_iv);
         wipe_bytes(&mut self.read_key);
         wipe_bytes(&mut self.read_iv);
+
+        self.write_sequence_number = None;
+        self.read_sequence_number = None;
+    }
+}
+
+impl Drop for Tls13RecordProtection {
+    fn drop(&mut self) {
+        self.erase();
     }
 }
 
@@ -2314,8 +2708,10 @@ fn build_tls13_encrypted_extensions(
         );
 
         Some(ALPN_HTTP_1_1.to_vec())
-    } else {
+    } else if client_hello.alpn_protocols().is_empty() {
         None
+    } else {
+        return Err(TlsServerHandshakeError::NoApplicationProtocol);
     };
 
     let mut body = Vec::with_capacity(2 + extensions.len());
@@ -3328,6 +3724,45 @@ mod tests {
         (flight, client_record_protection)
     }
 
+    fn completed_application_test_states() -> (Tls13ApplicationState, Tls13RecordProtection) {
+        let (flight, mut client_handshake_record_protection) = authenticated_test_handshake();
+
+        let server_finished_transcript_hash = flight.transcript_hash();
+
+        let application_schedule = derive_tls13_application_key_schedule(
+            &flight.main_secret,
+            &server_finished_transcript_hash,
+        )
+        .expect("application traffic secrets should derive");
+
+        let client_finished = build_tls13_finished(
+            &flight.client_handshake_traffic_secret,
+            &server_finished_transcript_hash,
+        )
+        .expect("client Finished should build");
+
+        let client_finished_plaintext =
+            TlsPlaintextRecord::new(ContentType::Handshake, client_finished)
+                .expect("client Finished plaintext should be valid");
+
+        let client_finished_record = client_handshake_record_protection
+            .encrypt_record(&client_finished_plaintext, 0)
+            .expect("client Finished should encrypt");
+
+        let application_state = flight
+            .complete_handshake(&[client_finished_record])
+            .expect("client Finished should complete the handshake");
+
+        let client_application_record_protection = Tls13RecordProtection::new(
+            application_schedule.client_key,
+            application_schedule.client_iv,
+            application_schedule.server_key,
+            application_schedule.server_iv,
+        );
+
+        (application_state, client_application_record_protection)
+    }
+
     #[test]
     fn client_hello_parser_extracts_tls13_negotiation_inputs() {
         let message = test_client_hello(
@@ -4227,5 +4662,191 @@ mod tests {
             flight.complete_handshake(&[client_finished_record]),
             Err(TlsServerHandshakeError::ClientFinishedMismatch)
         ));
+    }
+
+    #[test]
+    fn protocol_errors_select_the_expected_tls_alerts() {
+        assert_eq!(
+            TlsHandshakeError::MalformedVector { field: "test" }.alert_description(),
+            TlsAlertDescription::DecodeError
+        );
+
+        assert_eq!(
+            TlsHandshakeError::MissingRequiredExtension {
+                extension_type: EXTENSION_KEY_SHARE,
+            }
+            .alert_description(),
+            TlsAlertDescription::MissingExtension
+        );
+
+        assert_eq!(
+            TlsHandshakeError::InvalidCompressionMethods.alert_description(),
+            TlsAlertDescription::IllegalParameter
+        );
+
+        assert_eq!(
+            TlsServerHandshakeError::UnsupportedCipherSuite.alert_description(),
+            TlsAlertDescription::HandshakeFailure
+        );
+
+        assert_eq!(
+            TlsServerHandshakeError::ClientFinishedMismatch.alert_description(),
+            TlsAlertDescription::DecryptError
+        );
+
+        assert_eq!(
+            TlsServerHandshakeError::NoApplicationProtocol.alert_description(),
+            TlsAlertDescription::NoApplicationProtocol
+        );
+
+        assert_eq!(
+            TlsRecordError::Aead(ChaCha20Poly1305Error::AuthenticationFailed).alert_description(),
+            TlsAlertDescription::BadRecordMac
+        );
+    }
+
+    #[test]
+    fn explicit_incompatible_alpn_offer_is_rejected() {
+        let client_private_key = Scalar::new(Uint256::from_limbs([14, 0, 0, 0]));
+
+        let client_public_key = p256_generator_multiply(client_private_key)
+            .to_sec1_uncompressed()
+            .expect("test P-256 public key should encode");
+
+        let extensions = vec![
+            test_server_name_extension("example.test"),
+            test_u16_list_extension(EXTENSION_SUPPORTED_GROUPS, &[TLS_GROUP_SECP256R1]),
+            test_u16_list_extension(
+                EXTENSION_SIGNATURE_ALGORITHMS,
+                &[TLS_SIGNATURE_ECDSA_SECP256R1_SHA256],
+            ),
+            test_alpn_extension(&[&b"h2"[..]]),
+            test_supported_versions_extension(&[TLS_VERSION_1_3]),
+            test_key_share_extension(TLS_GROUP_SECP256R1, &client_public_key),
+        ];
+
+        let client_hello = test_client_hello(
+            TLS_LEGACY_RECORD_VERSION,
+            &[0],
+            &[TLS_CHACHA20_POLY1305_SHA256],
+            &extensions,
+        );
+
+        assert!(matches!(
+            negotiate_tls13_server_hello(&client_hello),
+            Err(TlsServerHandshakeError::NoApplicationProtocol)
+        ));
+    }
+
+    #[test]
+    fn close_notify_is_encrypted_and_closes_only_the_write_side() {
+        let (mut server, mut client) = completed_application_test_states();
+
+        let close_notify = server
+            .encrypt_close_notify()
+            .expect("server close_notify should encrypt");
+
+        let plaintext = client
+            .decrypt_record(&close_notify)
+            .expect("client should decrypt close_notify");
+
+        let alert = TlsAlert::parse(plaintext.fragment()).expect("close_notify alert should parse");
+
+        assert_eq!(plaintext.content_type(), ContentType::Alert);
+        assert_eq!(alert.level(), 1);
+        assert_eq!(alert.description(), TlsAlertDescription::CloseNotify);
+
+        assert_eq!(
+            server.encrypt_application_data_record(b"too late"),
+            Err(TlsRecordError::WriteAfterCloseNotify)
+        );
+
+        assert_eq!(
+            server.encrypt_close_notify(),
+            Err(TlsRecordError::CloseNotifyAlreadySent)
+        );
+
+        let peer_close_notify = TlsAlert::close_notify()
+            .plaintext_record()
+            .expect("client close_notify plaintext should be valid");
+
+        let peer_close_notify = client
+            .encrypt_record(&peer_close_notify, 0)
+            .expect("client close_notify should encrypt");
+
+        assert_eq!(
+            server
+                .receive_protected_record(&peer_close_notify)
+                .expect("server should process peer close_notify"),
+            Tls13ApplicationEvent::CloseNotify
+        );
+
+        let late_plaintext =
+            TlsPlaintextRecord::new(ContentType::ApplicationData, b"ignored".to_vec())
+                .expect("late application plaintext should be valid");
+
+        let late_record = client
+            .encrypt_record(&late_plaintext, 0)
+            .expect("late record should still be cryptographically valid");
+
+        assert_eq!(
+            server
+                .receive_protected_record(&late_record)
+                .expect("data after peer close_notify should be ignored"),
+            Tls13ApplicationEvent::IgnoredAfterCloseNotify
+        );
+    }
+
+    #[test]
+    fn received_fatal_alert_erases_application_keys() {
+        let (mut server, mut client) = completed_application_test_states();
+
+        let fatal_alert = TlsAlert::fatal(TlsAlertDescription::DecodeError)
+            .expect("decode_error is a fatal alert")
+            .plaintext_record()
+            .expect("fatal alert plaintext should be valid");
+
+        let fatal_alert = client
+            .encrypt_record(&fatal_alert, 0)
+            .expect("client fatal alert should encrypt");
+
+        assert_eq!(
+            server
+                .receive_protected_record(&fatal_alert)
+                .expect("server should process fatal alert"),
+            Tls13ApplicationEvent::FatalAlert(TlsAlertDescription::DecodeError)
+        );
+
+        assert_eq!(
+            server.encrypt_application_data_record(b"forbidden"),
+            Err(TlsRecordError::ConnectionFailed)
+        );
+
+        assert_eq!(server.record_protection.write_sequence_number(), None);
+
+        assert_eq!(server.record_protection.read_sequence_number(), None);
+    }
+
+    #[test]
+    fn sent_fatal_alert_erases_application_keys_after_encryption() {
+        let (mut server, mut client) = completed_application_test_states();
+
+        let fatal_alert = server
+            .encrypt_fatal_alert(TlsAlertDescription::InternalError)
+            .expect("server fatal alert should encrypt");
+
+        let plaintext = client
+            .decrypt_record(&fatal_alert)
+            .expect("client should decrypt server fatal alert");
+
+        let alert = TlsAlert::parse(plaintext.fragment()).expect("server fatal alert should parse");
+
+        assert_eq!(alert.level(), 2);
+        assert_eq!(alert.description(), TlsAlertDescription::InternalError);
+
+        assert_eq!(
+            server.encrypt_application_data_record(b"forbidden"),
+            Err(TlsRecordError::ConnectionFailed)
+        );
     }
 }
