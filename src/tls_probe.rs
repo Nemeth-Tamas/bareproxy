@@ -11,7 +11,7 @@ use crate::{
         Tls13ApplicationEvent, Tls13ApplicationState, Tls13ServerFirstFlight, TlsCiphertextRecord,
         TlsPlaintextRecord,
     },
-    tls_identity::TlsIdentity,
+    tls_identity::{TlsIdentity, TlsIdentityStore},
 };
 
 pub const DEV_TLS_PROBE_ADDR: &str = "127.0.0.1:8443";
@@ -22,9 +22,14 @@ const MAX_PROBE_HTTP_REQUEST: usize = 32 * 1024;
 pub fn run(certificate_path: &str, private_key_path: &str) -> io::Result<()> {
     let identity = TlsIdentity::load_pem_files(certificate_path, private_key_path)?;
 
+    let identities = TlsIdentityStore::new(vec![identity])?;
+
     let listener = TcpListener::bind(DEV_TLS_PROBE_ADDR)?;
 
-    println!("INFO event=tls_probe_listener_start address={DEV_TLS_PROBE_ADDR}");
+    println!(
+        "INFO event=tls_probe_listener_start address={DEV_TLS_PROBE_ADDR} identities={}",
+        identities.identities().len()
+    );
     io::stdout().flush()?;
 
     let (mut stream, peer_addr) = listener.accept()?;
@@ -34,20 +39,32 @@ pub fn run(certificate_path: &str, private_key_path: &str) -> io::Result<()> {
 
     println!("INFO event=tls_probe_connection_accept peer={peer_addr}");
 
-    handle_connection(&mut stream, &identity)?;
+    handle_connection(&mut stream, &identities)?;
 
     println!("INFO event=tls_probe_complete peer={peer_addr}");
 
     Ok(())
 }
 
-fn handle_connection(stream: &mut TcpStream, identity: &TlsIdentity) -> io::Result<()> {
+fn handle_connection(stream: &mut TcpStream, identities: &TlsIdentityStore) -> io::Result<()> {
     let client_hello1 = read_client_hello(stream, false)?;
 
     let parsed_client_hello =
         tls::parse_client_hello(&client_hello1).map_err(|error| invalid_data(error.to_string()))?;
 
     let compatibility_mode = !parsed_client_hello.legacy_session_id().is_empty();
+
+    let server_name = parsed_client_hello
+        .server_name()
+        .ok_or_else(|| invalid_data("TLS probe ClientHello contains no SNI hostname"))?;
+
+    let identity = identities.select(server_name).ok_or_else(|| {
+        invalid_data(format!(
+            "TLS probe has no certificate identity matching SNI hostname {server_name}"
+        ))
+    })?;
+
+    println!("INFO event=tls_probe_identity_selected server_name={server_name}");
 
     let first_flight = tls::negotiate_tls13_server_first_flight(&client_hello1)
         .map_err(|error| invalid_data(error.to_string()))?;

@@ -88,12 +88,6 @@ impl TlsIdentity {
             !dns_name.starts_with("*.") && dns_name.eq_ignore_ascii_case(server_name)
         })
     }
-
-    fn matches_server_name_wildcard(&self, server_name: &str) -> bool {
-        self.dns_names
-            .iter()
-            .any(|dns_name| dns_name.starts_with("*.") && dns_name_matches(dns_name, server_name))
-    }
 }
 
 #[derive(Clone)]
@@ -137,7 +131,7 @@ impl TlsIdentityStore {
             .or_else(|| {
                 self.identities
                     .iter()
-                    .find(|identity| identity.matches_server_name_wildcard(server_name))
+                    .find(|identity| identity.matches_server_name(server_name))
             })
     }
 }
