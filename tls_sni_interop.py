@@ -242,6 +242,7 @@ def main():
         config_path = directory / "bareproxy-sni.conf"
 
         config_path.write_text(
+            "https_listen = 127.0.0.1:8443\n"
             "tls_identity = "
             f"{alpha_cert.name} | {alpha_key.name}\n"
             "tls_identity = "

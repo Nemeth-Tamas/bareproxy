@@ -2,13 +2,14 @@ use std::{
     collections::HashSet,
     error::Error,
     fmt, fs,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
 
 const DEFAULT_MAX_CONNECTIONS: usize = 128;
 const DEFAULT_CLIENT_IDLE_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_UPSTREAM_TIMEOUT_SECONDS: u64 = 10;
+const DEFAULT_HTTPS_LISTEN_ADDR: &str = "127.0.0.1:8443";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -16,6 +17,7 @@ pub struct Config {
     max_connections: usize,
     client_idle_timeout_seconds: u64,
     upstream_timeout_seconds: u64,
+    https_listen_addr: String,
 }
 
 impl Config {
@@ -33,6 +35,10 @@ impl Config {
 
     pub fn upstream_timeout_seconds(&self) -> u64 {
         self.upstream_timeout_seconds
+    }
+
+    pub fn https_listen_addr(&self) -> &str {
+        &self.https_listen_addr
     }
 
     pub fn route_for_host(&self, host: &str) -> Result<&Route, RouteLookupError> {
@@ -183,6 +189,8 @@ fn parse_with_tls(input: &str) -> Result<(Config, Vec<TlsIdentityFiles>), Config
     let mut client_idle_timeout_set = false;
     let mut upstream_timeout_seconds = DEFAULT_UPSTREAM_TIMEOUT_SECONDS;
     let mut upstream_timeout_set = false;
+    let mut https_listen_addr = DEFAULT_HTTPS_LISTEN_ADDR.to_owned();
+    let mut https_listen_set = false;
 
     for (index, raw_line) in input.lines().enumerate() {
         let line_number = index + 1;
@@ -209,6 +217,26 @@ fn parse_with_tls(input: &str) -> Result<(Config, Vec<TlsIdentityFiles>), Config
             }
 
             tls_identity_files.push(identity_files);
+            continue;
+        }
+
+        if let Some((directive, value)) = line.split_once('=')
+            && directive.trim() == "https_listen"
+        {
+            if https_listen_set {
+                return Err(ConfigError::Line {
+                    line: line_number,
+                    message: "duplicate https_listen setting".to_owned(),
+                });
+            }
+
+            https_listen_addr =
+                parse_https_listen_addr(value.trim()).map_err(|message| ConfigError::Line {
+                    line: line_number,
+                    message,
+                })?;
+
+            https_listen_set = true;
             continue;
         }
 
@@ -314,6 +342,7 @@ fn parse_with_tls(input: &str) -> Result<(Config, Vec<TlsIdentityFiles>), Config
             max_connections,
             client_idle_timeout_seconds,
             upstream_timeout_seconds,
+            https_listen_addr,
         },
         tls_identity_files,
     ))
@@ -322,6 +351,18 @@ fn parse_with_tls(input: &str) -> Result<(Config, Vec<TlsIdentityFiles>), Config
 fn strip_comment(line: &str) -> &str {
     line.split_once('#')
         .map_or(line, |(before_comment, _)| before_comment)
+}
+
+fn parse_https_listen_addr(input: &str) -> Result<String, String> {
+    if input.is_empty() {
+        return Err("https_listen must be an IP address and port".to_owned());
+    }
+
+    let address = input
+        .parse::<SocketAddr>()
+        .map_err(|_| "https_listen must be an IP address and port".to_owned())?;
+
+    Ok(address.to_string())
 }
 
 fn parse_tls_identity_files(input: &str) -> Result<TlsIdentityFiles, String> {
@@ -531,9 +572,9 @@ fn parse_upstream_timeout_seconds(value: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ConfigError, DEFAULT_CLIENT_IDLE_TIMEOUT_SECONDS, DEFAULT_MAX_CONNECTIONS,
-        DEFAULT_UPSTREAM_TIMEOUT_SECONDS, Route, RouteLookupError, TlsIdentityFiles, Upstream,
-        parse, parse_with_tls,
+        Config, ConfigError, DEFAULT_CLIENT_IDLE_TIMEOUT_SECONDS, DEFAULT_HTTPS_LISTEN_ADDR,
+        DEFAULT_MAX_CONNECTIONS, DEFAULT_UPSTREAM_TIMEOUT_SECONDS, Route, RouteLookupError,
+        TlsIdentityFiles, Upstream, parse, parse_with_tls,
     };
 
     use std::path::PathBuf;
@@ -553,6 +594,7 @@ mod tests {
                 max_connections: DEFAULT_MAX_CONNECTIONS,
                 client_idle_timeout_seconds: DEFAULT_CLIENT_IDLE_TIMEOUT_SECONDS,
                 upstream_timeout_seconds: DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
+                https_listen_addr: DEFAULT_HTTPS_LISTEN_ADDR.to_owned(),
             })
         );
     }
@@ -668,6 +710,53 @@ example.test -> 127.0.0.1:3000"
             Err(ConfigError::Line {
                 line: 1,
                 message: "tls_identity must use `certificate.pem | private-key.pem`".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn uses_default_https_listen_address() {
+        let config = parse("example.test -> 127.0.0.1:3000").unwrap();
+
+        assert_eq!(config.https_listen_addr(), DEFAULT_HTTPS_LISTEN_ADDR);
+    }
+
+    #[test]
+    fn parses_https_listen_address() {
+        let config = parse(
+            "https_listen = 0.0.0.0:443\n\
+example.test -> 127.0.0.1:3000",
+        )
+        .unwrap();
+
+        assert_eq!(config.https_listen_addr(), "0.0.0.0:443");
+    }
+
+    #[test]
+    fn rejects_invalid_https_listen_address() {
+        assert_eq!(
+            parse(
+                "https_listen = definitely-not-a-socket\n\
+example.test -> 127.0.0.1:3000"
+            ),
+            Err(ConfigError::Line {
+                line: 1,
+                message: "https_listen must be an IP address and port".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_https_listen_address() {
+        assert_eq!(
+            parse(
+                "https_listen = 127.0.0.1:8443\n\
+https_listen = 0.0.0.0:443\n\
+example.test -> 127.0.0.1:3000"
+            ),
+            Err(ConfigError::Line {
+                line: 2,
+                message: "duplicate https_listen setting".to_owned(),
             })
         );
     }

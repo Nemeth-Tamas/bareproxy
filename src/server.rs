@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{config, http, proxy};
+use crate::{config, http, proxy, tls_identity::TlsIdentityStore, tls_probe};
 
 pub const DEV_LISTEN_ADDR: &str = "127.0.0.1:8080";
 
@@ -29,7 +29,7 @@ const SIGINT: i32 = 2;
 const RESPONSE_BODY: &str = "BareProxy is alive.\n";
 
 #[derive(Default)]
-struct ServerCounters {
+pub(crate) struct ServerCounters {
     requests: AtomicUsize,
     errors: AtomicUsize,
 }
@@ -97,13 +97,17 @@ pub fn bind_listener() -> io::Result<TcpListener> {
 
 pub fn serve(
     listener: TcpListener,
+    https_listener: Option<TcpListener>,
+    tls_identities: Option<TlsIdentityStore>,
     configuration: config::Config,
     config_path: &str,
 ) -> io::Result<()> {
     install_signal_handlers();
 
-    serve_until(
+    serve_until_with_tls(
         listener,
+        https_listener,
+        tls_identities,
         configuration,
         Some(config_path),
         &SHUTDOWN_REQUESTED,
@@ -111,14 +115,51 @@ pub fn serve(
     )
 }
 
+#[cfg(test)]
 fn serve_until(
     listener: TcpListener,
+    configuration: config::Config,
+    config_path: Option<&str>,
+    shutdown_requested: &AtomicBool,
+    reload_requested: &AtomicBool,
+) -> io::Result<()> {
+    serve_until_with_tls(
+        listener,
+        None,
+        None,
+        configuration,
+        config_path,
+        shutdown_requested,
+        reload_requested,
+    )
+}
+
+fn serve_until_with_tls(
+    listener: TcpListener,
+    https_listener: Option<TcpListener>,
+    tls_identities: Option<TlsIdentityStore>,
     mut configuration: config::Config,
     config_path: Option<&str>,
     shutdown_requested: &AtomicBool,
     reload_requested: &AtomicBool,
 ) -> io::Result<()> {
+    if https_listener.is_some() != tls_identities.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "HTTPS listener and TLS identity store must either both be present or both be absent",
+        ));
+    }
+
     listener.set_nonblocking(true)?;
+
+    if let Some(https_listener) = &https_listener {
+        https_listener.set_nonblocking(true)?;
+
+        println!(
+            "INFO event=https_listener_start address=https://{}",
+            https_listener.local_addr()?
+        );
+    }
 
     let active_connections = Arc::new(AtomicUsize::new(0));
     let counters = Arc::new(ServerCounters::default());
@@ -136,13 +177,42 @@ fn serve_until(
             }
         }
 
+        let mut accepted_connection = false;
+
         match accept_and_spawn(&listener, &configuration, &active_connections, &counters) {
-            Ok(Some(worker)) => workers.push(worker),
-            Ok(None) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(SHUTDOWN_POLL_INTERVAL);
+            Ok(Some(worker)) => {
+                workers.push(worker);
+                accepted_connection = true;
             }
+            Ok(None) => {
+                accepted_connection = true;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
+        }
+
+        if let (Some(https_listener), Some(tls_identities)) = (&https_listener, &tls_identities) {
+            match accept_tls_and_spawn(
+                https_listener,
+                tls_identities,
+                &configuration,
+                &active_connections,
+                &counters,
+            ) {
+                Ok(Some(worker)) => {
+                    workers.push(worker);
+                    accepted_connection = true;
+                }
+                Ok(None) => {
+                    accepted_connection = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        if !accepted_connection {
+            thread::sleep(SHUTDOWN_POLL_INTERVAL);
         }
 
         reap_finished_workers(&mut workers);
@@ -155,6 +225,7 @@ fn serve_until(
     );
 
     drop(listener);
+    drop(https_listener);
 
     println!("INFO event=listener_stop reason=shutdown");
 
@@ -280,6 +351,61 @@ fn accept_and_spawn(
     })))
 }
 
+fn accept_tls_and_spawn(
+    listener: &TcpListener,
+    tls_identities: &TlsIdentityStore,
+    configuration: &config::Config,
+    active_connections: &Arc<AtomicUsize>,
+    counters: &Arc<ServerCounters>,
+) -> io::Result<Option<JoinHandle<()>>> {
+    let (mut stream, peer_addr) = listener.accept()?;
+
+    let active = active_connections.load(Ordering::SeqCst);
+    let maximum = configuration.max_connections();
+
+    if active >= maximum {
+        println!(
+            "WARN event=https_connection_reject peer={peer_addr} reason=connection_limit active={active} maximum={maximum}"
+        );
+
+        let _ = stream.shutdown(Shutdown::Both);
+
+        return Ok(None);
+    }
+
+    let configuration = configuration.clone();
+    let tls_identities = tls_identities.clone();
+    let active_connections = Arc::clone(active_connections);
+    let counters = Arc::clone(counters);
+
+    let active = active_connections.fetch_add(1, Ordering::SeqCst) + 1;
+
+    println!(
+        "INFO event=https_connection_accept peer={peer_addr} active={active} maximum={maximum}"
+    );
+
+    Ok(Some(thread::spawn(move || {
+        let result = tls_probe::handle_runtime_connection(
+            &mut stream,
+            &tls_identities,
+            &configuration,
+            &counters,
+        );
+
+        let active = active_connections.fetch_sub(1, Ordering::SeqCst) - 1;
+
+        if let Err(error) = result {
+            eprintln!("ERROR event=https_connection_failure peer={peer_addr} error={error}");
+        }
+
+        let (requests_total, errors_total) = counters.snapshot();
+
+        println!(
+            "INFO event=https_connection_close peer={peer_addr} active={active} maximum={maximum} requests_total={requests_total} errors_total={errors_total}"
+        );
+    })))
+}
+
 fn handle_accepted_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -363,17 +489,16 @@ pub(crate) fn handle_https_connection<S>(
     stream: &mut S,
     peer_addr: SocketAddr,
     configuration: &config::Config,
+    counters: &ServerCounters,
 ) -> io::Result<()>
 where
     S: Read + Write,
 {
-    let counters = ServerCounters::default();
-
     match handle_connection_io(
         stream,
         peer_addr,
         configuration,
-        &counters,
+        counters,
         proxy::ForwardedProto::Https,
     ) {
         Ok(ConnectionOutcome::Complete) => Ok(()),

@@ -41,7 +41,9 @@ pub fn run(certificate_path: &str, private_key_path: &str) -> io::Result<()> {
 
     println!("INFO event=tls_probe_connection_accept peer={peer_addr}");
 
-    handle_connection(&mut stream, &identities, None)?;
+    let counters = server::ServerCounters::default();
+
+    handle_connection(&mut stream, &identities, None, &counters)?;
 
     println!("INFO event=tls_probe_complete peer={peer_addr}");
 
@@ -77,6 +79,8 @@ pub fn serve_configured(
     );
     io::stdout().flush()?;
 
+    let counters = server::ServerCounters::default();
+
     loop {
         let (mut stream, peer_addr) = listener.accept()?;
 
@@ -84,7 +88,7 @@ pub fn serve_configured(
 
         println!("INFO event=https_connection_accept peer={peer_addr}");
 
-        match handle_connection(&mut stream, &identities, Some(&configuration)) {
+        match handle_connection(&mut stream, &identities, Some(&configuration), &counters) {
             Ok(()) => {
                 println!("INFO event=https_connection_complete peer={peer_addr}");
             }
@@ -100,10 +104,24 @@ fn configure_stream(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
     stream.set_write_timeout(Some(timeout))
 }
 
+pub(crate) fn handle_runtime_connection(
+    stream: &mut TcpStream,
+    identities: &TlsIdentityStore,
+    configuration: &config::Config,
+    counters: &server::ServerCounters,
+) -> io::Result<()> {
+    let timeout = Duration::from_secs(configuration.client_idle_timeout_seconds());
+
+    configure_stream(stream, timeout)?;
+
+    handle_connection(stream, identities, Some(configuration), counters)
+}
+
 fn handle_connection(
     stream: &mut TcpStream,
     identities: &TlsIdentityStore,
     configuration: Option<&config::Config>,
+    counters: &server::ServerCounters,
 ) -> io::Result<()> {
     let client_hello1 = read_client_hello(stream, false)?;
 
@@ -212,7 +230,7 @@ fn handle_connection(
 
         let mut transport = TlsApplicationTransport::new(stream, application_state);
 
-        server::handle_https_connection(&mut transport, peer_addr, configuration)?;
+        server::handle_https_connection(&mut transport, peer_addr, configuration, counters)?;
 
         transport.send_close_notify()?;
 
