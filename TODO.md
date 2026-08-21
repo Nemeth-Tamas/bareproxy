@@ -520,11 +520,11 @@ Goal: BareProxy must itself make secure HTTPS requests before it can communicate
 
 * [x] Reuse the TLS record layer in client mode.
 * [x] Produce a TLS 1.3 `ClientHello`.
-* [ ] Send SNI.
+* [x] Send SNI.
 * [x] Offer P-256 key exchange.
 * [x] Offer the implemented cipher suite.
-* [ ] Parse `ServerHello`.
-* [ ] Derive client/server handshake secrets.
+* [x] Parse `ServerHello`.
+* [x] Derive client/server handshake secrets.
 * [ ] Parse `EncryptedExtensions`.
 * [ ] Parse the remote certificate chain.
 * [ ] Verify `CertificateVerify`.

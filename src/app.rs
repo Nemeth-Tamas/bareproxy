@@ -1,6 +1,6 @@
 use std::{env, error::Error, fmt, net::TcpListener, process::ExitCode};
 
-use crate::{config, server, tls_identity::TlsIdentityStore, tls_probe};
+use crate::{config, server, tls_client_probe, tls_identity::TlsIdentityStore, tls_probe};
 
 const APP_NAME: &str = "BareProxy";
 const DEFAULT_CONFIG_PATH: &str = "bareproxy.conf";
@@ -19,6 +19,10 @@ enum Command {
     TlsConfigProbe {
         config_path: String,
     },
+    TlsClientProbe {
+        server_name: String,
+        address: String,
+    },
     Help,
     Version,
 }
@@ -29,11 +33,13 @@ enum AppError {
     MissingConfigPath,
     MissingTlsProbeArguments,
     MissingTlsConfigProbePath,
+    MissingTlsClientProbeArguments,
     TooManyArguments,
     Config { message: String },
     ListenerBind { address: String, message: String },
     Server { message: String },
     TlsProbe { message: String },
+    TlsClientProbe { message: String },
 }
 
 impl fmt::Display for AppError {
@@ -48,6 +54,8 @@ impl fmt::Display for AppError {
             Self::MissingTlsConfigProbePath => {
                 formatter.write_str("--tls-config-probe requires a configuration path")
             }
+            Self::MissingTlsClientProbeArguments => formatter
+                .write_str("--tls-client-probe requires an SNI server name and TCP address"),
             Self::TooManyArguments => write!(formatter, "too many arguments"),
             Self::Config { message } => write!(formatter, "configuration error: {message}"),
             Self::ListenerBind { address, message } => {
@@ -55,6 +63,9 @@ impl fmt::Display for AppError {
             }
             Self::Server { message } => write!(formatter, "server error: {message}"),
             Self::TlsProbe { message } => write!(formatter, "TLS probe error: {message}"),
+            Self::TlsClientProbe { message } => {
+                write!(formatter, "TLS client probe error: {message}")
+            }
         }
     }
 }
@@ -67,11 +78,13 @@ impl AppError {
             Self::Config { .. }
             | Self::ListenerBind { .. }
             | Self::Server { .. }
-            | Self::TlsProbe { .. } => STARTUP_ERROR_EXIT_CODE,
+            | Self::TlsProbe { .. }
+            | Self::TlsClientProbe { .. } => STARTUP_ERROR_EXIT_CODE,
             Self::UnknownArgument(_)
             | Self::MissingConfigPath
             | Self::MissingTlsProbeArguments
             | Self::MissingTlsConfigProbePath
+            | Self::MissingTlsClientProbeArguments
             | Self::TooManyArguments => CLI_ERROR_EXIT_CODE,
         }
     }
@@ -116,6 +129,16 @@ fn run() -> Result<(), AppError> {
 
             tls_probe::run_configured(identities, configuration).map_err(|source| {
                 AppError::TlsProbe {
+                    message: source.to_string(),
+                }
+            })?;
+        }
+        Command::TlsClientProbe {
+            server_name,
+            address,
+        } => {
+            tls_client_probe::run(&server_name, &address).map_err(|source| {
+                AppError::TlsClientProbe {
                     message: source.to_string(),
                 }
             })?;
@@ -218,6 +241,20 @@ where
 
             Command::TlsConfigProbe { config_path }
         }
+        Some("--tls-client-probe") => {
+            let server_name = args
+                .next()
+                .ok_or(AppError::MissingTlsClientProbeArguments)?;
+
+            let address = args
+                .next()
+                .ok_or(AppError::MissingTlsClientProbeArguments)?;
+
+            Command::TlsClientProbe {
+                server_name,
+                address,
+            }
+        }
         Some(argument) => return Err(AppError::UnknownArgument(argument.to_owned())),
     };
 
@@ -244,6 +281,7 @@ fn print_help() {
     println!("    -c, --config <PATH>              Use a custom configuration file");
     println!("    --tls-probe <CERT_PEM> <KEY_PEM> Run one local TLS interoperability probe");
     println!("    --tls-config-probe <PATH>        Run configured multi-SNI TLS probes");
+    println!("    --tls-client-probe <SNI> <ADDR>  Probe a TLS 1.3 server as a client");
     println!("    -h, --help                       Print help");
     println!("    -V, --version                    Print version");
     println!();
@@ -330,6 +368,32 @@ mod tests {
         assert_eq!(
             parse_args(vec!["--tls-config-probe".to_owned()]),
             Err(AppError::MissingTlsConfigProbePath)
+        );
+    }
+
+    #[test]
+    fn tls_client_probe_selects_server_name_and_address() {
+        assert_eq!(
+            parse_args(vec![
+                "--tls-client-probe".to_owned(),
+                "server.example".to_owned(),
+                "127.0.0.1:9443".to_owned(),
+            ]),
+            Ok(Command::TlsClientProbe {
+                server_name: "server.example".to_owned(),
+                address: "127.0.0.1:9443".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn tls_client_probe_requires_both_arguments() {
+        assert_eq!(
+            parse_args(vec![
+                "--tls-client-probe".to_owned(),
+                "server.example".to_owned(),
+            ]),
+            Err(AppError::MissingTlsClientProbeArguments)
         );
     }
 

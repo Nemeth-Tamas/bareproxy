@@ -1659,6 +1659,445 @@ pub fn build_tls13_client_hello(
     Ok(message)
 }
 
+#[derive(Debug)]
+pub enum TlsClientHandshakeError {
+    ClientHello(TlsClientHelloBuildError),
+    Random(io::Error),
+    ServerHello(TlsHandshakeError),
+    UnexpectedServerHelloType { message_type: u8 },
+    ServerHelloLengthMismatch { declared: usize, actual: usize },
+    InvalidServerHelloLegacyVersion { version: u16 },
+    InvalidServerHelloSessionIdLength { length: usize },
+    HelloRetryRequestUnsupported,
+    LegacySessionIdMismatch,
+    UnsupportedCipherSuite { cipher_suite: u16 },
+    InvalidCompressionMethod { method: u8 },
+    DuplicateServerHelloExtension { extension_type: u16 },
+    UnexpectedServerHelloExtension { extension_type: u16 },
+    MissingServerHelloExtension { extension_type: u16 },
+    InvalidSelectedVersion { version: u16 },
+    InvalidServerKeyShareGroup { group: u16 },
+    InvalidServerKeyShare(P256PointError),
+    Ecdh(P256EcdhError),
+    KeySchedule(HkdfError),
+    RecordProtection(TlsRecordError),
+    UnexpectedProtectedContentType { content_type: ContentType },
+}
+
+impl fmt::Display for TlsClientHandshakeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClientHello(error) => write!(formatter, "failed to build ClientHello: {error}"),
+            Self::Random(error) => {
+                write!(
+                    formatter,
+                    "failed to generate TLS client randomness: {error}"
+                )
+            }
+            Self::ServerHello(error) => write!(formatter, "invalid ServerHello: {error}"),
+            Self::UnexpectedServerHelloType { message_type } => {
+                write!(
+                    formatter,
+                    "expected TLS ServerHello handshake type 2, got {message_type}"
+                )
+            }
+            Self::ServerHelloLengthMismatch { declared, actual } => {
+                write!(
+                    formatter,
+                    "TLS ServerHello declares {declared} body bytes but contains {actual}"
+                )
+            }
+            Self::InvalidServerHelloLegacyVersion { version } => {
+                write!(
+                    formatter,
+                    "TLS 1.3 ServerHello legacy_version must be 0x0303, got 0x{version:04x}"
+                )
+            }
+            Self::InvalidServerHelloSessionIdLength { length } => {
+                write!(
+                    formatter,
+                    "TLS ServerHello legacy_session_id_echo is {length} bytes, exceeding 32"
+                )
+            }
+            Self::HelloRetryRequestUnsupported => {
+                formatter.write_str("TLS client HelloRetryRequest handling is not implemented yet")
+            }
+            Self::LegacySessionIdMismatch => formatter
+                .write_str("TLS ServerHello legacy_session_id_echo does not match ClientHello"),
+            Self::UnsupportedCipherSuite { cipher_suite } => {
+                write!(
+                    formatter,
+                    "TLS server selected unsupported cipher suite 0x{cipher_suite:04x}"
+                )
+            }
+            Self::InvalidCompressionMethod { method } => {
+                write!(
+                    formatter,
+                    "TLS 1.3 ServerHello legacy_compression_method must be zero, got {method}"
+                )
+            }
+            Self::DuplicateServerHelloExtension { extension_type } => {
+                write!(
+                    formatter,
+                    "TLS ServerHello repeats extension type {extension_type}"
+                )
+            }
+            Self::UnexpectedServerHelloExtension { extension_type } => {
+                write!(
+                    formatter,
+                    "TLS ServerHello contains unexpected extension type {extension_type}"
+                )
+            }
+            Self::MissingServerHelloExtension { extension_type } => {
+                write!(
+                    formatter,
+                    "TLS ServerHello is missing required extension type {extension_type}"
+                )
+            }
+            Self::InvalidSelectedVersion { version } => {
+                write!(
+                    formatter,
+                    "TLS server selected unsupported protocol version 0x{version:04x}"
+                )
+            }
+            Self::InvalidServerKeyShareGroup { group } => {
+                write!(
+                    formatter,
+                    "TLS server selected unsupported key-share group 0x{group:04x}"
+                )
+            }
+            Self::InvalidServerKeyShare(error) => {
+                write!(formatter, "invalid TLS server P-256 key share: {error}")
+            }
+            Self::Ecdh(error) => write!(formatter, "TLS client P-256 ECDH failed: {error}"),
+            Self::KeySchedule(error) => {
+                write!(
+                    formatter,
+                    "TLS client handshake key schedule failed: {error}"
+                )
+            }
+            Self::RecordProtection(error) => {
+                write!(
+                    formatter,
+                    "TLS client handshake record protection failed: {error}"
+                )
+            }
+            Self::UnexpectedProtectedContentType { content_type } => {
+                write!(
+                    formatter,
+                    "expected protected TLS handshake content, got {content_type:?}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for TlsClientHandshakeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ClientHello(error) => Some(error),
+            Self::Random(error) => Some(error),
+            Self::ServerHello(error) => Some(error),
+            Self::InvalidServerKeyShare(error) => Some(error),
+            Self::Ecdh(error) => Some(error),
+            Self::KeySchedule(error) => Some(error),
+            Self::RecordProtection(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<TlsClientHelloBuildError> for TlsClientHandshakeError {
+    fn from(error: TlsClientHelloBuildError) -> Self {
+        Self::ClientHello(error)
+    }
+}
+
+impl From<TlsHandshakeError> for TlsClientHandshakeError {
+    fn from(error: TlsHandshakeError) -> Self {
+        Self::ServerHello(error)
+    }
+}
+
+impl From<HkdfError> for TlsClientHandshakeError {
+    fn from(error: HkdfError) -> Self {
+        Self::KeySchedule(error)
+    }
+}
+
+impl From<TlsRecordError> for TlsClientHandshakeError {
+    fn from(error: TlsRecordError) -> Self {
+        Self::RecordProtection(error)
+    }
+}
+
+struct ParsedTls13ServerHello {
+    legacy_session_id_echo: Vec<u8>,
+    server_key_share: Vec<u8>,
+}
+
+fn parse_tls13_server_hello(
+    message: &[u8],
+) -> Result<ParsedTls13ServerHello, TlsClientHandshakeError> {
+    if message.len() < HANDSHAKE_HEADER_SIZE {
+        return Err(TlsHandshakeError::Truncated.into());
+    }
+
+    let message_type = message[0];
+
+    if message_type != HANDSHAKE_TYPE_SERVER_HELLO {
+        return Err(TlsClientHandshakeError::UnexpectedServerHelloType { message_type });
+    }
+
+    let declared_length =
+        (usize::from(message[1]) << 16) | (usize::from(message[2]) << 8) | usize::from(message[3]);
+
+    let actual_length = message.len() - HANDSHAKE_HEADER_SIZE;
+
+    if declared_length != actual_length {
+        return Err(TlsClientHandshakeError::ServerHelloLengthMismatch {
+            declared: declared_length,
+            actual: actual_length,
+        });
+    }
+
+    let mut reader = HandshakeReader::new(&message[HANDSHAKE_HEADER_SIZE..]);
+
+    let legacy_version = reader.read_u16()?;
+
+    if legacy_version != TLS_LEGACY_RECORD_VERSION {
+        return Err(TlsClientHandshakeError::InvalidServerHelloLegacyVersion {
+            version: legacy_version,
+        });
+    }
+
+    let random = reader.read_exact(32)?;
+
+    if random == TLS13_HELLO_RETRY_REQUEST_RANDOM {
+        return Err(TlsClientHandshakeError::HelloRetryRequestUnsupported);
+    }
+
+    let legacy_session_id_echo = reader.read_vector_u8("legacy_session_id_echo")?.to_vec();
+
+    if legacy_session_id_echo.len() > 32 {
+        return Err(TlsClientHandshakeError::InvalidServerHelloSessionIdLength {
+            length: legacy_session_id_echo.len(),
+        });
+    }
+
+    let cipher_suite = reader.read_u16()?;
+
+    if cipher_suite != TLS_CHACHA20_POLY1305_SHA256 {
+        return Err(TlsClientHandshakeError::UnsupportedCipherSuite { cipher_suite });
+    }
+
+    let compression_method = reader.read_u8()?;
+
+    if compression_method != 0 {
+        return Err(TlsClientHandshakeError::InvalidCompressionMethod {
+            method: compression_method,
+        });
+    }
+
+    let extensions = reader.read_vector_u16("ServerHello extensions")?;
+
+    reader.finish("ServerHello")?;
+
+    let mut extension_reader = HandshakeReader::new(extensions);
+    let mut seen_extensions = Vec::new();
+    let mut selected_version = None;
+    let mut server_key_share = None;
+
+    while extension_reader.remaining() != 0 {
+        let extension_type = extension_reader.read_u16()?;
+        let extension_data = extension_reader.read_vector_u16("ServerHello extension_data")?;
+
+        if seen_extensions.contains(&extension_type) {
+            return Err(TlsClientHandshakeError::DuplicateServerHelloExtension { extension_type });
+        }
+
+        seen_extensions.push(extension_type);
+
+        match extension_type {
+            EXTENSION_SUPPORTED_VERSIONS => {
+                let mut version_reader = HandshakeReader::new(extension_data);
+                let version = version_reader.read_u16()?;
+                version_reader.finish("ServerHello supported_versions")?;
+
+                selected_version = Some(version);
+            }
+            EXTENSION_KEY_SHARE => {
+                let mut key_share_reader = HandshakeReader::new(extension_data);
+                let group = key_share_reader.read_u16()?;
+                let key_exchange = key_share_reader.read_vector_u16("ServerHello key_exchange")?;
+
+                key_share_reader.finish("ServerHello key_share")?;
+
+                if group != TLS_GROUP_SECP256R1 {
+                    return Err(TlsClientHandshakeError::InvalidServerKeyShareGroup { group });
+                }
+
+                if key_exchange.is_empty() {
+                    return Err(TlsHandshakeError::MalformedVector {
+                        field: "ServerHello key_exchange",
+                    }
+                    .into());
+                }
+
+                server_key_share = Some(key_exchange.to_vec());
+            }
+            _ => {
+                return Err(TlsClientHandshakeError::UnexpectedServerHelloExtension {
+                    extension_type,
+                });
+            }
+        }
+    }
+
+    let selected_version =
+        selected_version.ok_or(TlsClientHandshakeError::MissingServerHelloExtension {
+            extension_type: EXTENSION_SUPPORTED_VERSIONS,
+        })?;
+
+    if selected_version != TLS_VERSION_1_3 {
+        return Err(TlsClientHandshakeError::InvalidSelectedVersion {
+            version: selected_version,
+        });
+    }
+
+    let server_key_share =
+        server_key_share.ok_or(TlsClientHandshakeError::MissingServerHelloExtension {
+            extension_type: EXTENSION_KEY_SHARE,
+        })?;
+
+    Ok(ParsedTls13ServerHello {
+        legacy_session_id_echo,
+        server_key_share,
+    })
+}
+
+pub struct Tls13ClientHelloFlight {
+    client_hello: Vec<u8>,
+    private_key: Scalar,
+    transcript: TlsTranscript,
+}
+
+impl Tls13ClientHelloFlight {
+    pub fn new(server_name: &str) -> Result<Self, TlsClientHandshakeError> {
+        if !is_valid_server_name(server_name.as_bytes()) {
+            return Err(TlsClientHelloBuildError::InvalidServerName.into());
+        }
+
+        let mut random = [0_u8; 32];
+        fill_random(&mut random).map_err(TlsClientHandshakeError::Random)?;
+
+        let private_key =
+            generate_ephemeral_p256_private_key().map_err(TlsClientHandshakeError::Random)?;
+
+        let client_hello = build_tls13_client_hello(server_name, random, private_key)?;
+
+        let mut transcript = TlsTranscript::new();
+        transcript.update_handshake_message(&client_hello);
+
+        Ok(Self {
+            client_hello,
+            private_key,
+            transcript,
+        })
+    }
+
+    pub fn client_hello(&self) -> &[u8] {
+        &self.client_hello
+    }
+
+    pub fn receive_server_hello(
+        mut self,
+        server_hello_message: &[u8],
+    ) -> Result<Tls13ClientHandshakeState, TlsClientHandshakeError> {
+        let server_hello = parse_tls13_server_hello(server_hello_message)?;
+
+        if !server_hello.legacy_session_id_echo.is_empty() {
+            return Err(TlsClientHandshakeError::LegacySessionIdMismatch);
+        }
+
+        let server_public_key = P256Point::from_sec1_uncompressed(&server_hello.server_key_share)
+            .map_err(TlsClientHandshakeError::InvalidServerKeyShare)?;
+
+        let mut shared_secret = p256_ecdh(self.private_key, server_public_key)
+            .map_err(TlsClientHandshakeError::Ecdh)?;
+
+        self.transcript
+            .update_handshake_message(server_hello_message);
+
+        let hello_transcript_hash = self.transcript.hash();
+
+        let key_schedule_result =
+            derive_tls13_handshake_key_schedule(&shared_secret, &hello_transcript_hash);
+
+        wipe_bytes(&mut shared_secret);
+
+        let key_schedule = key_schedule_result?;
+
+        let handshake_record_protection = Tls13RecordProtection::new(
+            key_schedule.client_key,
+            key_schedule.client_iv,
+            key_schedule.server_key,
+            key_schedule.server_iv,
+        );
+
+        Ok(Tls13ClientHandshakeState {
+            client_handshake_traffic_secret: key_schedule.client_handshake_traffic_secret,
+            server_handshake_traffic_secret: key_schedule.server_handshake_traffic_secret,
+            main_secret: key_schedule.main_secret,
+            transcript: self.transcript.clone(),
+            handshake_record_protection,
+        })
+    }
+}
+
+impl Drop for Tls13ClientHelloFlight {
+    fn drop(&mut self) {
+        self.private_key = Scalar::ZERO;
+    }
+}
+
+pub struct Tls13ClientHandshakeState {
+    client_handshake_traffic_secret: [u8; TLS_SHA256_HASH_SIZE],
+    server_handshake_traffic_secret: [u8; TLS_SHA256_HASH_SIZE],
+    main_secret: [u8; TLS_SHA256_HASH_SIZE],
+    transcript: TlsTranscript,
+    handshake_record_protection: Tls13RecordProtection,
+}
+
+impl Tls13ClientHandshakeState {
+    pub fn transcript_hash(&self) -> [u8; TLS_SHA256_HASH_SIZE] {
+        self.transcript.hash()
+    }
+
+    pub fn decrypt_server_handshake_record(
+        &mut self,
+        record: &TlsCiphertextRecord,
+    ) -> Result<TlsPlaintextRecord, TlsClientHandshakeError> {
+        let plaintext = self.handshake_record_protection.decrypt_record(record)?;
+
+        if plaintext.content_type() != ContentType::Handshake {
+            return Err(TlsClientHandshakeError::UnexpectedProtectedContentType {
+                content_type: plaintext.content_type(),
+            });
+        }
+
+        Ok(plaintext)
+    }
+}
+
+impl Drop for Tls13ClientHandshakeState {
+    fn drop(&mut self) {
+        wipe_bytes(&mut self.client_handshake_traffic_secret);
+        wipe_bytes(&mut self.server_handshake_traffic_secret);
+        wipe_bytes(&mut self.main_secret);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsPlaintextRecord {
     content_type: ContentType,
@@ -3689,6 +4128,35 @@ mod tests {
         assert_eq!(
             build_tls13_client_hello("example.test", [0_u8; 32], Scalar::ZERO,),
             Err(TlsClientHelloBuildError::ZeroPrivateKey)
+        );
+    }
+
+    #[test]
+    fn tls13_client_derives_server_compatible_handshake_keys() {
+        let client = Tls13ClientHelloFlight::new("server.example")
+            .expect("TLS client flight should initialize");
+
+        let mut server = negotiate_tls13_server_hello(client.client_hello())
+            .expect("BareProxy server should accept BareProxy client");
+
+        let mut client = client
+            .receive_server_hello(server.server_hello())
+            .expect("TLS client should accept BareProxy ServerHello");
+
+        let decrypted = client
+            .decrypt_server_handshake_record(server.encrypted_extensions_record())
+            .expect("client should decrypt server handshake traffic");
+
+        assert_eq!(decrypted.content_type(), ContentType::Handshake);
+        assert_eq!(decrypted.fragment(), server.encrypted_extensions());
+
+        assert_ne!(client.transcript_hash(), [0_u8; 32]);
+
+        assert_eq!(
+            server
+                .handshake_record_protection_mut()
+                .write_sequence_number(),
+            Some(1)
         );
     }
 

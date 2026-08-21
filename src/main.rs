@@ -7,6 +7,7 @@ pub mod p256;
 mod proxy;
 mod server;
 pub mod tls;
+mod tls_client_probe;
 mod tls_identity;
 mod tls_probe;
 
