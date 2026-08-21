@@ -153,6 +153,7 @@ impl fmt::Display for ConfigError {
 
 impl Error for ConfigError {}
 
+#[cfg(test)]
 pub fn load(path: &str) -> Result<Config, ConfigError> {
     load_with_tls(path).map(|(configuration, _)| configuration)
 }

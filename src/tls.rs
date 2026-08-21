@@ -1494,6 +1494,172 @@ impl ClientHello {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TlsClientHelloBuildError {
+    InvalidServerName,
+    ZeroPrivateKey,
+    PublicKey(P256PointError),
+}
+
+impl fmt::Display for TlsClientHelloBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidServerName => formatter.write_str("invalid TLS client SNI server name"),
+            Self::ZeroPrivateKey => {
+                formatter.write_str("TLS client P-256 private key cannot be zero")
+            }
+            Self::PublicKey(error) => {
+                write!(
+                    formatter,
+                    "failed to encode TLS client P-256 key share: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for TlsClientHelloBuildError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::PublicKey(error) => Some(error),
+            Self::InvalidServerName | Self::ZeroPrivateKey => None,
+        }
+    }
+}
+
+impl From<P256PointError> for TlsClientHelloBuildError {
+    fn from(error: P256PointError) -> Self {
+        Self::PublicKey(error)
+    }
+}
+
+pub fn build_tls13_client_hello(
+    server_name: &str,
+    random: [u8; 32],
+    private_key: Scalar,
+) -> Result<Vec<u8>, TlsClientHelloBuildError> {
+    if !is_valid_server_name(server_name.as_bytes()) {
+        return Err(TlsClientHelloBuildError::InvalidServerName);
+    }
+
+    if private_key == Scalar::ZERO {
+        return Err(TlsClientHelloBuildError::ZeroPrivateKey);
+    }
+
+    let public_key = p256_generator_multiply(private_key).to_sec1_uncompressed()?;
+
+    let mut extensions = Vec::new();
+
+    let append_extension = |output: &mut Vec<u8>, extension_type: u16, data: &[u8]| {
+        let data_length =
+            u16::try_from(data.len()).expect("TLS client extension must fit in uint16");
+
+        output.extend_from_slice(&extension_type.to_be_bytes());
+        output.extend_from_slice(&data_length.to_be_bytes());
+        output.extend_from_slice(data);
+    };
+
+    let server_name_bytes = server_name.as_bytes();
+    let server_name_length =
+        u16::try_from(server_name_bytes.len()).expect("validated DNS name must fit in uint16");
+
+    let server_name_list_length = server_name_bytes.len() + 3;
+    let server_name_list_length = u16::try_from(server_name_list_length)
+        .expect("validated TLS server-name list must fit in uint16");
+
+    let mut server_name_extension = Vec::with_capacity(server_name_bytes.len() + 5);
+
+    server_name_extension.extend_from_slice(&server_name_list_length.to_be_bytes());
+    server_name_extension.push(0);
+    server_name_extension.extend_from_slice(&server_name_length.to_be_bytes());
+    server_name_extension.extend_from_slice(server_name_bytes);
+
+    append_extension(
+        &mut extensions,
+        EXTENSION_SERVER_NAME,
+        &server_name_extension,
+    );
+
+    append_extension(
+        &mut extensions,
+        EXTENSION_SUPPORTED_GROUPS,
+        &[0x00, 0x02, 0x00, 0x17],
+    );
+
+    append_extension(
+        &mut extensions,
+        EXTENSION_SIGNATURE_ALGORITHMS,
+        &[0x00, 0x02, 0x04, 0x03],
+    );
+
+    let mut alpn_extension = Vec::with_capacity(11);
+    alpn_extension.extend_from_slice(&9_u16.to_be_bytes());
+    alpn_extension.push(8);
+    alpn_extension.extend_from_slice(ALPN_HTTP_1_1);
+
+    append_extension(
+        &mut extensions,
+        EXTENSION_APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
+        &alpn_extension,
+    );
+
+    append_extension(
+        &mut extensions,
+        EXTENSION_SUPPORTED_VERSIONS,
+        &[0x02, 0x03, 0x04],
+    );
+
+    let key_share_entry_length = 2 + 2 + public_key.len();
+    let key_share_entry_length = u16::try_from(key_share_entry_length)
+        .expect("P-256 TLS key-share entry must fit in uint16");
+
+    let mut key_share_extension = Vec::with_capacity(2 + usize::from(key_share_entry_length));
+
+    key_share_extension.extend_from_slice(&key_share_entry_length.to_be_bytes());
+    key_share_extension.extend_from_slice(&TLS_GROUP_SECP256R1.to_be_bytes());
+    key_share_extension.extend_from_slice(
+        &u16::try_from(public_key.len())
+            .expect("P-256 public key must fit in uint16")
+            .to_be_bytes(),
+    );
+    key_share_extension.extend_from_slice(&public_key);
+
+    append_extension(&mut extensions, EXTENSION_KEY_SHARE, &key_share_extension);
+
+    let mut body = Vec::new();
+
+    body.extend_from_slice(&TLS_LEGACY_RECORD_VERSION.to_be_bytes());
+    body.extend_from_slice(&random);
+
+    body.push(0);
+
+    body.extend_from_slice(&2_u16.to_be_bytes());
+    body.extend_from_slice(&TLS_CHACHA20_POLY1305_SHA256.to_be_bytes());
+
+    body.extend_from_slice(&[1, 0]);
+
+    body.extend_from_slice(
+        &u16::try_from(extensions.len())
+            .expect("TLS client extension block must fit in uint16")
+            .to_be_bytes(),
+    );
+    body.extend_from_slice(&extensions);
+
+    debug_assert!(body.len() <= TLS_UINT24_MAX);
+
+    let body_length = body.len();
+
+    let mut message = Vec::with_capacity(HANDSHAKE_HEADER_SIZE + body_length);
+
+    message.push(HANDSHAKE_TYPE_CLIENT_HELLO);
+    message.push(((body_length >> 16) & 0xff) as u8);
+    message.push(((body_length >> 8) & 0xff) as u8);
+    message.push((body_length & 0xff) as u8);
+    message.extend_from_slice(&body);
+
+    Ok(message)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsPlaintextRecord {
     content_type: ContentType,
     legacy_record_version: u16,
@@ -3480,6 +3646,50 @@ mod tests {
         assert_eq!(client.read_sequence_number(), Some(1));
         assert_eq!(server.write_sequence_number(), Some(1));
         assert_eq!(server.read_sequence_number(), Some(1));
+    }
+
+    #[test]
+    fn tls13_client_hello_builder_offers_bareproxy_profile() {
+        let private_key = Scalar::ONE;
+        let random = [0xa5_u8; 32];
+
+        let message = build_tls13_client_hello("Acme.Example", random, private_key)
+            .expect("TLS client should build ClientHello");
+
+        let parsed = parse_client_hello(&message).expect("generated ClientHello should parse");
+
+        assert_eq!(parsed.random(), &random);
+        assert_eq!(parsed.server_name(), Some("acme.example"));
+        assert_eq!(parsed.cipher_suites(), &[TLS_CHACHA20_POLY1305_SHA256]);
+        assert_eq!(parsed.supported_versions(), &[TLS_VERSION_1_3]);
+        assert_eq!(parsed.supported_groups(), &[TLS_GROUP_SECP256R1]);
+        assert_eq!(
+            parsed.signature_algorithms(),
+            &[TLS_SIGNATURE_ECDSA_SECP256R1_SHA256]
+        );
+        assert!(parsed.offers_http11());
+
+        let expected_key_share = p256_generator_multiply(private_key)
+            .to_sec1_uncompressed()
+            .expect("test client public key should encode");
+
+        assert_eq!(
+            parsed.secp256r1_key_share(),
+            Some(expected_key_share.as_slice())
+        );
+    }
+
+    #[test]
+    fn tls13_client_hello_builder_rejects_invalid_inputs() {
+        assert_eq!(
+            build_tls13_client_hello("127.0.0.1", [0_u8; 32], Scalar::ONE,),
+            Err(TlsClientHelloBuildError::InvalidServerName)
+        );
+
+        assert_eq!(
+            build_tls13_client_hello("example.test", [0_u8; 32], Scalar::ZERO,),
+            Err(TlsClientHelloBuildError::ZeroPrivateKey)
+        );
     }
 
     #[test]

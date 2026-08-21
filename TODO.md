@@ -518,11 +518,11 @@ Goal: select the correct certificate and proxy route during TLS setup.
 
 Goal: BareProxy must itself make secure HTTPS requests before it can communicate safely with an ACME server.
 
-* [ ] Reuse the TLS record layer in client mode.
-* [ ] Produce a TLS 1.3 `ClientHello`.
+* [x] Reuse the TLS record layer in client mode.
+* [x] Produce a TLS 1.3 `ClientHello`.
 * [ ] Send SNI.
-* [ ] Offer P-256 key exchange.
-* [ ] Offer the implemented cipher suite.
+* [x] Offer P-256 key exchange.
+* [x] Offer the implemented cipher suite.
 * [ ] Parse `ServerHello`.
 * [ ] Derive client/server handshake secrets.
 * [ ] Parse `EncryptedExtensions`.
